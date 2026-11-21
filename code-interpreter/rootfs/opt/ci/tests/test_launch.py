@@ -1,5 +1,6 @@
 """launch.py — real local processes, no bwrap."""
 
+import json
 import os
 import shutil
 import socket
@@ -130,3 +131,81 @@ print(s.recv(10).decode())
         srv.close()
     assert p.returncode == 0, p.stderr
     assert p.stdout.strip() == "OK"
+
+
+# ---- agent mode (one sandbox per session, REPL restarts inside it) ---------
+
+REPL_DIR = Path(__file__).resolve().parents[1] / "repl"
+sys.path.insert(0, str(REPL_DIR))
+from proto import recv, send  # noqa: E402
+
+
+def pairs():
+    a_repl, c_repl = socket.socketpair()
+    a_ctl, c_ctl = socket.socketpair()
+    return (a_repl, a_ctl), (c_repl, c_ctl)
+
+
+def call(sock, req):
+    sock.settimeout(10)
+    send(sock, req)
+    return recv(sock)
+
+
+linux_only = pytest.mark.skipif(sys.platform != "linux", reason="AF_UNIX SOCK_SEQPACKET is Linux-only")
+
+
+@pytest.fixture
+def agent():
+    assert "CI_IN_SANDBOX" not in os.environ  # kill(-1) must never run here
+    (a_repl, a_ctl), (c_repl, c_ctl) = pairs()
+    a_agent, c_agent = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    fds = (c_repl.fileno(), c_ctl.fileno(), c_agent.fileno())
+    env = dict(os.environ, REPL_FD=str(fds[0]), REPL_CTL_FD=str(fds[1]), CI_AGENT_FD=str(fds[2]),
+               CI_PROXY_SOCK="/nonexistent")
+    p = subprocess.Popen([sys.executable, str(LAUNCH), sys.executable, str(REPL_DIR / "server.py")],
+                         env=env, pass_fds=fds)
+    for s in (c_repl, c_ctl, c_agent):
+        s.close()
+    yield p, a_agent, a_repl
+    a_agent.close()
+    p.wait(10)
+
+
+def restart(a_agent):
+    (n_repl, n_ctl), (c_repl, c_ctl) = pairs()
+    socket.send_fds(a_agent, [b'{"op": "restart"}'], [c_repl.fileno(), c_ctl.fileno()])
+    c_repl.close()
+    c_ctl.close()
+    a_agent.settimeout(10)
+    return json.loads(a_agent.recv(4096)), n_repl, n_ctl  # keep n_ctl open: EOF ends the REPL
+
+
+@linux_only
+def test_agent_restarts_repl_on_new_channels_and_old_one_closes(agent):
+    p, a_agent, a_repl = agent
+    assert call(a_repl, {"op": "exec", "code": "x = 1", "id": 1})["id"] == 1
+    reply, n_repl, n_ctl = restart(a_agent)
+    assert reply == {"ok": True}
+    a_repl.settimeout(5)
+    assert a_repl.recv(1) == b""  # old REPL is gone and nobody holds its channel
+    assert call(n_repl, {"op": "exec", "code": "x", "id": 2})["error"] == "NameError"
+
+
+@linux_only
+def test_agent_ping_and_unknown_op(agent):
+    _, a_agent, _ = agent
+    a_agent.settimeout(5)
+    a_agent.send(b'{"op": "ping"}')
+    assert json.loads(a_agent.recv(4096)) == {"ok": True}
+    a_agent.send(b'{"op": "nope"}')
+    assert json.loads(a_agent.recv(4096)) == {"ok": False}
+
+
+@linux_only
+def test_closing_the_agent_channel_ends_agent_and_repl(agent):
+    p, a_agent, a_repl = agent
+    a_agent.close()
+    assert p.wait(10) == 0
+    a_repl.settimeout(5)
+    assert a_repl.recv(1) == b""

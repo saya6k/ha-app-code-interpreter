@@ -20,6 +20,7 @@ class SandboxPolicy:
     nproc: int = 128  # RLIMIT_NPROC: counts threads too
     fsize_mb: int = 256
     nofile: int = 1024
+    sandbox_mb: int = 256  # tmpfs /sandbox: RAM, a hard cap the disk cannot give
     tmp_mb: int = 64
     nice: int = 10
     oom_score_adj: int = 1000
@@ -46,7 +47,9 @@ def exec_prefix(policy: SandboxPolicy, uid: int) -> list[str]:
 def sandbox_env(policy: SandboxPolicy) -> dict[str, str]:
     env = {
         "PATH": "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin",
-        "HOME": "/tmp",
+        "HOME": "/sandbox",  # pip --user and dotfiles persist for the session
+        "PIP_NO_CACHE_DIR": "1",  # a wheel cache would eat the /sandbox quota
+        "CI_IN_SANDBOX": "1",  # lets launch.py use kill(-1) safely
         "LANG": "C.UTF-8",
         "MPLBACKEND": "Agg",
         "MPLCONFIGDIR": "/tmp/mpl",
@@ -60,7 +63,6 @@ def sandbox_env(policy: SandboxPolicy) -> dict[str, str]:
 def bwrap_argv(
     policy: SandboxPolicy,
     *,
-    work: Path,
     proxy_dir: Path,
     seccomp_fd: int,
     env: dict[str, str],
@@ -82,7 +84,7 @@ def bwrap_argv(
         "--ro-bind", str(root), "/",
         "--dev", "/dev",
         "--size", str(policy.tmp_mb * MIB), "--tmpfs", "/tmp",
-        "--bind", str(work), "/sandbox",
+        "--size", str(policy.sandbox_mb * MIB), "--tmpfs", "/sandbox",
         "--ro-bind", str(proxy_dir), "/run/ci",
         "--chdir", "/sandbox",
         "--seccomp", str(seccomp_fd),

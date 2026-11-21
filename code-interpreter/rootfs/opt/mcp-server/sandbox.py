@@ -1,8 +1,13 @@
 """One session's bubblewrap sandbox: REPL lifecycle, commands, teardown (SPEC §3.2-3.4).
 
-Layout under base_dir/<sid>/ (app-only, not mounted whole into the sandbox):
-    work/   session uid, 0700  -> /sandbox (rw)
-    proxy/  root, 0755         -> /run/ci  (ro; proxy.sock when allowlisted)
+One bwrap per session. Inside it, launch.py (the agent) supervises the REPL;
+commands run through the REPL, so code, commands, /sandbox, /tmp and HOME
+all live in the same namespaces. /sandbox and /tmp are size-capped tmpfs:
+nothing a session writes lands on the HA data disk. Restarting a stuck or
+dead REPL happens inside the sandbox and keeps the files.
+
+On the app's disk only base_dir/<sid>/proxy/ exists (root, 0755, bound
+read-only at /run/ci; proxy.sock when allowlisted).
 
 Fail-closed: if bwrap or the REPL does not come up, create() raises and
 nothing runs. There is no code path that executes outside bubblewrap.
@@ -12,9 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shutil
 import signal
+import socket
 from pathlib import Path
 from typing import Callable
 
@@ -25,30 +32,14 @@ from seccomp import compile_filter
 
 BASE_DIR = Path("/var/cache/code-interpreter")
 PY = "/opt/venv/bin/python3"
-LAUNCH = [PY, "/opt/ci/launch.py"]
-REPL = [PY, "-u", "/opt/ci/repl/server.py"]
-OUT_LIMIT = 16000
+SANDBOX_CMD = [PY, "/opt/ci/launch.py", PY, "-u", "/opt/ci/repl/server.py"]
 STDERR_TAIL = 4096
 READY_TIMEOUT_S = 30.0
+AGENT_TIMEOUT_S = 10.0
 
 
 class SandboxError(RuntimeError):
     pass
-
-
-async def _read_capped(stream: asyncio.StreamReader, limit: int) -> tuple[bytes, bool]:
-    buf, truncated = bytearray(), False
-    while chunk := await stream.read(65536):
-        room = limit - len(buf)
-        if room > 0:
-            buf += chunk[:room]
-        if len(chunk) > room:
-            truncated = True
-    return bytes(buf), truncated
-
-
-def _exit_code(rc: int) -> int:
-    return 128 - rc if rc < 0 else rc
 
 
 class Sandbox:
@@ -69,20 +60,18 @@ class Sandbox:
         self.policy = policy
         self.base_dir = base_dir
         self.dir = base_dir / sid
-        self.work = self.dir / "work"
         self.proxy_dir = self.dir / "proxy"
         self.root = root
         self.bwrap = bwrap
         self.ready_timeout_s = ready_timeout_s
-        self._repl: asyncio.subprocess.Process | None = None
+        self._proc: asyncio.subprocess.Process | None = None
+        self._agent: socket.socket | None = None
+        self._agent_lock = asyncio.Lock()
         self._client: ReplClient | None = None
         self._stderr_tail = bytearray()
-        self._commands: set[asyncio.subprocess.Process] = set()
         self._on_net_event = on_net_event
         self._proxy: asyncio.Server | None = None
-        # Set first thing in destroy(): no process may start after it, or it
-        # would outlive the session and keep running under a uid that the
-        # next session gets.
+        # Set first thing in destroy(): no REPL may start after it.
         self._closed = False
 
     @classmethod
@@ -91,20 +80,18 @@ class Sandbox:
         try:
             await asyncio.to_thread(sbx._prepare_dirs)
             await sbx._start_proxy()
-            await sbx._start_repl()
+            await sbx._start()
         except BaseException:
             await sbx.destroy()
             raise
         return sbx
 
     def _prepare_dirs(self) -> None:
-        # bwrap runs as the session uid and must traverse to work/ and proxy/.
+        # bwrap runs as the session uid and must traverse to proxy/.
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self.base_dir.chmod(0o711)
         self.dir.mkdir(mode=0o711)
         self.dir.chmod(0o711)
-        self.work.mkdir(mode=0o700)
-        os.chown(self.work, self.uid, self.uid)
         self.proxy_dir.mkdir(mode=0o755)
 
     async def _start_proxy(self) -> None:
@@ -123,147 +110,135 @@ class Sandbox:
             owner=self.uid,
         )
 
-    async def _spawn(self, cmd: list[str], env_extra: dict[str, str], keep_fds: tuple[int, ...], **io):
-        if self._closed:
-            raise SandboxError("sandbox is closed")
-        env = sandbox_env(self.policy) | env_extra
+    async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
+        while chunk := await stream.read(65536):
+            self._stderr_tail += chunk
+            del self._stderr_tail[:-STDERR_TAIL]
+
+    def _failure(self, what: str) -> SandboxError:
+        tail = self._stderr_tail.decode(errors="replace").strip()
+        return SandboxError(f"{what}: {tail}" if tail else what)
+
+    async def _start(self) -> None:
+        """Spawn the session's one bwrap: agent + first REPL."""
+        (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
+        app_agent, child_agent = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        children = (child_repl, child_ctl, child_agent)
+        for s in children:
+            s.set_inheritable(True)
         r, w = os.pipe()
         try:
             try:
                 os.write(w, compile_filter())
             finally:
                 os.close(w)
+            env = sandbox_env(self.policy) | {
+                "REPL_FD": str(child_repl.fileno()),
+                "REPL_CTL_FD": str(child_ctl.fileno()),
+                "CI_AGENT_FD": str(child_agent.fileno()),
+            }
             argv = exec_prefix(self.policy, self.uid) + bwrap_argv(
-                self.policy,
-                work=self.work,
-                proxy_dir=self.proxy_dir,
-                seccomp_fd=r,
-                env=env,
-                root=self.root,
-                bwrap=self.bwrap,
-            ) + LAUNCH + cmd
-            proc = await asyncio.create_subprocess_exec(
+                self.policy, proxy_dir=self.proxy_dir, seccomp_fd=r, env=env,
+                root=self.root, bwrap=self.bwrap,
+            ) + SANDBOX_CMD
+            self._proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
-                pass_fds=(r, *keep_fds),
-                start_new_session=True,
-                **io,
-            )
-        finally:
-            os.close(r)
-        if self._closed:  # destroy() ran while we were spawning
-            await self._kill(proc)
-            raise SandboxError("sandbox is closed")
-        return proc
-
-    async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
-        while chunk := await stream.read(65536):
-            self._stderr_tail += chunk
-            del self._stderr_tail[:-STDERR_TAIL]
-
-    async def _start_repl(self) -> None:
-        self._stderr_tail.clear()
-        (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
-        try:
-            self._repl = await self._spawn(
-                REPL,
-                {"REPL_FD": str(child_repl.fileno()), "REPL_CTL_FD": str(child_ctl.fileno())},
-                (child_repl.fileno(), child_ctl.fileno()),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
+                pass_fds=(r, *(s.fileno() for s in children)),
+                start_new_session=True,
             )
         except BaseException:
-            app_repl.close()
-            app_ctl.close()
+            for s in (app_repl, app_ctl, app_agent):
+                s.close()
             raise
         finally:
-            child_repl.close()
-            child_ctl.close()
-        asyncio.get_running_loop().create_task(self._drain_stderr(self._repl.stderr))
-        self._client = ReplClient(app_repl, app_ctl)
+            os.close(r)
+            for s in children:
+                s.close()
+        self._agent = app_agent
+        asyncio.get_running_loop().create_task(self._drain_stderr(self._proc.stderr))
+        await self._attach(ReplClient(app_repl, app_ctl), "sandbox did not start")
+
+    async def _attach(self, client: ReplClient, what: str) -> None:
+        self._client = client
         try:
-            await self._client.wait_ready(self.ready_timeout_s)
+            await client.wait_ready(self.ready_timeout_s)
         except SandboxNotReady as e:
-            await self._stop_repl()
             await asyncio.sleep(0.1)  # let the stderr drain catch the last words
-            tail = self._stderr_tail.decode(errors="replace").strip()
-            raise SandboxError(f"sandbox did not start: {e}: {tail}") from None
+            raise self._failure(f"{what}: {e}") from None
 
-    async def _kill(self, proc: asyncio.subprocess.Process) -> None:
-        # The outer bwrap leads the process group; --die-with-parent then takes
-        # down the sandbox's pid namespace with it. Once asyncio has reaped the
-        # process its pid may belong to someone else: never signal it then.
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(proc.pid, signal.SIGKILL)
-        await proc.wait()
+    def _agent_call(self, req: dict, fds: list[int]) -> dict:
+        """Blocking request on the SOCK_SEQPACKET agent channel (run in a thread)."""
+        self._agent.settimeout(AGENT_TIMEOUT_S)
+        socket.send_fds(self._agent, [json.dumps(req).encode()], fds)
+        data = self._agent.recv(4096)
+        if not data:
+            raise ConnectionError("agent closed")
+        return json.loads(data)
 
-    async def _stop_repl(self) -> None:
+    async def _restart_repl(self) -> None:
+        """Fresh REPL in the same sandbox: variables go, files stay."""
+        if self._closed or self._agent is None:
+            raise SandboxError("sandbox is closed")
         if self._client is not None:
             self._client.close()
             self._client = None
-        if self._repl is not None:
-            await self._kill(self._repl)
-            self._repl = None
+        (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
+        try:
+            async with self._agent_lock:
+                reply = await asyncio.to_thread(
+                    self._agent_call, {"op": "restart"}, [child_repl.fileno(), child_ctl.fileno()]
+                )
+        except (OSError, ValueError) as e:
+            app_repl.close()
+            app_ctl.close()
+            raise self._failure(f"sandbox is gone, its files are lost ({e})") from None
+        finally:
+            child_repl.close()
+            child_ctl.close()
+        if not reply.get("ok"):
+            app_repl.close()
+            app_ctl.close()
+            raise self._failure("sandbox refused the REPL restart")
+        await self._attach(ReplClient(app_repl, app_ctl), "REPL did not restart")
 
-    async def run_code(self, code: str, timeout_s: float, reset: bool = False) -> dict:
+    async def _with_restart(self, call) -> dict:
         if self._client is None:
             raise SandboxError("sandbox is not running")
-        if reset:
-            r = await self._client.reset()
-            if r["restart_required"]:
-                await self._restart()
-        r = await self._client.run(code, timeout_s)
+        r = await call(self._client)
         restarted = r.pop("restart_required")
         if restarted and not self._closed:
-            await self._restart()
+            await self._restart_repl()
         r["kernel_restarted"] = restarted
         return r
 
-    async def _restart(self) -> None:
-        await self._stop_repl()
-        await self._start_repl()
+    async def run_code(self, code: str, timeout_s: float, reset: bool = False) -> dict:
+        if reset:
+            await self._with_restart(lambda c: c.reset())
+        return await self._with_restart(lambda c: c.run(code, timeout_s))
 
     async def run_command(self, command: str, timeout_s: float) -> dict:
-        proc = await self._spawn(
-            ["/bin/sh", "-c", command],
-            {},
-            (),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        self._commands.add(proc)
-        readers = asyncio.gather(
-            _read_capped(proc.stdout, OUT_LIMIT), _read_capped(proc.stderr, OUT_LIMIT)
-        )
-        error = None
-        try:
-            try:
-                await asyncio.wait_for(proc.wait(), timeout_s)
-            except TimeoutError:
-                error = "TimeoutError"
-                await self._kill(proc)
-            (out, out_trunc), (err, err_trunc) = await readers
-        except BaseException:  # e.g. the caller was cancelled
-            readers.cancel()
-            raise
-        finally:
-            if proc.returncode is None:  # never leave a command running untracked
-                await self._kill(proc)
-            self._commands.discard(proc)
-        return {
-            "stdout": out.decode(errors="replace"),
-            "stderr": err.decode(errors="replace"),
-            "exit_code": None if error else _exit_code(proc.returncode),
-            "error": error,
-            "truncated": out_trunc or err_trunc,
-        }
+        return await self._with_restart(lambda c: c.command(command, timeout_s))
 
     async def destroy(self) -> None:
         self._closed = True
-        await self._stop_repl()
-        for proc in list(self._commands):
-            await self._kill(proc)
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+        if self._agent is not None:
+            self._agent.close()
+            self._agent = None
+        if self._proc is not None:
+            # The outer bwrap leads the process group; --die-with-parent then
+            # takes down the sandbox's pid namespace (and its tmpfs) with it.
+            # Never signal a pid asyncio has already reaped: it may be reused.
+            if self._proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(self._proc.pid, signal.SIGKILL)
+            await self._proc.wait()
+            self._proc = None
         if self._proxy is not None:
             await egress.close(self._proxy)
             self._proxy = None

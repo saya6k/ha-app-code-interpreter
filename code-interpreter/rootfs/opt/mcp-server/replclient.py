@@ -74,26 +74,22 @@ class _Channel:
             self.sock.close()
 
 
-_REPLY_KEYS = ("stdout", "stderr", "result", "error", "truncated")
+_CODE_KEYS = ("stdout", "stderr", "result", "error", "truncated")
+_COMMAND_KEYS = ("stdout", "stderr", "exit_code", "error", "truncated")
 
 
-def _merge(out: dict, reply: dict) -> dict:
+def _merge(out: dict, reply: dict, keys: tuple[str, ...]) -> dict:
     """Take only the reply fields the app knows; the sandbox controls the rest."""
-    for k in _REPLY_KEYS:
+    for k in keys:
         if k in reply:
             out[k] = reply[k]
     return out
 
 
-def _blank() -> dict:
-    return {
-        "stdout": "",
-        "stderr": "",
-        "result": None,
-        "error": None,
-        "truncated": False,
-        "restart_required": False,
-    }
+def _blank(command: bool = False) -> dict:
+    out = {"stdout": "", "stderr": "", "error": None, "truncated": False, "restart_required": False}
+    out.update({"exit_code": None} if command else {"result": None})
+    return out
 
 
 class ReplClient:
@@ -101,20 +97,34 @@ class ReplClient:
         self._repl = _Channel(repl)
         self._ctl = _Channel(ctl)
         self.grace_s = grace_s
+        self._next_id = 0
 
     def close(self) -> None:
         self._repl.close()
         self._ctl.close()
 
+    async def _send(self, req: dict) -> int:
+        self._next_id += 1
+        await self._repl.send({**req, "id": self._next_id})
+        return self._next_id
+
+    async def _reply(self, rid: int, timeout_s: float) -> dict:
+        """Next reply for request `rid`; replies to abandoned requests are skipped."""
+        async def matching():
+            while (msg := await self._repl.recv()).get("id") != rid:
+                pass
+            return msg
+
+        return await asyncio.wait_for(matching(), timeout_s)
+
     async def wait_ready(self, timeout_s: float) -> None:
         try:
-            await self._repl.send({"op": "ping"})
-            await asyncio.wait_for(self._repl.recv(), timeout_s)
+            await self._reply(await self._send({"op": "ping"}), timeout_s)
         except (ConnectionError, TimeoutError) as e:
             raise SandboxNotReady(f"REPL not ready: {e or 'timeout'}") from None
 
     async def interrupt(self) -> bool:
-        """Ask the server to SIGINT itself. True if a cell was running."""
+        """Ask the server to SIGINT itself. True if a cell or command was running."""
         try:
             await self._ctl.send({"op": "interrupt"})
             resp = await asyncio.wait_for(self._ctl.recv(), 2)
@@ -125,30 +135,40 @@ class ReplClient:
     async def reset(self) -> dict:
         out = _blank()
         try:
-            await self._repl.send({"op": "reset"})
-            _merge(out, await asyncio.wait_for(self._repl.recv(), 10))
+            _merge(out, await self._reply(await self._send({"op": "reset"}), 10), _CODE_KEYS)
         except (ConnectionError, TimeoutError):
             out.update(error="KernelDied", restart_required=True)
         return out
 
-    async def run(self, code: str, timeout_s: float) -> dict:
-        out = _blank()
+    async def _bounded(self, req: dict, timeout_s: float, out: dict, keys: tuple[str, ...]) -> dict:
+        """Send, wait timeout_s, then interrupt and wait grace_s, then give up."""
         try:
-            await self._repl.send({"op": "exec", "code": code})
+            rid = await self._send(req)
             try:
-                _merge(out, await asyncio.wait_for(self._repl.recv(), timeout_s))
-                return out
+                return _merge(out, await self._reply(rid, timeout_s), keys)
             except TimeoutError:
                 pass
             await self.interrupt()
             try:
-                _merge(out, await asyncio.wait_for(self._repl.recv(), self.grace_s))
+                _merge(out, await self._reply(rid, self.grace_s), keys)
                 out["error"] = "TimeoutError"
-                return out
             except TimeoutError:
                 out.update(error="TimeoutError", restart_required=True)
-                return out
+            return out
         except ConnectionError:
-            # Server died mid-cell (crash, OOM kill, os._exit) or broke the protocol.
+            # Server died mid-request (crash, OOM kill, os._exit) or broke the protocol.
             out.update(error="KernelDied", restart_required=True)
             return out
+        except asyncio.CancelledError:
+            # Caller gave up: stop the work in the sandbox so the next request
+            # does not queue behind it. Its late reply is skipped by id.
+            await asyncio.shield(self.interrupt())
+            raise
+
+    async def run(self, code: str, timeout_s: float) -> dict:
+        return await self._bounded({"op": "exec", "code": code}, timeout_s, _blank(), _CODE_KEYS)
+
+    async def command(self, command: str, timeout_s: float) -> dict:
+        """The server enforces timeout_s itself; the client allows a little more."""
+        req = {"op": "command", "command": command, "timeout_s": timeout_s}
+        return await self._bounded(req, timeout_s + 2, _blank(command=True), _COMMAND_KEYS)

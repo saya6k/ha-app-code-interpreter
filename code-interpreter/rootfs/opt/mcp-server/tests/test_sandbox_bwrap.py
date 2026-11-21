@@ -109,7 +109,6 @@ for p in ('/sandbox/a.txt', '/tmp/b.txt', '/usr/c.txt', '/opt/ci/d.txt', '/run/c
 ok
 """)
     assert eval(r["result"]) == ["/sandbox/a.txt", "/tmp/b.txt"]
-    assert (sbx.work / "a.txt").read_text() == "x"
 
 
 def test_seccomp_blocks_nested_userns_but_threads_and_processes_work(h, sbx):
@@ -163,7 +162,7 @@ plt.plot([1, 2]); plt.title('한글'); plt.savefig('/sandbox/p.png')
 'ok'
 """, timeout=120)
     assert r["result"] == "'ok'", r["stderr"]
-    assert (sbx.work / "p.png").stat().st_size > 0
+    assert int(code(h, sbx, "import os; os.path.getsize('/sandbox/p.png')")["result"]) > 0
 
 
 def test_timeout_interrupt_keeps_variables(h, sbx):
@@ -360,3 +359,53 @@ def test_cancelled_run_command_is_killed(h, sbx):
     names = [n for _, n, _ in procs_of(UID, states=True)]
     assert "sleep" not in names, names
     assert code(h, sbx, "1")["result"] == "1"  # the session itself is fine
+
+
+
+# ---- one sandbox per session (review findings 4, 5) -------------------------
+
+def test_sandbox_dir_is_capped_and_never_touches_the_app_disk(h, sbx):
+    r = code(h, sbx, """
+import errno
+written, err = 0, None
+try:
+    for i in range(10):  # 10 x 40 MB: each file under RLIMIT_FSIZE, together over the cap
+        with open(f'/sandbox/big{i}', 'wb') as f:
+            for _ in range(40):
+                f.write(b'0' * 1024 * 1024); written += 1
+except OSError as e:
+    err = errno.errorcode[e.errno]
+(written, err)
+""")
+    written, err = eval(r["result"])
+    assert err == "ENOSPC" and written <= 256
+    assert sorted(p.name for p in sbx.dir.iterdir()) == ["proxy"]  # nothing else on disk
+    code(h, sbx, "import glob, os; [os.remove(p) for p in glob.glob('/sandbox/big*')]")
+    assert code(h, sbx, "open('/sandbox/ok', 'w').write('fine')")["error"] is None
+
+
+def test_commands_and_code_share_tmp_home_and_sandbox(h, sbx):
+    r = h.do(sbx.run_command("echo cmd > /tmp/t; echo home > $HOME/h; pwd", timeout_s=30))
+    assert r["stdout"] == "/sandbox\n"
+    r = code(h, sbx, "import os; (open('/tmp/t').read(), open(os.path.expanduser('~/h')).read())")
+    assert eval(r["result"]) == ("cmd\n", "home\n")
+
+
+def test_restart_keeps_files_and_ends_stray_processes(h, sbx):
+    code(h, sbx, "import subprocess; open('/sandbox/f', 'w').write('kept'); subprocess.Popen(['sleep', '300'])")
+    assert "sleep" in [n for _, n, _ in procs_of(UID, states=True)]
+    r = code(h, sbx, "import os; os._exit(1)")
+    assert r["kernel_restarted"] is True
+    h.do(asyncio.sleep(0.3))
+    assert "sleep" not in [n for _, n, _ in procs_of(UID, states=True)]
+    assert code(h, sbx, "open('/sandbox/f').read()")["result"] == "'kept'"
+
+
+def test_sandbox_killed_from_inside_is_reported_and_files_are_gone(h, sbx):
+    """kill(-1) from user code takes the agent down, so bwrap and the whole
+    sandbox end. The app must say so instead of pretending a restart worked."""
+    code(h, sbx, "import os, signal; os.kill(-1, signal.SIGKILL)")  # its reply may still get out
+    h.do(asyncio.sleep(0.5))  # bwrap tears the sandbox down once the agent is gone
+    assert procs_of(UID) == []
+    with pytest.raises(SandboxError, match="files are lost"):
+        code(h, sbx, "1")

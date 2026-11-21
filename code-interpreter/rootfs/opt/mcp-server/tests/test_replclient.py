@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import replclient
 from replclient import MAX_MSG, ReplClient, SandboxNotReady, socketpairs
 
 SERVER = Path(__file__).resolve().parents[2] / "ci" / "repl" / "server.py"
@@ -196,12 +197,47 @@ def test_forged_oversized_reply_is_rejected_as_kernel_death(repl):
     assert r["restart_required"] is True
 
 
-def test_reply_fields_outside_the_schema_are_dropped(repl):
+def test_forged_reply_without_the_request_id_is_ignored(repl):
     code = (
         "import os, json, struct\n"
-        "b = json.dumps({'stdout': 'x', 'restart_required': False, 'evil': 1}).encode()\n"
+        "b = json.dumps({'stdout': 'forged', 'result': '1'}).encode()\n"
         "os.write(int(os.environ['REPL_FD']), struct.pack('>I', len(b)) + b)\n"
-        "import time; time.sleep(5)"
+        "'real'"
     )
-    r = repl(code, timeout=1)
-    assert r["stdout"] == "x" and "evil" not in r
+    r = repl(code)
+    assert r["result"] == "'real'" and r["stdout"] == ""
+
+
+def test_merge_keeps_only_known_fields():
+    out = replclient._merge({"error": None}, {"stdout": "x", "restart_required": False, "evil": 1},
+                            replclient._CODE_KEYS)
+    assert out == {"error": None, "stdout": "x"}
+
+
+def test_command_runs_with_exit_code_and_stderr(repl):
+    r = repl.do(repl.client.command("echo out; echo err >&2; exit 4", timeout_s=10))
+    assert (r["stdout"], r["stderr"], r["exit_code"], r["error"]) == ("out\n", "err\n", 4, None)
+    assert "result" not in r
+
+
+def test_command_timeout_kills_its_process_group(repl):
+    r = repl.do(repl.client.command("sleep 30 & sleep 30", timeout_s=1))
+    assert r["error"] == "TimeoutError" and r["exit_code"] is None and not r["restart_required"]
+    assert repl("1")["result"] == "1"
+
+
+def test_command_output_is_capped(repl):
+    r = repl.do(repl.client.command("yes | head -c 100000", timeout_s=10))
+    assert len(r["stdout"]) == 16000 and r["truncated"] is True
+
+
+def test_cancelled_request_does_not_leak_its_reply_into_the_next(repl):
+    async def go():
+        task = asyncio.ensure_future(repl.client.run("import time; time.sleep(1); 'late'", timeout_s=30))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return await repl.client.run("'next'", timeout_s=10)
+
+    assert repl.do(go())["result"] == "'next'"

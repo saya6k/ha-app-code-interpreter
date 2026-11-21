@@ -16,6 +16,7 @@ import linecache
 import os
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import traceback
@@ -117,6 +118,64 @@ def execute(code: str, g: dict, cell: int) -> dict:
     }
 
 
+def _read_capped(stream, limit: int, out: list) -> None:
+    buf, truncated = bytearray(), False
+    while chunk := stream.read(65536):
+        room = limit - len(buf)
+        if room > 0:
+            buf += chunk[:room]
+        if len(chunk) > room:
+            truncated = True
+    out[:] = [bytes(buf), truncated]
+
+
+def run_command(command: str, timeout_s: float) -> dict:
+    """sh -c in /sandbox, capped output; timeout or interrupt kills its group."""
+    global _executing
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    outs = [[b"", False], [b"", False]]
+    readers = [
+        threading.Thread(target=_read_capped, args=(s, OUT_LIMIT, o), daemon=True)
+        for s, o in zip((proc.stdout, proc.stderr), outs)
+    ]
+    for t in readers:
+        t.start()
+    error = None
+    signal.signal(signal.SIGINT, _on_sigint)
+    try:
+        _executing = True
+        try:
+            proc.wait(timeout_s)
+        except subprocess.TimeoutExpired:
+            error = "TimeoutError"
+    except KeyboardInterrupt:
+        error = "KeyboardInterrupt"
+    finally:
+        _executing = False
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        for t in readers:
+            t.join(2)  # a detached grandchild may still hold the pipe
+    rc = proc.returncode
+    return {
+        "stdout": outs[0][0].decode(errors="replace"),
+        "stderr": outs[1][0].decode(errors="replace"),
+        "exit_code": None if error else (128 - rc if rc < 0 else rc),
+        "error": error,
+        "truncated": outs[0][1] or outs[1][1],
+    }
+
+
 def _channel(env: str) -> socket.socket:
     sock = socket.socket(fileno=int(os.environ[env]))
     os.set_inheritable(sock.fileno(), False)  # keep it from user subprocesses
@@ -159,9 +218,13 @@ def main() -> None:
             g.clear()
             g.update(new_globals())
             resp = {"error": None}
+        elif op == "command":
+            resp = run_command(req.get("command", ""), float(req.get("timeout_s", 60)))
         else:
             cell += 1
             resp = execute(req.get("code", ""), g, cell)
+        # Echo the id: after a cancelled request the app skips stale replies.
+        resp["id"] = req.get("id")
         try:
             send(conn, resp)
         except OSError:
