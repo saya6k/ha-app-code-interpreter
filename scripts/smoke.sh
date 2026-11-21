@@ -12,7 +12,8 @@ image=${1:-app-code-interpreter:dev}
 idle_wait=${2:-150}
 name=ci-smoke-$$
 tmp=$(mktemp -d)
-cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$tmp"; }
+# The container writes /data as root; the caller may not be able to remove it.
+cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$tmp" 2>/dev/null || true; }
 trap cleanup EXIT
 rc=0
 
@@ -32,15 +33,17 @@ wait_ready() {
   fi
 }
 
+phase_no=0
 start_app() { # options-json
   docker rm -f "$name" >/dev/null 2>&1 || true
-  rm -rf "$tmp/data" "$tmp/share"
-  mkdir -p "$tmp/data" "$tmp/share"
-  printf 'kwh\n1\n2\n3\n' > "$tmp/share/energy.csv"
-  printf '%s\n' "$1" > "$tmp/data/options.json"
+  phase_no=$((phase_no + 1))
+  dir="$tmp/phase$phase_no"  # fresh per phase: never reuse root-owned files
+  mkdir -p "$dir/data" "$dir/share"
+  printf 'kwh\n1\n2\n3\n' > "$dir/share/energy.csv"
+  printf '%s\n' "$1" > "$dir/data/options.json"
   # shellcheck disable=SC2086 # DOCKER_RUN_EXTRA is a list of options
   docker run -d --name "$name" --security-opt seccomp=unconfined ${DOCKER_RUN_EXTRA:-} \
-    -v "$tmp/data:/data" -v "$tmp/share:/share" \
+    -v "$dir/data:/data" -v "$dir/share:/share" \
     -v "$repo/scripts/smoke_client.py:/smoke_client.py:ro" "$image" >/dev/null
   wait_ready 1
 }
@@ -77,7 +80,7 @@ if start_app '{"idle_timeout_minutes": 20, "max_sessions": 3}'; then
     client 0 after_kill
     client 0 open2
     stop_app
-    n=$(cat "$tmp"/data/audit/audit-*.jsonl | grep '"session.destroy"' | grep -c '"reason": "shutdown"' || true)
+    n=$(cat "$dir"/data/audit/audit-*.jsonl | grep '"session.destroy"' | grep -c '"reason": "shutdown"' || true)
     if [ "$n" -ge 2 ]; then echo "PASS | normal stop audits session.destroy (shutdown) x$n"; else fail "shutdown destroy audit ($n)"; fi
   fi
 fi

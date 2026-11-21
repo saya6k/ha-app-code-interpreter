@@ -14,10 +14,12 @@ profile code-interpreter flags=(attach_disconnected,mediate_deleted) {
   unix,
   umount,
 
-  # Signals stay within this profile: the app interrupts and kills its own
-  # sandboxes; other containers' profiles do not accept signals from here.
+  # Send only within this profile: the app interrupts and kills its own
+  # sandboxes. Receive from anyone: the container runtime's stop signal may
+  # come from a named profile (Ubuntu confines runc/containerd), and a sender
+  # still needs send permission in its own profile.
   signal (send, receive) peer=@{profile_name},
-  signal (receive) peer=unconfined,
+  signal (receive),
 
   # bubblewrap: bind/tmpfs mounts, read-only remounts, pivot_root.
   mount,

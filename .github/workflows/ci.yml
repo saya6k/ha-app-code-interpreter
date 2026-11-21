@@ -167,6 +167,9 @@ jobs:
         env:
           DOCKER_RUN_EXTRA: --security-opt apparmor=code-interpreter
         run: bash scripts/smoke.sh code-interpreter-app:ci
+      - name: AppArmor denials (on failure)
+        if: failure()
+        run: sudo dmesg | grep -i 'apparmor="DENIED"' | tail -50 || true
 
   ci-ok:
     name: CI passed

@@ -162,7 +162,7 @@ np.linalg.inv(np.eye(300) * 2)
 plt.plot([1, 2]); plt.title('한글'); plt.savefig('/sandbox/p.png')
 'ok'
 """, timeout=120)
-    assert r["result"] == "'ok'", r["stderr"]
+    assert r["result"] == "'ok'", r
     assert int(code(h, sbx, "import os; os.path.getsize('/sandbox/p.png')")["result"]) > 0
 
 
