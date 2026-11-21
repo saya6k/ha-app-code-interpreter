@@ -6,57 +6,67 @@ the client reports restart_required, kills and starts a fresh one.
 
 import asyncio
 import os
-import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
-from replclient import ReplClient, SandboxNotReady
+from replclient import MAX_MSG, ReplClient, SandboxNotReady, socketpairs
 
 SERVER = Path(__file__).resolve().parents[2] / "ci" / "repl" / "server.py"
 
 
 class Repl:
     def __init__(self) -> None:
-        # Short dir: AF_UNIX paths are capped at 104 bytes on macOS.
-        self.dir = Path(tempfile.mkdtemp(prefix="repl-", dir="/tmp"))
-        self.client = ReplClient(self.dir, grace_s=1)
+        self.loop = asyncio.new_event_loop()
         self.proc: subprocess.Popen | None = None
+        self.client: ReplClient | None = None
         self.start()
 
     def start(self) -> None:
+        (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
         env = dict(
             os.environ,
-            REPL_SOCK=str(self.dir / "repl.sock"),
-            REPL_CTL=str(self.dir / "ctl.sock"),
+            REPL_FD=str(child_repl.fileno()),
+            REPL_CTL_FD=str(child_ctl.fileno()),
         )
         self.proc = subprocess.Popen(
-            [sys.executable, str(SERVER)], env=env, start_new_session=True
+            [sys.executable, str(SERVER)],
+            env=env,
+            pass_fds=(child_repl.fileno(), child_ctl.fileno()),
+            start_new_session=True,
         )
-        asyncio.run(self.client.wait_ready(timeout_s=10))
+        child_repl.close()
+        child_ctl.close()
+        self.client = ReplClient(app_repl, app_ctl, grace_s=1)
+        self.do(self.client.wait_ready(timeout_s=10))
+
+    def do(self, coro):
+        return self.loop.run_until_complete(coro)
 
     def kill(self) -> None:
-        if self.proc.poll() is None:
+        self.client.close()
+        try:
             os.killpg(self.proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass  # already exited on EOF (macOS reports EPERM for a dead group)
         self.proc.wait()
 
     def __call__(self, code: str, timeout: float = 10) -> dict:
-        r = asyncio.run(self.client.run(code, timeout_s=timeout))
+        r = self.do(self.client.run(code, timeout_s=timeout))
         if r.get("restart_required"):
             self.kill()
             self.start()
         return r
 
     def reset(self) -> dict:
-        return asyncio.run(self.client.reset())
+        return self.do(self.client.reset())
 
     def close(self) -> None:
         self.kill()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        self.loop.close()
 
 
 @pytest.fixture
@@ -153,14 +163,45 @@ def test_sys_exit_does_not_kill_server(repl):
 
 def test_interrupt_while_idle_is_ignored(repl):
     repl("still = 'here'")
-    assert asyncio.run(repl.client.interrupt()) is False
+    assert repl.do(repl.client.interrupt()) is False
     assert repl("still")["result"] == "'here'"
 
 
-def test_wait_ready_fails_closed_when_no_server():
-    d = Path(tempfile.mkdtemp(prefix="repl-", dir="/tmp"))
-    try:
-        with pytest.raises(SandboxNotReady):
-            asyncio.run(ReplClient(d).wait_ready(timeout_s=0.3))
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+def test_wait_ready_fails_closed_when_peer_is_gone():
+    (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
+    child_repl.close()
+    child_ctl.close()
+    client = ReplClient(app_repl, app_ctl)
+    with pytest.raises(SandboxNotReady):
+        asyncio.run(client.wait_ready(timeout_s=1))
+
+
+def test_wait_ready_times_out_when_peer_is_silent():
+    (app_repl, app_ctl), child = socketpairs()
+    client = ReplClient(app_repl, app_ctl)
+    with pytest.raises(SandboxNotReady):
+        asyncio.run(client.wait_ready(timeout_s=0.3))
+    for s in child:
+        s.close()
+
+
+def test_forged_oversized_reply_is_rejected_as_kernel_death(repl):
+    code = (
+        "import os, struct\n"
+        "os.write(int(os.environ['REPL_FD']), struct.pack('>I', %d))\n"
+        "import time; time.sleep(5)" % (MAX_MSG + 1)
+    )
+    r = repl(code)
+    assert r["error"] == "KernelDied"
+    assert r["restart_required"] is True
+
+
+def test_reply_fields_outside_the_schema_are_dropped(repl):
+    code = (
+        "import os, json, struct\n"
+        "b = json.dumps({'stdout': 'x', 'restart_required': False, 'evil': 1}).encode()\n"
+        "os.write(int(os.environ['REPL_FD']), struct.pack('>I', len(b)) + b)\n"
+        "import time; time.sleep(5)"
+    )
+    r = repl(code, timeout=1)
+    assert r["stdout"] == "x" and "evil" not in r

@@ -1,10 +1,12 @@
 """Stateful Python REPL server for the sandbox (stdlib only).
 
-Serves one request at a time on a Unix socket and keeps a single globals dict
-across requests. SIGINT interrupts running user code (KeyboardInterrupt) and
-is ignored while idle. The app cannot signal this process by pid (it lives in
-the sandbox's pid namespace), so an "interrupt" request on the control socket
-makes the server send SIGINT to itself.
+Serves requests one at a time on an inherited socket (fd in $REPL_FD) and
+keeps a single globals dict across requests. The app creates the socketpairs
+and passes one end through bubblewrap, so no socket file exists that sandbox
+code could replace. SIGINT interrupts running user code (KeyboardInterrupt)
+and is ignored while idle. The app cannot signal this process by pid (it lives
+in the sandbox's pid namespace), so an "interrupt" request on the control
+channel ($REPL_CTL_FD) makes the server send SIGINT to itself.
 """
 
 import ast
@@ -20,8 +22,6 @@ import traceback
 
 from proto import recv, send
 
-SOCK = os.environ.get("REPL_SOCK", "/run/ci/repl.sock")
-CTL_SOCK = os.environ.get("REPL_CTL", "/run/ci/ctl.sock")
 OUT_LIMIT = 16000
 RESULT_LIMIT = 4000
 
@@ -117,61 +117,55 @@ def execute(code: str, g: dict, cell: int) -> dict:
     }
 
 
-def _listen(path: str) -> socket.socket:
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(path)
-    srv.listen(4)
-    return srv
+def _channel(env: str) -> socket.socket:
+    sock = socket.socket(fileno=int(os.environ[env]))
+    os.set_inheritable(sock.fileno(), False)  # keep it from user subprocesses
+    return sock
 
 
-def _serve_ctl(srv: socket.socket) -> None:
+def _serve_ctl(conn: socket.socket) -> None:
     """Control channel, served on its own thread while a cell runs."""
     while True:
-        conn, _ = srv.accept()
-        with conn:
-            try:
-                req = recv(conn)
-                interrupted = req.get("op") == "interrupt" and _executing
-                if interrupted:
-                    os.kill(os.getpid(), signal.SIGINT)
-                send(conn, {"interrupted": interrupted})
-            except (OSError, ValueError):
-                pass
+        try:
+            req = recv(conn)
+        except (OSError, ValueError):
+            os._exit(0)  # app side closed: the session is gone
+        interrupted = req.get("op") == "interrupt" and _executing
+        if interrupted:
+            os.kill(os.getpid(), signal.SIGINT)
+        try:
+            send(conn, {"interrupted": interrupted})
+        except OSError:
+            os._exit(0)
 
 
 def main() -> None:
     signal.signal(signal.SIGINT, _on_sigint)
-    ctl = _listen(CTL_SOCK)
+    conn = _channel("REPL_FD")
+    ctl = _channel("REPL_CTL_FD")
     threading.Thread(target=_serve_ctl, args=(ctl,), daemon=True).start()
-    srv = _listen(SOCK)  # bound last: its presence means the server is ready
 
     g = new_globals()
     cell = 0
     while True:
-        conn, _ = srv.accept()
-        with conn:
-            try:
-                req = recv(conn)
-            except (OSError, ValueError):
-                continue
-            op = req.get("op")
-            if op == "ping":
-                resp = {"pid": os.getpid()}
-            elif op == "reset":
-                g.clear()
-                g.update(new_globals())
-                resp = {"error": None}
-            else:
-                cell += 1
-                resp = execute(req.get("code", ""), g, cell)
-            try:
-                send(conn, resp)
-            except OSError:
-                pass
+        try:
+            req = recv(conn)
+        except (OSError, ValueError):
+            return  # app side closed: the session is gone
+        op = req.get("op")
+        if op == "ping":
+            resp = {"pid": os.getpid()}
+        elif op == "reset":
+            g.clear()
+            g.update(new_globals())
+            resp = {"error": None}
+        else:
+            cell += 1
+            resp = execute(req.get("code", ""), g, cell)
+        try:
+            send(conn, resp)
+        except OSError:
+            return
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ def main(argv: list[str]) -> int:
     if os.path.exists(PROXY_SOCK):
         listener = socket.create_server(("127.0.0.1", PROXY_PORT))
         threading.Thread(target=_serve, args=(listener,), daemon=True).start()
-    code = subprocess.call(argv)
+    code = subprocess.call(argv, close_fds=False)  # REPL channels are inherited fds
     return 128 - code if code < 0 else code
 
 
