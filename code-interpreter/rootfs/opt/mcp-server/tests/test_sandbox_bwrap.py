@@ -500,3 +500,9 @@ def test_destroy_during_file_op_raises_cleanly(h):
     assert not isinstance(result, AttributeError), result
     assert isinstance(result, (SandboxError, tuple)), result
     assert procs_of(UID) == []
+
+
+def test_kernel_death_reports_the_sandbox_stderr(h, sbx):
+    r = code(h, sbx, "import os; os.write(2, b'native lib: fatal error\\n'); os.abort()")
+    assert r["error"] == "KernelDied" and r["kernel_restarted"] is True
+    assert "native lib: fatal error" in r["stderr"]

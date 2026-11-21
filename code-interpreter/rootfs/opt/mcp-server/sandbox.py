@@ -34,6 +34,7 @@ BASE_DIR = Path("/var/cache/code-interpreter")
 PY = "/opt/venv/bin/python3"
 SANDBOX_CMD = [PY, "/opt/ci/launch.py", PY, "-u", "/opt/ci/repl/server.py"]
 STDERR_TAIL = 4096
+KERNEL_DIED_TAIL = 2000
 READY_TIMEOUT_S = 30.0
 AGENT_TIMEOUT_S = 60.0  # covers streaming a max_file_mb file
 AGENT_REPLY_MAX = 1 << 20  # a full listing (files.LIST_CAP entries) fits
@@ -306,8 +307,16 @@ class Sandbox:
     async def _with_restart(self, call) -> dict:
         if self._client is None:
             raise SandboxError("sandbox is not running")
+        self._stderr_tail.clear()
         r = await call(self._client)
         restarted = r.pop("restart_required")
+        if r.get("error") == "KernelDied":
+            # The REPL died below Python (abort, segfault, a native library
+            # out of threads or memory): its last stderr is the only clue.
+            await asyncio.sleep(0.1)  # let the drain catch up
+            tail = self._stderr_tail.decode(errors="replace").strip()
+            if tail:
+                r["stderr"] = (r["stderr"] + "\n" if r["stderr"] else "") + "[sandbox] " + tail[-KERNEL_DIED_TAIL:]
         if restarted and not self._closed:
             await self._restart_repl()
         r["kernel_restarted"] = restarted
