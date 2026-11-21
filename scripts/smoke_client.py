@@ -121,6 +121,41 @@ async def ha_like_long_call() -> None:
                 await s.call_tool("close_session", {"session_id": res["session_id"]})
 
 
+def ingress_ui(sid: str) -> None:
+    """Ingress UI on :8098 (loopback is allowed; so is HA's Ingress proxy)."""
+    import socket
+    import urllib.error
+    import urllib.request
+
+    def req(url, method="GET", headers=None):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, method=method, headers=headers or {}), timeout=10) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    base = "http://127.0.0.1:8098"
+    status, page = req(f"{base}/")
+    check("ingress UI page", status == 200 and "<title>Code Interpreter</title>" in page, status)
+    status, body = req(f"{base}/api/sessions")
+    live = json.loads(body).get("sessions", []) if status == 200 else []
+    check("ingress UI lists live sessions", sid in [s["session_id"] for s in live], body[:120])
+    status, body = req(f"{base}/api/audit/days")
+    days = json.loads(body).get("days", []) if status == 200 else []
+    status, body = req(f"{base}/api/audit/sessions?day={days[0] if days else ''}")
+    check("ingress UI audit summary", status == 200 and sid in body, body[:120])
+    status, _ = req(f"{base}/api/sessions/{sid}/close", "POST")
+    check("ingress UI close without header refused", status == 403, status)
+    status, body = req(f"{base}/api/sessions/{sid}/close", "POST",
+                       {"X-Requested-With": "code-interpreter-ui", "X-Remote-User-Name": "smoke"})
+    check("ingress UI closes a session", status == 200, body)
+    ui_events = [e for e in audit_events() if e["event"] == "ui.close_session"]
+    check("UI close is audited with the user", ui_events and ui_events[-1]["detail"].get("user") == "smoke", ui_events[-1:])
+    own_ip = socket.gethostbyname(socket.gethostname())
+    status, _ = req(f"http://{own_ip}:8098/api/sessions")
+    check(f"ingress UI refuses a non-Ingress client ({own_ip})", status == 403, status)
+
+
 async def main(idle_wait_s: int, mode: str) -> int:
     if mode == "default":
         await ha_like_long_call()
@@ -152,6 +187,8 @@ async def main(idle_wait_s: int, mode: str) -> int:
 
             r = payload(await call("list_sessions"))
             check("list_sessions", [x["session_id"] for x in r["sessions"]] == [sid], r)
+            ui_sid = payload(await call("run_code", code="1"))["session_id"]
+            await asyncio.to_thread(ingress_ui, ui_sid)
 
             # /share round trip (T7): smoke.sh puts energy.csv into /share.
             r = payload(await call("import_from_share", share_path="energy.csv", session_id=sid))

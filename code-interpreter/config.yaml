@@ -13,6 +13,10 @@ arch:
   - amd64
 init: false
 startup: services
+ingress: true
+ingress_port: 8098
+panel_icon: mdi:language-python
+panel_title: Code Interpreter
 map:
   - share:rw
 discovery:
