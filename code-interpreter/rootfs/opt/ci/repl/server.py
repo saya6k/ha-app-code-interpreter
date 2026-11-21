@@ -1,8 +1,10 @@
-"""Stateful Python REPL server for the sandbox container (stdlib only).
+"""Stateful Python REPL server for the sandbox (stdlib only).
 
 Serves one request at a time on a Unix socket and keeps a single globals dict
 across requests. SIGINT interrupts running user code (KeyboardInterrupt) and
-is ignored while idle, so the client can cancel a timed-out cell safely.
+is ignored while idle. The app cannot signal this process by pid (it lives in
+the sandbox's pid namespace), so an "interrupt" request on the control socket
+makes the server send SIGINT to itself.
 """
 
 import ast
@@ -13,12 +15,13 @@ import os
 import signal
 import socket
 import sys
+import threading
 import traceback
 
 from proto import recv, send
 
-SOCK = os.environ.get("REPL_SOCK", "/tmp/repl.sock")
-PIDFILE = os.environ.get("REPL_PID", "/tmp/repl.pid")
+SOCK = os.environ.get("REPL_SOCK", "/run/ci/repl.sock")
+CTL_SOCK = os.environ.get("REPL_CTL", "/run/ci/ctl.sock")
 OUT_LIMIT = 16000
 RESULT_LIMIT = 4000
 
@@ -114,19 +117,37 @@ def execute(code: str, g: dict, cell: int) -> dict:
     }
 
 
-def main() -> None:
-    signal.signal(signal.SIGINT, _on_sigint)
-    tmp = PIDFILE + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(str(os.getpid()))
-    os.replace(tmp, PIDFILE)
+def _listen(path: str) -> socket.socket:
     try:
-        os.unlink(SOCK)
+        os.unlink(path)
     except FileNotFoundError:
         pass
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(SOCK)
+    srv.bind(path)
     srv.listen(4)
+    return srv
+
+
+def _serve_ctl(srv: socket.socket) -> None:
+    """Control channel, served on its own thread while a cell runs."""
+    while True:
+        conn, _ = srv.accept()
+        with conn:
+            try:
+                req = recv(conn)
+                interrupted = req.get("op") == "interrupt" and _executing
+                if interrupted:
+                    os.kill(os.getpid(), signal.SIGINT)
+                send(conn, {"interrupted": interrupted})
+            except (OSError, ValueError):
+                pass
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT, _on_sigint)
+    ctl = _listen(CTL_SOCK)
+    threading.Thread(target=_serve_ctl, args=(ctl,), daemon=True).start()
+    srv = _listen(SOCK)  # bound last: its presence means the server is ready
 
     g = new_globals()
     cell = 0
