@@ -6,6 +6,7 @@ import pytest
 from pathlib import Path
 
 import service
+from audit import Audit
 from policy import SandboxPolicy
 from sandbox import FileOpError, SandboxError
 
@@ -73,7 +74,7 @@ def make(tmp_path, options=None, create=None):
     o = service.load_options(opts)
     o = dataclasses.replace(o, export_dir=share / "code-interpreter")
     svc = service.Service(o, create_sandbox=create or default_create,
-                          base_dir=tmp_path / "cache", share_root=share)
+                          base_dir=tmp_path / "cache", share_root=share, audit=Audit(tmp_path / "audit"))
     return svc, created
 
 
@@ -280,3 +281,64 @@ def test_write_file_over_limit(tmp_path):
         assert r["error"] == "file_error" and "max_file_mb" in r["detail"]
 
     run(go())
+
+
+def events(tmp_path):
+    out = []
+    for f in sorted((tmp_path / "audit").glob("audit-*.jsonl")):
+        out += [json.loads(x) for x in f.read_text().splitlines()]
+    return out
+
+
+def test_audit_session_lifecycle_and_code_without_output(tmp_path):
+    async def go():
+        svc, _ = make(tmp_path)
+        r = await svc.run_code("set a=secret-output")
+        await svc.run_command("echo hi", session_id=r["session_id"])
+        await svc.close_session(r["session_id"])
+        return r["session_id"]
+
+    sid = run(go())
+    ev = events(tmp_path)
+    assert [e["event"] for e in ev] == ["session.create", "code.exec", "command.exec", "session.destroy"]
+    assert all(e["session_id"] == sid for e in ev)
+    code_ev = ev[1]["detail"]
+    assert code_ev["code"] == "set a=secret-output" and len(code_ev["sha256"]) == 64
+    assert {"ms", "stdout_chars", "stderr_chars", "kernel_restarted", "timeout"} <= code_ev.keys()
+    assert "stdout" not in code_ev and "result" not in code_ev  # output is never stored
+    assert ev[2]["detail"]["command"] == "echo hi" and ev[2]["detail"]["exit_code"] == 0
+    assert ev[3]["detail"]["reason"] == "close"
+
+
+def test_audit_file_events_and_traversal_violation(tmp_path):
+    async def go():
+        svc, _ = make(tmp_path)
+        (tmp_path / "share" / "in.csv").write_text("1")
+        r = await svc.import_from_share("in.csv")
+        sid = r["session_id"]
+        await svc.write_file(sid, "o.txt", "data")
+        await svc.export_to_share(sid, "/sandbox/o.txt")
+        await svc.import_from_share("../etc/passwd", session_id=sid)
+
+    run(go())
+    ev = events(tmp_path)
+    kinds = [(e["event"], e["outcome"]) for e in ev]
+    assert ("file.import", "ok") in kinds and ("file.write", "ok") in kinds and ("file.export", "ok") in kinds
+    assert ("file.import", "error") in kinds
+    viol = [e for e in ev if e["event"] == "policy.violation"]
+    assert viol and viol[0]["detail"]["kind"] == "traversal"
+    exp = next(e for e in ev if e["event"] == "file.export")
+    assert exp["detail"]["share_path"].endswith("/o.txt") and len(exp["detail"]["sha256"]) == 64
+
+
+def test_audit_net_events_attribute_session_and_flag_denials(tmp_path):
+    svc, _ = make(tmp_path)
+    svc._net_event({"session_id": "s1", "host": "pypi.org", "port": 443, "allowed": True,
+                    "bytes_up": 10, "bytes_down": 99, "duration_ms": 5})
+    svc._net_event({"session_id": "s1", "host": "example.com", "port": 443, "allowed": False,
+                    "reason": "not-allowlisted", "bytes_up": 0, "bytes_down": 0, "duration_ms": 1})
+    ev = events(tmp_path)
+    assert [(e["event"], e["outcome"]) for e in ev] == [
+        ("net.connect", "allowed"), ("net.connect", "denied"), ("policy.violation", "denied")]
+    assert ev[0]["session_id"] == "s1" and ev[0]["detail"]["bytes_down"] == 99
+    assert ev[2]["detail"] == {"kind": "egress", "host": "example.com", "port": 443, "reason": "not-allowlisted"}

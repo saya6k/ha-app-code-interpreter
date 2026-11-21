@@ -80,3 +80,8 @@ def test_export_refuses_a_symlinked_session_dir(share, tmp_path):
 def test_export_dir_must_be_inside_share(share, tmp_path):
     with pytest.raises(ShareError, match="outside"):
         sharefs.export(b"x", "a.txt", tmp_path / "elsewhere", "abc", root=share)
+
+
+def test_traversal_to_a_missing_target_is_still_called_outside(share):
+    with pytest.raises(ShareError, match="outside"):
+        sharefs.read_share("../no/such/file", 1000, root=share)

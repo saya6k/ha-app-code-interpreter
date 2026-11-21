@@ -26,6 +26,14 @@ def payload(r):
     return json.loads(r.content[0].text)
 
 
+def audit_events():
+    out = []
+    for name in sorted(os.listdir("/data/audit")):
+        with open(os.path.join("/data/audit", name)) as f:
+            out += [json.loads(x) for x in f]
+    return out
+
+
 def procs_of(uid):
     n = 0
     for pid in filter(str.isdigit, os.listdir("/proc")):
@@ -38,11 +46,43 @@ def procs_of(uid):
     return n
 
 
-async def main(idle_wait_s: int) -> int:
+async def allowlist_mode(call) -> None:
+    """App started with network_allowlist [pypi.org, *.pythonhosted.org]."""
+    r = payload(await call("run_command", timeout_s=180,
+                           command="pip download -q --no-deps -d /tmp/dl requests && ls /tmp/dl"))
+    check("pip download via proxy", r.get("exit_code") == 0 and r.get("stdout", "").startswith("requests-"), r)
+    sid = r.get("session_id")
+    r = payload(await call("run_code", session_id=sid, code=(
+        "import urllib.request, urllib.error, socket\n"
+        "def get(u):\n"
+        "    try: return urllib.request.urlopen(u, timeout=20).status\n"
+        "    except urllib.error.URLError as e: return str(e.reason)\n"
+        "def tcp(h, p):\n"
+        "    try: socket.create_connection((h, p), timeout=3).close(); return 'open'\n"
+        "    except OSError as e: return type(e).__name__\n"
+        "(get('https://example.com/'), tcp('1.1.1.1', 443))")))
+    example, ip = eval(r["result"]) if r.get("result") else (None, None)
+    check("example.com refused, direct IP blocked", "403" in str(example) and ip != "open", r.get("result"))
+    for _ in range(100):  # entries land when each tunnel closes
+        ev = [e for e in audit_events() if e["event"] == "net.connect"]
+        if {"pypi.org", "example.com"} <= {e["detail"]["host"] for e in ev}:
+            break
+        await asyncio.sleep(0.1)
+    hosts = {(e["detail"]["host"], e["outcome"], e["session_id"] == sid) for e in ev}
+    check("net.connect audited per session", ("pypi.org", "allowed", True) in hosts
+          and ("example.com", "denied", True) in hosts, sorted(hosts))
+    viol = [e for e in audit_events() if e["event"] == "policy.violation" and e["detail"].get("kind") == "egress"]
+    check("egress denial audited as policy.violation", bool(viol), viol[:1])
+
+
+async def main(idle_wait_s: int, mode: str) -> int:
     async with streamablehttp_client(URL) as (read, write, _):
         async with ClientSession(read, write) as s:
             await s.initialize()
             call = lambda name, **args: s.call_tool(name, args)  # noqa: E731
+            if mode == "allowlist":
+                await allowlist_mode(call)
+                return 1 if fails else 0
 
             names = sorted(t.name for t in (await s.list_tools()).tools)
             check("tools/list", names == ["close_session", "export_to_share", "import_from_share", "list_files",
@@ -85,6 +125,16 @@ async def main(idle_wait_s: int) -> int:
             r = payload(await call("read_file", session_id=sid, path="/etc/passwd"))
             check("read outside /sandbox refused", r.get("error") == "file_error", r)
 
+            # Audit (T9): events recorded, execution output never stored.
+            r = payload(await call("run_code", session_id=sid, code="print('OUT' + 'PUT-MARKER-7')"))
+            check("marker printed", r.get("stdout") == "OUTPUT-MARKER-7\n", r)
+            ev = audit_events()
+            names = {e["event"] for e in ev}
+            want = {"session.create", "code.exec", "command.exec", "file.import", "file.export", "policy.violation"}
+            check("audit log has the expected events", want <= names, sorted(names))
+            raw = "".join(open(os.path.join("/data/audit", n)).read() for n in os.listdir("/data/audit"))
+            check("audit log holds no execution output", "OUTPUT-MARKER-7" not in raw and "np.float64" not in raw)
+
             if idle_wait_s:
                 deadline = time.time() + idle_wait_s
                 while time.time() < deadline and payload(await call("list_sessions"))["sessions"]:
@@ -102,4 +152,5 @@ async def main(idle_wait_s: int) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main(int(sys.argv[1]) if len(sys.argv) > 1 else 0)))
+    sys.exit(asyncio.run(main(int(sys.argv[1]) if len(sys.argv) > 1 else 0,
+                              sys.argv[2] if len(sys.argv) > 2 else "default")))

@@ -10,13 +10,15 @@ import signal
 
 from mcp.server.fastmcp import FastMCP
 
+from audit import Audit
 from service import Service, load_options
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("mcp-server")
 
 mcp = FastMCP("Code Interpreter", host="0.0.0.0", port=8099, stateless_http=True)
-svc = Service(load_options())
+options = load_options()
+svc = Service(options, audit=Audit(retention_days=options.audit_retention_days))
 
 
 @mcp.tool()
@@ -104,6 +106,12 @@ async def close_session(session_id: str) -> dict:
     return await svc.close_session(session_id)
 
 
+async def prune_audit() -> None:
+    while True:
+        svc.audit.prune()
+        await asyncio.sleep(3600)
+
+
 async def main() -> None:
     svc.clear_leftovers()
     problem = await svc.self_check()
@@ -113,6 +121,7 @@ async def main() -> None:
     else:
         log.info("[mcp-server] sandbox self-check ok")
     reaper = asyncio.create_task(svc.run_reaper())
+    pruner = asyncio.create_task(prune_audit())
     # uvicorn handles SIGTERM itself, then restores the previous handler and
     # re-raises the signal. With the default handler that kills the process
     # before the cleanup below; a no-op handler lets serve() return instead.
@@ -120,9 +129,10 @@ async def main() -> None:
     try:
         await mcp.run_streamable_http_async()
     finally:
-        reaper.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await reaper
+        for task in (reaper, pruner):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await svc.shutdown()
         log.info("[mcp-server] all sessions closed")
 

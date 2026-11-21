@@ -35,6 +35,10 @@ def resolve_share(p: str, root: Path = SHARE) -> Path:
     if not rel:
         raise ShareError("share_path is empty")
     real_root = root.resolve()
+    # Containment first: a path aiming outside /share is a traversal attempt
+    # whether or not its target exists.
+    if not _inside((real_root / rel).resolve(), real_root):
+        raise ShareError(f"/share/{rel} points outside /share")
     try:
         path = (real_root / rel).resolve(strict=True)
     except (OSError, RuntimeError):
