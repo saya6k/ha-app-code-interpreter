@@ -12,6 +12,10 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 
 log = logging.getLogger("mcp-server")
 
+# Each live session runs its sandbox under its own uid (UID_BASE + slot), so
+# sessions cannot signal each other and RLIMIT_NPROC is counted per session.
+UID_BASE = 60000
+
 
 class SessionNotFound(KeyError):
     pass
@@ -20,6 +24,7 @@ class SessionNotFound(KeyError):
 @dataclass(eq=False)
 class Session:
     id: str
+    uid: int
     sandbox: Any
     created: float
     last_used: float
@@ -29,12 +34,13 @@ class Session:
 class SessionManager:
     def __init__(
         self,
-        sandbox_factory: Callable[[str], Awaitable[Any]],
+        sandbox_factory: Callable[[str, int], Awaitable[Any]],
         *,
         idle_timeout_s: float,
         max_sessions: int,
         clock: Callable[[], float] = time.time,
         on_destroy: Callable[[Session, str], None] | None = None,
+        uid_base: int = UID_BASE,
     ) -> None:
         self._factory = sandbox_factory
         self._idle = idle_timeout_s
@@ -42,6 +48,8 @@ class SessionManager:
         self._clock = clock
         self._on_destroy = on_destroy
         self._sessions: dict[str, Session] = {}
+        self._uids = range(uid_base, uid_base + max_sessions)
+        self._retired: set[int] = set()  # sandbox may outlive a failed destroy
         self._create_lock = asyncio.Lock()
 
     def list(self) -> list[Session]:
@@ -99,19 +107,28 @@ class SessionManager:
                 if not idle:
                     raise RuntimeError("max_sessions reached and all sessions are busy")
                 await self._destroy(min(idle, key=lambda s: s.last_used), "evicted")
+            uid = self._free_uid()
             sid = secrets.token_hex(8)
-            sandbox = await self._factory(sid)
+            sandbox = await self._factory(sid, uid)
             now = self._clock()
-            session = Session(sid, sandbox, created=now, last_used=now)
+            session = Session(sid, uid, sandbox, created=now, last_used=now)
             self._sessions[sid] = session
             return session
+
+    def _free_uid(self) -> int:
+        used = {s.uid for s in self._sessions.values()} | self._retired
+        for uid in self._uids:
+            if uid not in used:
+                return uid
+        raise RuntimeError("no sandbox uid available (retired after failed destroys)")
 
     async def _destroy(self, session: Session, reason: str) -> None:
         if self._sessions.pop(session.id, None) is None:
             return
         try:
             await session.sandbox.destroy()
-        except Exception:  # reconcile on next start reclaims leftovers
-            log.exception("[mcp-server] destroy failed sid=%s", session.id)
+        except Exception:  # the app restart reclaims it; until then keep the uid out of use
+            self._retired.add(session.uid)
+            log.exception("[mcp-server] destroy failed sid=%s uid=%d retired", session.id, session.uid)
         if self._on_destroy:
             self._on_destroy(session, reason)

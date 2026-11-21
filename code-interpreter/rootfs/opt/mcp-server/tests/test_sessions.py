@@ -14,8 +14,9 @@ class FakeClock:
 
 
 class FakeSandbox:
-    def __init__(self, sid: str) -> None:
+    def __init__(self, sid: str, uid: int) -> None:
         self.sid = sid
+        self.uid = uid
         self.destroyed = False
 
     async def destroy(self) -> None:
@@ -29,8 +30,8 @@ class Recorder:
         self.created: list[FakeSandbox] = []
         self.destroyed: list[tuple[str, str]] = []
 
-    async def factory(self, sid: str) -> FakeSandbox:
-        sb = FakeSandbox(sid)
+    async def factory(self, sid: str, uid: int) -> FakeSandbox:
+        sb = FakeSandbox(sid, uid)
         self.created.append(sb)
         return sb
 
@@ -212,7 +213,7 @@ def test_destroy_failure_still_removes_session():
             pass
 
         async def boom():
-            raise RuntimeError("docker down")
+            raise RuntimeError("kill failed")
 
         s.sandbox.destroy = boom
         await mgr.close(s.id)
@@ -230,5 +231,87 @@ def test_expires_in_reports_remaining_idle_time():
             pass
         clock.t += 15
         assert mgr.expires_in(s) == 45
+
+    run(go())
+
+
+def test_expired_session_id_raises_not_found_without_creating():
+    async def go():
+        clock = FakeClock()
+        mgr, rec = make(clock=clock, idle=60)
+        async with mgr.acquire(None) as s:
+            pass
+        clock.t += 61
+        await mgr.reap()
+        with pytest.raises(SessionNotFound):
+            async with mgr.acquire(s.id):
+                pass
+        assert len(rec.created) == 1 and mgr.list() == []
+
+    run(go())
+
+
+def test_live_sessions_get_distinct_uids_from_base():
+    async def go():
+        mgr, rec = make(max_sessions=3)
+        for _ in range(3):
+            async with mgr.acquire(None):
+                pass
+        assert sorted(s.uid for s in mgr.list()) == [60000, 60001, 60002]
+        assert [sb.uid for sb in rec.created] == [60000, 60001, 60002]
+
+    run(go())
+
+
+def test_uid_slot_is_reused_after_close():
+    async def go():
+        mgr, _ = make(max_sessions=3)
+        ids = []
+        for _ in range(3):
+            async with mgr.acquire(None) as s:
+                ids.append(s)
+        await mgr.close(ids[1].id)
+        async with mgr.acquire(None) as s:
+            assert s.uid == 60001
+
+    run(go())
+
+
+def test_eviction_hands_the_slot_to_the_new_session():
+    async def go():
+        clock = FakeClock()
+        mgr, rec = make(clock=clock, max_sessions=2)
+        async with mgr.acquire(None) as a:
+            pass
+        clock.t += 1
+        async with mgr.acquire(None):
+            pass
+        clock.t += 1
+        async with mgr.acquire(None) as c:
+            assert c.uid == a.uid
+        assert rec.destroyed == [(a.id, "evicted")]
+
+    run(go())
+
+
+def test_failed_destroy_retires_the_uid():
+    """A sandbox that could not be destroyed may still run under its uid, so the
+    uid must not go to another session."""
+
+    async def go():
+        mgr, _ = make(max_sessions=2)
+        async with mgr.acquire(None) as a:
+            pass
+
+        async def boom():
+            raise RuntimeError("kill failed")
+
+        a.sandbox.destroy = boom
+        await mgr.close(a.id)
+        async with mgr.acquire(None) as b:
+            assert b.uid != a.uid
+        with pytest.raises(RuntimeError, match="uid"):
+            async with mgr.acquire(None):
+                pass
 
     run(go())
