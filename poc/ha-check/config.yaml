@@ -1,0 +1,19 @@
+---
+# Checkpoint A' check: the real apparmor.txt, sbxexec, seccomp filter and
+# Sandbox code on HAOS, with protection mode on. Assemble first:
+#   scripts/assemble-ha-check.sh <dir>   then copy <dir> to /addons/ci-check
+name: code-interpreter check
+version: 0.1.0
+slug: ci_check
+description: One-shot check of the Code Interpreter sandbox on this host.
+arch:
+  - aarch64
+  - amd64
+# init: true (Docker's init as PID 1) reaps orphaned bwrap processes, as s6
+# does in the real app.
+init: true
+startup: once
+boot: manual
+# Same mounts as the real app, so the sandbox's view of /share is tested.
+map:
+  - share:rw

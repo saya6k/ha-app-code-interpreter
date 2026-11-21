@@ -1,0 +1,17 @@
+---
+# Throwaway probe: can an HAOS app sandbox code with bubblewrap, keeping
+# protection mode ON (no docker_api, no extra capabilities)?
+# Install as a local app (copy this folder to /addons/bwrap-probe on the host).
+name: bwrap probe
+version: 0.1.0
+slug: bwrap_probe
+description: One-shot check of bubblewrap sandboxing inside an app container.
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: once
+boot: manual
+# AppArmor: apparmor.txt next to this file is loaded as the app's profile.
+# To see whether a failure is caused by AppArmor, set `apparmor: false`,
+# rebuild, and run again.

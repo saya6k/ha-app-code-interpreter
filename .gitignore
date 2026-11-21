@@ -14,3 +14,6 @@ __pycache__/
 **/SPEC*.md
 **/specs/
 **/tasks/
+
+# macOS Finder metadata
+.DS_Store

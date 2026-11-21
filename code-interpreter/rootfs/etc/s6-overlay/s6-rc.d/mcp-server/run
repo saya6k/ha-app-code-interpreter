@@ -1,0 +1,7 @@
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
+set -euo pipefail
+
+echo "[mcp-server] starting on 0.0.0.0:8099 (/mcp) …"
+cd /opt/mcp-server
+exec /opt/venv/bin/python3 server.py
