@@ -1,0 +1,35 @@
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
+# ==============================================================================
+# Announces the MCP endpoint to Home Assistant via Supervisor discovery.
+# Runs as a oneshot after mcp-server, and never fails the container: a failed
+# announce is a degraded state (add the endpoint manually in HA), not a broken
+# app.
+# ==============================================================================
+set -uo pipefail
+
+# s6 only orders process start, not readiness — wait for the server to listen
+# (its startup sandbox self-check runs first) so the announced URL answers the
+# moment HA validates it.
+for _ in $(seq 1 240); do
+    if (exec 3<>/dev/tcp/127.0.0.1/8099) 2>/dev/null; then
+        exec 3<&-
+        break
+    fi
+    sleep 0.5
+done
+
+# Skipped silently when no Supervisor is present (bare docker smoke tests).
+if ! bashio::supervisor.ping 2>/dev/null; then
+    bashio::log.info "No Supervisor detected — skipping discovery announce."
+    exit 0
+fi
+
+if bashio::discovery "mcp" "{\"url\": \"http://$(hostname):8099/mcp\"}" > /dev/null; then
+    bashio::log.info "Announced MCP endpoint to Home Assistant."
+else
+    bashio::log.warning "Supervisor discovery announce failed (non-fatal)."
+    bashio::log.warning "Add the endpoint manually if it does not appear: http://$(hostname):8099/mcp"
+fi
+
+exit 0

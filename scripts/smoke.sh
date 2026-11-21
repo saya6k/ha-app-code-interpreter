@@ -31,6 +31,13 @@ wait_ready() {
   else
     fail "sandbox self-check at startup"; docker logs "$name" 2>&1 | tail -20; return 1
   fi
+  i=0
+  until docker logs "$name" 2>&1 | grep -q "skipping discovery announce"; do
+    i=$((i + 1))
+    if [ "$i" -gt 20 ]; then fail "discovery oneshot ran (no Supervisor -> skip)"; return 1; fi
+    sleep 0.5
+  done
+  echo "PASS | discovery oneshot ran (no Supervisor -> skip)"
 }
 
 phase_no=0
