@@ -222,3 +222,100 @@ def test_fail_closed_when_sandbox_cannot_start(h):
         assert not (broken.base / "bad").exists()
     finally:
         broken.close()
+
+
+# ---- network (SPEC Success Criteria 2, 3) ---------------------------------
+
+def gateway() -> str:
+    """Default gateway of the app container: the HA host (172.30.32.1) on HAOS."""
+    for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+        f = line.split()
+        if f[1] == "00000000":
+            return ".".join(str(int(f[2][i : i + 2], 16)) for i in (6, 4, 2, 0))
+    raise RuntimeError("no default route")
+
+
+PROBE = """
+import os, socket
+def tcp(host, port):
+    try:
+        socket.create_connection((host, port), timeout=3).close(); return 'open'
+    except OSError as e:
+        return type(e).__name__
+try:
+    socket.getaddrinfo('example.com', 443); dns = 'resolved'
+except OSError:
+    dns = 'failed'
+(tcp('1.1.1.1', 443), tcp('{gw}', 80), tcp('{gw}', 8099), dns,
+ os.path.exists('/run/ci/proxy.sock'), 'HTTPS_PROXY' in os.environ)
+"""
+
+
+def test_no_allowlist_means_no_network_at_all(h, sbx):
+    r = code(h, sbx, PROBE.format(gw=gateway()))
+    assert r["error"] is None, r["stderr"]
+    ip, gw80, gw8099, dns, has_sock, has_env = eval(r["result"])
+    assert "open" not in (ip, gw80, gw8099)
+    assert dns == "failed" and has_sock is False and has_env is False
+    r = code(h, sbx, "import socket\ntry:\n socket.create_connection(('127.0.0.1', 3128), 2); e = None\nexcept OSError as x: e = type(x).__name__\ne")
+    assert r["result"] == "'ConnectionRefusedError'"
+
+
+@pytest.fixture
+def net():
+    events = []
+    harness = Harness(
+        SandboxPolicy(allowlist=("pypi.org", "*.pythonhosted.org")),
+        on_net_event=events.append,
+    )
+    s = harness.create(sid="net1")
+    yield harness, s, events
+    harness.do(s.destroy())
+    harness.close()
+
+
+def test_allowlist_reaches_only_listed_hosts_through_the_proxy(net):
+    h, s, events = net
+    r = code(h, s, PROBE.format(gw=gateway()))
+    ip, gw80, gw8099, dns, has_sock, has_env = eval(r["result"])
+    assert "open" not in (ip, gw80, gw8099)
+    assert dns == "failed" and has_sock is True and has_env is True
+
+    r = code(h, s, """
+import urllib.request, urllib.error
+def get(url):
+    try:
+        return urllib.request.urlopen(url, timeout=20).status
+    except urllib.error.URLError as e:
+        return str(e.reason)
+(get('https://pypi.org/simple/requests/'), get('https://example.com/'))
+""")
+    assert r["error"] is None, r["stderr"]
+    pypi, example = eval(r["result"])
+    assert pypi == 200
+    assert "403" in example
+
+    by_host = {e["host"]: e for e in events}
+    assert by_host["pypi.org"]["allowed"] is True and by_host["pypi.org"]["bytes_down"] > 0
+    assert by_host["example.com"]["allowed"] is False
+    assert by_host["example.com"]["reason"] == "not-allowlisted"
+    assert all(e["session_id"] == "net1" for e in events)
+
+
+def test_pip_download_through_the_proxy(net):
+    h, s, _ = net
+    r = h.do(s.run_command("pip download -q --no-deps -d /tmp/dl requests && ls /tmp/dl", timeout_s=120))
+    assert r["exit_code"] == 0, r["stderr"]
+    assert r["stdout"].startswith("requests-")
+
+
+def test_proxy_socket_belongs_to_the_session_uid(net):
+    _, s, _ = net
+    st = (s.proxy_dir / "proxy.sock").stat()
+    assert (st.st_uid, oct(st.st_mode & 0o777)) == (UID, "0o600")
+
+
+def test_destroy_closes_the_proxy(net):
+    h, s, _ = net
+    h.do(s.destroy())
+    assert not (s.proxy_dir / "proxy.sock").exists()

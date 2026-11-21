@@ -1,9 +1,13 @@
 import asyncio
 import json
+import os
+import shutil
+import stat
+import tempfile
 
 import pytest
 
-import proxy
+import egress as proxy
 
 
 def test_parse_allowlist_defaults_port_443_and_lowercases():
@@ -84,8 +88,8 @@ def test_is_public_ip(ip, public):
 # ---- end-to-end against a local proxy instance (deny paths only; no internet) ----
 
 
-async def _exchange(port: int, request: bytes) -> bytes:
-    r, w = await asyncio.open_connection("127.0.0.1", port)
+async def _exchange(path: str, request: bytes) -> bytes:
+    r, w = await asyncio.open_unix_connection(path)
     w.write(request)
     await w.drain()
     data = await asyncio.wait_for(r.read(4096), 5)
@@ -97,18 +101,19 @@ def _run_proxy_case(request: bytes, resolver=None):
     logs: list[dict] = []
 
     async def go():
-        server = await proxy.serve(
-            "127.0.0.1",
-            0,
-            proxy.parse_allowlist(["allowed.test"]),
-            log=logs.append,
-            resolver=resolver,
-        )
-        port = server.sockets[0].getsockname()[1]
-        async with server:
-            reply = await _exchange(port, request)
-        await asyncio.sleep(0.05)
-        return reply
+        d = tempfile.mkdtemp(prefix="egress-", dir="/tmp")
+        path = os.path.join(d, "proxy.sock")
+        try:
+            server = await proxy.serve_unix(
+                path, proxy.parse_allowlist(["allowed.test"]), log=logs.append, resolver=resolver
+            )
+            assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+            async with server:
+                reply = await _exchange(path, request)
+            await asyncio.sleep(0.05)
+            return reply
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
 
     return asyncio.run(go()), logs
 
@@ -118,7 +123,7 @@ def test_denied_host_gets_403_and_is_logged():
     assert reply.startswith(b"HTTP/1.1 403")
     assert logs[0]["host"] == "example.com" and logs[0]["port"] == 443
     assert logs[0]["allowed"] is False
-    assert {"src_ip", "bytes_up", "bytes_down", "duration_ms"} <= logs[0].keys()
+    assert {"bytes_up", "bytes_down", "duration_ms"} <= logs[0].keys()
     json.dumps(logs[0])
 
 
@@ -142,3 +147,48 @@ def test_allowed_name_resolving_to_private_ip_is_refused():
     assert reply.startswith(b"HTTP/1.1 403")
     assert logs[0]["allowed"] is False
     assert logs[0]["reason"] == "non-public-address"
+
+
+def test_tunnel_closes_and_logs_when_client_is_done_even_if_upstream_lingers(monkeypatch):
+    """A keep-alive upstream must not hold the tunnel (and its log entry) open."""
+    monkeypatch.setattr(proxy, "is_public_ip", lambda ip: True)
+    logs: list[dict] = []
+
+    async def go():
+        async def upstream(r, w):  # echoes, never closes on its own
+            while data := await r.read(65536):
+                w.write(data)
+                await w.drain()
+            await asyncio.sleep(30)
+
+        up = await asyncio.start_server(upstream, "127.0.0.1", 0)
+        up_port = up.sockets[0].getsockname()[1]
+
+        async def resolver(host, port):
+            return ["127.0.0.1"]
+
+        d = tempfile.mkdtemp(prefix="egress-", dir="/tmp")
+        path = os.path.join(d, "proxy.sock")
+        try:
+            server = await proxy.serve_unix(
+                path, proxy.parse_allowlist([f"allowed.test:{up_port}"]), log=logs.append, resolver=resolver
+            )
+            async with server:  # `up` lingers on purpose; close it without waiting
+                r, w = await asyncio.open_unix_connection(path)
+                w.write(f"CONNECT allowed.test:{up_port} HTTP/1.1\r\n\r\n".encode())
+                assert (await r.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 200")
+                w.write(b"ping")
+                assert await asyncio.wait_for(r.readexactly(4), 5) == b"ping"
+                w.write_eof()
+                for _ in range(40):
+                    if logs:
+                        break
+                    await asyncio.sleep(0.05)
+                w.close()
+        finally:
+            up.close()
+            shutil.rmtree(d, ignore_errors=True)
+
+    asyncio.run(asyncio.wait_for(go(), 10))
+    assert logs and logs[0]["allowed"] is True
+    assert logs[0]["bytes_up"] == 4 and logs[0]["bytes_down"] == 4

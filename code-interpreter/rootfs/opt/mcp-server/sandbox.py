@@ -16,7 +16,9 @@ import os
 import shutil
 import signal
 from pathlib import Path
+from typing import Callable
 
+import egress
 from policy import SANDBOX_ROOT, SandboxPolicy, bwrap_argv, exec_prefix, sandbox_env
 from replclient import ReplClient, SandboxNotReady, socketpairs
 from seccomp import compile_filter
@@ -60,6 +62,7 @@ class Sandbox:
         root: Path = SANDBOX_ROOT,
         bwrap: str = "bwrap",
         ready_timeout_s: float = READY_TIMEOUT_S,
+        on_net_event: Callable[[dict], None] | None = None,
     ) -> None:
         self.sid = sid
         self.uid = uid
@@ -75,12 +78,15 @@ class Sandbox:
         self._client: ReplClient | None = None
         self._stderr_tail = bytearray()
         self._commands: set[asyncio.subprocess.Process] = set()
+        self._on_net_event = on_net_event
+        self._proxy: asyncio.Server | None = None
 
     @classmethod
     async def create(cls, sid: str, uid: int, policy: SandboxPolicy, **kw) -> Sandbox:
         sbx = cls(sid, uid, policy, **kw)
         try:
             await asyncio.to_thread(sbx._prepare_dirs)
+            await sbx._start_proxy()
             await sbx._start_repl()
         except BaseException:
             await sbx.destroy()
@@ -96,6 +102,22 @@ class Sandbox:
         self.work.mkdir(mode=0o700)
         os.chown(self.work, self.uid, self.uid)
         self.proxy_dir.mkdir(mode=0o755)
+
+    async def _start_proxy(self) -> None:
+        """Only with an allowlist: no socket means no way out of the sandbox."""
+        if not self.policy.allowlist:
+            return
+
+        def log(entry: dict) -> None:
+            if self._on_net_event:
+                self._on_net_event({"session_id": self.sid, **entry})
+
+        self._proxy = await egress.serve_unix(
+            str(self.proxy_dir / "proxy.sock"),
+            egress.parse_allowlist(list(self.policy.allowlist)),
+            log=log,
+            owner=self.uid,
+        )
 
     async def _spawn(self, cmd: list[str], env_extra: dict[str, str], keep_fds: tuple[int, ...], **io):
         env = sandbox_env(self.policy) | env_extra
@@ -216,4 +238,8 @@ class Sandbox:
         await self._stop_repl()
         for proc in list(self._commands):
             await self._kill(proc)
+        if self._proxy is not None:
+            self._proxy.close()
+            await self._proxy.wait_closed()
+            self._proxy = None
         await asyncio.to_thread(shutil.rmtree, self.dir, True)

@@ -1,19 +1,20 @@
-"""Egress proxy sidecar: the sandbox's only way out (stdlib only).
+"""Egress CONNECT proxy: a sandbox's only way out (SPEC §3.5, stdlib only).
+
+Each session with a non-empty allowlist gets its own listener on a Unix
+socket that is bound into its sandbox at /run/ci/proxy.sock, so every
+connection belongs to exactly one session.
 
 HTTP CONNECT only. The target host:port must match the allowlist
 (`host[:port]`, `*.domain` = subdomains only, port defaults to 443). Plain
 HTTP proxying and IP-literal targets are refused, and names resolving only to
 non-public addresses are refused (no reaching the HA host or LAN by DNS).
-One JSON line per connection on stdout.
-
-Env: EGRESS_ALLOWLIST (comma-separated), EGRESS_LISTEN (default 0.0.0.0:3128).
+`log` gets one dict per connection.
 """
 
 from __future__ import annotations
 
 import asyncio
 import ipaddress
-import json
 import os
 import socket
 import time
@@ -108,9 +109,7 @@ async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, counter: l
 
 async def _handle(reader, writer, rules, log, resolver) -> None:
     start = time.monotonic()
-    peer = writer.get_extra_info("peername")
     entry = {
-        "src_ip": peer[0] if peer else None,
         "host": None,
         "port": None,
         "allowed": False,
@@ -166,9 +165,19 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
         up_reader, up_writer = upstream
         await reply("200 Connection Established")
         up, down = [0], [0]
+        # A CONNECT tunnel carries TLS, which needs no half-close: once the
+        # client is done (or upstream hangs up), tear the tunnel down. Waiting
+        # for a keep-alive upstream would hold the connection and its log open.
+        pipes = [
+            asyncio.ensure_future(_pipe(reader, up_writer, up)),
+            asyncio.ensure_future(_pipe(up_reader, writer, down)),
+        ]
         try:
-            await asyncio.gather(_pipe(reader, up_writer, up), _pipe(up_reader, writer, down))
+            await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            for t in pipes:
+                t.cancel()
+            await asyncio.gather(*pipes, return_exceptions=True)
             entry["bytes_up"], entry["bytes_down"] = up[0], down[0]
             up_writer.close()
     except (ConnectionError, OSError):
@@ -179,32 +188,20 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
         writer.close()
 
 
-async def serve(
-    host: str,
-    port: int,
+async def serve_unix(
+    path: str,
     rules: list[Rule],
     *,
     log: Callable[[dict], None],
+    owner: int | None = None,
     resolver: Callable[[str, int], Awaitable[list[str]]] | None = None,
 ) -> asyncio.Server:
+    """Listen on `path`; only `owner` (the session uid) may connect."""
     resolver = resolver or _resolve
-    return await asyncio.start_server(
-        lambda r, w: _handle(r, w, rules, log, resolver), host, port, limit=HEADER_LIMIT
+    server = await asyncio.start_unix_server(
+        lambda r, w: _handle(r, w, rules, log, resolver), path, limit=HEADER_LIMIT
     )
-
-
-def _print_json(entry: dict) -> None:
-    print(json.dumps(entry), flush=True)
-
-
-async def _main() -> None:
-    rules = parse_allowlist(os.environ.get("EGRESS_ALLOWLIST", "").split(","))
-    host, _, port = os.environ.get("EGRESS_LISTEN", "0.0.0.0:3128").rpartition(":")
-    server = await serve(host, int(port), rules, log=_print_json)
-    print(f"[egress] listening on {host}:{port}, {len(rules)} rule(s)", flush=True)
-    async with server:
-        await server.serve_forever()
-
-
-if __name__ == "__main__":
-    asyncio.run(_main())
+    if owner is not None:
+        os.chown(path, owner, owner)
+    os.chmod(path, 0o600)
+    return server
