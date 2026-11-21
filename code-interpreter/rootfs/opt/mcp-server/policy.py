@@ -53,6 +53,7 @@ def sandbox_env(policy: SandboxPolicy) -> dict[str, str]:
         "LANG": "C.UTF-8",
         "MPLBACKEND": "Agg",
         "MPLCONFIGDIR": "/tmp/mpl",
+        "MATPLOTLIBRC": "/opt/ci/matplotlibrc",  # Korean font by default
     }
     if policy.allowlist:
         url = f"http://127.0.0.1:{PROXY_PORT}"

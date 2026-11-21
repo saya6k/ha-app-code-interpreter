@@ -12,6 +12,7 @@ tmp=$(mktemp -d)
 cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$tmp"; }
 trap cleanup EXIT
 mkdir -p "$tmp/data" "$tmp/share"
+printf 'kwh\n1\n2\n3\n' > "$tmp/share/energy.csv"
 printf '{"idle_timeout_minutes": 1, "max_sessions": 3, "memory_limit_mb": 1024, "network_allowlist": []}\n' \
   > "$tmp/data/options.json"
 

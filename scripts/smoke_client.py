@@ -45,7 +45,8 @@ async def main(idle_wait_s: int) -> int:
             call = lambda name, **args: s.call_tool(name, args)  # noqa: E731
 
             names = sorted(t.name for t in (await s.list_tools()).tools)
-            check("tools/list", names == ["close_session", "list_sessions", "run_code", "run_command"], names)
+            check("tools/list", names == ["close_session", "export_to_share", "import_from_share", "list_files",
+                                          "list_sessions", "read_file", "run_code", "run_command", "write_file"], names)
 
             r1 = payload(await call("run_code", code="x = 20"))
             sid = r1.get("session_id")
@@ -63,6 +64,26 @@ async def main(idle_wait_s: int) -> int:
 
             r = payload(await call("list_sessions"))
             check("list_sessions", [x["session_id"] for x in r["sessions"]] == [sid], r)
+
+            # /share round trip (T7): smoke.sh puts energy.csv into /share.
+            r = payload(await call("import_from_share", share_path="energy.csv", session_id=sid))
+            check("import_from_share", r.get("path") == "/sandbox/energy.csv", r)
+            r = payload(await call("run_code", session_id=sid, code=(
+                "import pandas as pd, matplotlib.pyplot as plt\n"
+                "df = pd.read_csv('energy.csv'); df.kwh.plot(); plt.title('전력'); plt.savefig('plot.png')\n"
+                "df.kwh.mean()")))
+            check("run_code reads it and reports new_files",
+                  r.get("result") in ("2.0", "np.float64(2.0)") and r.get("new_files") == ["/sandbox/plot.png"], r)
+            check("Korean title renders (no missing-glyph warning)", "Glyph" not in r.get("stderr", "x"), r.get("stderr"))
+            r = payload(await call("read_file", session_id=sid, path="/sandbox/plot.png"))
+            check("read_file on binary -> mime only", r.get("binary") is True and r.get("mime") == "image/png", r)
+            r = payload(await call("export_to_share", session_id=sid, path="/sandbox/plot.png"))
+            out = r.get("share_path", "")
+            check("export_to_share", out == f"/share/code-interpreter/{sid}/plot.png" and os.path.getsize(out) > 0, r)
+            r = payload(await call("import_from_share", share_path="../etc/passwd", session_id=sid))
+            check("import outside /share refused", r.get("error") == "share_error", r)
+            r = payload(await call("read_file", session_id=sid, path="/etc/passwd"))
+            check("read outside /sandbox refused", r.get("error") == "file_error", r)
 
             if idle_wait_s:
                 deadline = time.time() + idle_wait_s

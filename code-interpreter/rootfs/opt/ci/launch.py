@@ -13,6 +13,7 @@ for the sandbox's lifetime and supervises the REPL in argv:
                                spares only init and this agent), then start
                                argv again on the new REPL channels
     {"op": "ping"}
+    {"op": "list" | "read" | "write", ...} (+ a pipe fd)  file ops, see files.py
 Restarting inside the sandbox keeps its tmpfs /sandbox, so files survive.
 When the app closes the agent channel, the agent ends the sandbox.
 Without $CI_AGENT_FD it just runs argv and returns its exit code.
@@ -114,15 +115,20 @@ def _agent(argv: list[str], agent: socket.socket) -> int:
             req = json.loads(data)
         except ValueError:
             req = {}
-        if req.get("op") == "restart" and len(fds) == 2:
+        op = req.get("op")
+        if op == "restart" and len(fds) == 2:
             _kill_others(child)
             child.wait()
             child = _start(argv, fds)
             reply = {"ok": True}
+        elif op in ("list", "read", "write"):
+            import files  # sibling module; only the agent needs it
+
+            reply = files.handle(req, fds)
         else:
             for fd in fds:
                 os.close(fd)
-            reply = {"ok": req.get("op") == "ping"}
+            reply = {"ok": op == "ping"}
         agent.send(json.dumps(reply).encode())
 
 

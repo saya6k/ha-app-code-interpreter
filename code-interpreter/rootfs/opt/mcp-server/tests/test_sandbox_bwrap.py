@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from policy import SANDBOX_ROOT, SandboxPolicy
-from sandbox import Sandbox, SandboxError
+from sandbox import FileOpError, Sandbox, SandboxError
 
 pytestmark = pytest.mark.skipif(
     not (SANDBOX_ROOT.is_dir() and shutil.which("bwrap") and os.geteuid() == 0),
@@ -409,3 +409,35 @@ def test_sandbox_killed_from_inside_is_reported_and_files_are_gone(h, sbx):
     assert procs_of(UID) == []
     with pytest.raises(SandboxError, match="files are lost"):
         code(h, sbx, "1")
+
+
+# ---- file ops through the agent (T7) ---------------------------------------
+
+def test_large_binary_round_trip_through_the_agent(h, sbx):
+    data = os.urandom(20 * 1024 * 1024)
+    assert h.do(sbx.write_file("/sandbox/d/blob.bin", data, 20 << 20)) == {"path": "/sandbox/d/blob.bin", "size": len(data)}
+    got, size = h.do(sbx.read_file("d/blob.bin", 21 << 20))
+    assert size == len(data) and got == data
+    r = code(h, sbx, "import hashlib; hashlib.sha256(open('/sandbox/d/blob.bin','rb').read()).hexdigest()")
+    import hashlib
+    assert r["result"] == repr(hashlib.sha256(data).hexdigest())
+
+
+def test_file_ops_stay_inside_sandbox(h, sbx):
+    code(h, sbx, "import os; os.symlink('/etc/passwd', '/sandbox/pw'); os.symlink('/tmp', '/sandbox/t')")
+    for path in ("/etc/passwd", "/sandbox/../etc/passwd", "pw", "t/x"):
+        with pytest.raises(FileOpError, match="outside /sandbox"):
+            h.do(sbx.read_file(path, 100))
+    with pytest.raises(FileOpError):
+        h.do(sbx.write_file("t/evil", b"x", 100))
+    with pytest.raises(FileOpError, match="exceeds"):
+        h.do(sbx.write_file("big", b"x" * 2000, 1000))
+
+
+def test_listing_sees_code_output_and_survives_restart(h, sbx):
+    code(h, sbx, "open('/sandbox/out.csv', 'w').write('a\\n1\\n')")
+    names = [e["path"] for e in h.do(sbx.list_files())["entries"]]
+    assert "/sandbox/out.csv" in names
+    code(h, sbx, "import os; os._exit(1)")
+    names = [e["path"] for e in h.do(sbx.list_files())["entries"]]
+    assert "/sandbox/out.csv" in names

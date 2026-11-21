@@ -35,11 +35,16 @@ PY = "/opt/venv/bin/python3"
 SANDBOX_CMD = [PY, "/opt/ci/launch.py", PY, "-u", "/opt/ci/repl/server.py"]
 STDERR_TAIL = 4096
 READY_TIMEOUT_S = 30.0
-AGENT_TIMEOUT_S = 10.0
+AGENT_TIMEOUT_S = 60.0  # covers streaming a max_file_mb file
+AGENT_REPLY_MAX = 1 << 20  # a full listing (files.LIST_CAP entries) fits
 
 
 class SandboxError(RuntimeError):
     pass
+
+
+class FileOpError(ValueError):
+    """The agent refused a file op (outside /sandbox, too large, missing...)."""
 
 
 class Sandbox:
@@ -169,14 +174,89 @@ class Sandbox:
             await asyncio.sleep(0.1)  # let the stderr drain catch the last words
             raise self._failure(f"{what}: {e}") from None
 
-    def _agent_call(self, req: dict, fds: list[int]) -> dict:
-        """Blocking request on the SOCK_SEQPACKET agent channel (run in a thread)."""
+    def _agent_call(self, req: dict, fds: list[int], stream=None) -> dict:
+        """Blocking request on the SOCK_SEQPACKET agent channel (run in a thread).
+        `stream` runs after the request is sent, e.g. to feed or drain a pipe."""
         self._agent.settimeout(AGENT_TIMEOUT_S)
         socket.send_fds(self._agent, [json.dumps(req).encode()], fds)
-        data = self._agent.recv(4096)
+        if stream is not None:
+            stream()
+        data = self._agent.recv(AGENT_REPLY_MAX)
         if not data:
             raise ConnectionError("agent closed")
         return json.loads(data)
+
+    async def _agent_op(self, req: dict) -> dict:
+        return await self._agent_op_thread(lambda: self._agent_call(req, []))
+
+    async def _agent_op_thread(self, work) -> dict:
+        if self._closed or self._agent is None:
+            raise SandboxError("sandbox is closed")
+        try:
+            async with self._agent_lock:
+                reply = await asyncio.to_thread(work)
+        except (OSError, ValueError) as e:
+            raise self._failure(f"sandbox is gone, its files are lost ({e})") from None
+        if not reply.get("ok"):
+            raise FileOpError(reply.get("error", "file operation failed"))
+        return reply
+
+    async def list_files(self, path: str = "/sandbox", recursive: bool = False) -> dict:
+        reply = await self._agent_op({"op": "list", "path": path, "recursive": recursive})
+        return {"entries": reply["entries"], "truncated": reply["truncated"]}
+
+    async def read_file(self, path: str, limit: int) -> tuple[bytes, int]:
+        """Up to `limit` bytes of a /sandbox file, and its full size."""
+        got = bytearray()
+
+        def drain(r: int) -> None:
+            while chunk := os.read(r, 65536):
+                got.extend(chunk[: max(0, limit - len(got))])
+
+        reply = await self._piped({"op": "read", "path": path, "limit": limit}, give="w", use=drain)
+        return bytes(got), reply["size"]
+
+    async def write_file(self, path: str, data: bytes, max_bytes: int) -> dict:
+        def feed(w: int) -> None:
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(w, view):]
+            except BrokenPipeError:  # agent refused early; its reply says why
+                pass
+
+        reply = await self._piped({"op": "write", "path": path, "max_bytes": max_bytes}, give="r", use=feed)
+        return {"path": reply["path"], "size": reply["size"]}
+
+    async def _piped(self, req: dict, give: str, use) -> dict:
+        """Agent op with a pipe: one end goes to the agent, `use` works the
+        other. The pipe is created, used and closed inside the worker thread,
+        so each fd is closed exactly once even if the caller is cancelled."""
+
+        def stream_op() -> dict:
+            r, w = os.pipe()
+            mine, theirs = (r, w) if give == "w" else (w, r)
+            open_fds = {mine, theirs}
+
+            def close(fd: int) -> None:
+                if fd in open_fds:
+                    open_fds.discard(fd)
+                    os.close(fd)
+
+            def after_send() -> None:
+                close(theirs)  # the agent holds its own copy now
+                try:
+                    use(mine)
+                finally:
+                    close(mine)  # EOF for the agent when we were writing
+
+            try:
+                return self._agent_call(req, [theirs], after_send)
+            finally:
+                for fd in list(open_fds):
+                    close(fd)
+
+        return await self._agent_op_thread(stream_op)
 
     async def _restart_repl(self) -> None:
         """Fresh REPL in the same sandbox: variables go, files stay."""

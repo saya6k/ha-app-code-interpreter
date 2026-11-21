@@ -26,10 +26,13 @@ async def run_code(code: str, session_id: str | None = None, timeout_s: int = 60
     Omit session_id to start a new session and pass the returned session_id on
     follow-up calls. If a call returns session_not_found, the old variables and
     files are gone: start again without session_id. The last expression's value
-    is returned as `result`. Files live under /sandbox; /tmp is scratch.
+    is returned as `result`, and files the call created or changed under
+    /sandbox as `new_files`. Files live under /sandbox (256 MB); /tmp is
+    scratch (64 MB). Use import_from_share / export_to_share to move files
+    between /sandbox and Home Assistant's /share.
 
     Preinstalled: numpy, pandas, scipy, statsmodels, scikit-learn, sympy,
-    networkx, matplotlib (Agg; Korean font NanumGothic), seaborn, openpyxl,
+    networkx, matplotlib (Agg; Korean labels work by default), seaborn, openpyxl,
     xlsxwriter, pyarrow, pillow, lxml, beautifulsoup4, python-docx, fpdf2,
     pyyaml, tabulate. There is no /proc (psutil does not work) and no network
     unless the app's allowlist permits a host. timeout_s is capped at 600.
@@ -45,6 +48,48 @@ async def run_command(command: str, session_id: str | None = None, timeout_s: in
     Returns stdout, stderr and exit_code.
     """
     return await svc.run_command(command, session_id, timeout_s)
+
+
+@mcp.tool()
+async def list_files(session_id: str, path: str = "/sandbox") -> dict:
+    """List files in a session's /sandbox (name, type, size)."""
+    return await svc.list_files(session_id, path)
+
+
+@mcp.tool()
+async def read_file(session_id: str, path: str) -> dict:
+    """Read a text file from /sandbox (up to 16000 characters).
+
+    For binary files only the size and MIME type are returned; use
+    export_to_share to hand them to the user.
+    """
+    return await svc.read_file(session_id, path)
+
+
+@mcp.tool()
+async def write_file(session_id: str, path: str, content: str) -> dict:
+    """Write a text file into /sandbox (parent directories are created)."""
+    return await svc.write_file(session_id, path, content)
+
+
+@mcp.tool()
+async def import_from_share(share_path: str, session_id: str | None = None, dest: str | None = None) -> dict:
+    """Copy a file from Home Assistant's /share into the session's /sandbox.
+
+    share_path is relative to /share (e.g. "energy.csv"). Omit session_id to
+    start a new session. dest defaults to the file name in /sandbox.
+    """
+    return await svc.import_from_share(share_path, session_id, dest)
+
+
+@mcp.tool()
+async def export_to_share(session_id: str, path: str) -> dict:
+    """Copy a /sandbox file (e.g. a plot) to /share so the user can open it.
+
+    Returns share_path, under /share/code-interpreter/<session_id>/. Tell the
+    user that path.
+    """
+    return await svc.export_to_share(session_id, path)
 
 
 @mcp.tool()

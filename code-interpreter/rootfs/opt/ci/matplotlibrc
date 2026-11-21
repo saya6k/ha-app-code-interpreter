@@ -1,0 +1,7 @@
+# Sandbox-wide matplotlib defaults ($MATPLOTLIBRC). Korean labels work out of
+# the box: NanumGothic first, DejaVu Sans for glyphs it lacks.
+backend: Agg
+font.family: sans-serif
+font.sans-serif: NanumGothic, DejaVu Sans
+# NanumGothic has no U+2212 MINUS SIGN; use ASCII '-' on axes.
+axes.unicode_minus: False

@@ -1,23 +1,30 @@
 import asyncio
+import dataclasses
 import json
 
 import pytest
+from pathlib import Path
 
 import service
 from policy import SandboxPolicy
-from sandbox import SandboxError
+from sandbox import FileOpError, SandboxError
 
 
 class FakeSandbox:
     def __init__(self, sid, uid, policy):
         self.sid, self.uid, self.policy = sid, uid, policy
         self.vars = {}
+        self.files = {}
         self.destroyed = False
 
     async def run_code(self, code, timeout_s, reset=False):
         self.last_timeout = timeout_s
         if reset:
             self.vars.clear()
+        if code.startswith("touch "):
+            for name in code[6:].split():
+                self.files["/sandbox/" + name] = b"x"
+            code = "set _=1"
         if code.startswith("set "):
             k, v = code[4:].split("=")
             self.vars[k] = v
@@ -26,6 +33,23 @@ class FakeSandbox:
         result = "2" if code == "1 + 1" else self.vars.get(code)
         return {"stdout": "", "stderr": "", "result": result, "error": None,
                 "truncated": False, "kernel_restarted": False}
+
+    async def list_files(self, path="/sandbox", recursive=False):
+        entries = [{"path": p, "type": "file", "size": len(d), "mtime": 0} for p, d in sorted(self.files.items())]
+        return {"entries": entries, "truncated": False}
+
+    async def read_file(self, path, limit):
+        if path not in self.files:
+            raise FileOpError(f"{path} missing")
+        d = self.files[path]
+        return d[:limit], len(d)
+
+    async def write_file(self, path, data, max_bytes):
+        if len(data) > max_bytes:
+            raise FileOpError("too large")
+        p = path if path.startswith("/sandbox/") else "/sandbox/" + path
+        self.files[p] = data
+        return {"path": p, "size": len(data)}
 
     async def run_command(self, command, timeout_s):
         return {"stdout": command, "stderr": "", "exit_code": 0, "error": None, "truncated": False}
@@ -44,8 +68,12 @@ def make(tmp_path, options=None, create=None):
         created.append(s)
         return s
 
-    svc = service.Service(service.load_options(opts), create_sandbox=create or default_create,
-                          base_dir=tmp_path / "cache")
+    share = tmp_path / "share"
+    share.mkdir(exist_ok=True)
+    o = service.load_options(opts)
+    o = dataclasses.replace(o, export_dir=share / "code-interpreter")
+    svc = service.Service(o, create_sandbox=create or default_create,
+                          base_dir=tmp_path / "cache", share_root=share)
     return svc, created
 
 
@@ -171,3 +199,84 @@ def test_invalid_allowlist_entry_is_dropped_and_logged(tmp_path, caplog):
         o = service.load_options(p)
     assert o.policy.allowlist == ("pypi.org",)
     assert "https://pypi.org" in caplog.text
+
+
+def test_export_dir_outside_share_falls_back(tmp_path, caplog):
+    p = tmp_path / "o.json"
+    p.write_text(json.dumps({"export_dir": "/config/out"}))
+    with caplog.at_level("ERROR"):
+        assert service.load_options(p).export_dir == Path("/share/code-interpreter")
+    assert "/config/out" in caplog.text
+    p.write_text(json.dumps({"export_dir": "/share/../etc"}))
+    assert service.load_options(p).export_dir == Path("/share/code-interpreter")
+    p.write_text(json.dumps({"export_dir": "/share/results"}))
+    assert service.load_options(p).export_dir == Path("/share/results")
+
+
+def test_run_code_reports_new_and_changed_files_but_not_dotfiles(tmp_path):
+    async def go():
+        svc, created = make(tmp_path)
+        r = await svc.run_code("touch a.csv .cache/x b.png")
+        assert r["new_files"] == ["/sandbox/a.csv", "/sandbox/b.png"]
+        r = await svc.run_code("set q=1", session_id=r["session_id"])
+        assert r["new_files"] == []
+
+    run(go())
+
+
+def test_import_read_write_export_round_trip(tmp_path):
+    async def go():
+        svc, created = make(tmp_path)
+        (tmp_path / "share" / "energy.csv").write_text("kwh\n1\n2\n")
+        r = await svc.import_from_share("energy.csv")
+        sid = r["session_id"]
+        assert r["path"] == "/sandbox/energy.csv" and r["size"] == 8
+        r = await svc.read_file(sid, "/sandbox/energy.csv")
+        assert r["content"] == "kwh\n1\n2\n" and r["truncated"] is False
+        await svc.write_file(sid, "out.txt", "result")
+        r = await svc.export_to_share(sid, "/sandbox/out.txt")
+        exported = Path(r["share_path"])
+        assert exported == tmp_path / "share" / "code-interpreter" / sid / "out.txt"
+        assert exported.read_text() == "result"
+
+    run(go())
+
+
+def test_import_refuses_paths_outside_share(tmp_path):
+    async def go():
+        svc, _ = make(tmp_path)
+        (tmp_path / "secret").write_text("x")
+        r = await svc.import_from_share("../secret")
+        assert r["error"] == "share_error" and "outside /share" in r["detail"]
+
+    run(go())
+
+
+def test_read_file_binary_and_missing(tmp_path):
+    async def go():
+        svc, created = make(tmp_path)
+        r = await svc.run_code("1")
+        sid = r["session_id"]
+        created[0].files["/sandbox/p.png"] = b"\x89PNG\x00\x01"
+        r = await svc.read_file(sid, "/sandbox/p.png")
+        assert r["binary"] is True and r["mime"] == "image/png" and "content" not in r
+        r = await svc.read_file(sid, "/sandbox/none.txt")
+        assert r["error"] == "file_error"
+
+    run(go())
+
+
+def test_read_file_truncates_long_text_and_handles_cut_multibyte():
+    data = ("가" * 20000).encode()  # 3 bytes each
+    r = service._text_or_binary("/sandbox/k.txt", data[:64000], len(data))
+    assert r["truncated"] is True and len(r["content"]) == 16000 and set(r["content"]) == {"가"}
+
+
+def test_write_file_over_limit(tmp_path):
+    async def go():
+        svc, _ = make(tmp_path, {"max_file_mb": 1})
+        r = await svc.run_code("1")
+        r = await svc.write_file(r["session_id"], "big.txt", "x" * (2 << 20))
+        assert r["error"] == "file_error" and "max_file_mb" in r["detail"]
+
+    run(go())

@@ -177,6 +177,17 @@ async def isolated():
             after = (await s.run_code("1", timeout_s=30))["result"]
             report("crash restarts kernel", r["kernel_restarted"] and after == "1", (r["error"], after))
 
+        async def file_round_trip():
+            data = os.urandom(4 << 20)
+            await s.write_file("/sandbox/f/blob.bin", data, 8 << 20)
+            got, size = await s.read_file("f/blob.bin", 8 << 20)
+            report("4 MB file round trip via agent (SCM_RIGHTS pipe)", got == data and size == len(data), size)
+            try:
+                await s.read_file("/etc/passwd", 100)
+                report("file op outside /sandbox refused", False, "read succeeded")
+            except Exception as e:
+                report("file op outside /sandbox refused", "outside /sandbox" in str(e), e)
+
         async def command():
             r = await s.run_command("echo hi; exit 3", timeout_s=30)
             report("run_command", (r["stdout"], r["exit_code"]) == ("hi\n", 3), r)
@@ -184,7 +195,8 @@ async def isolated():
         for name, fn in [("variables persist", persist), ("identity probe", identity),
                          ("userns probe", userns), ("leak probe", leaks), ("network probe", network),
                          ("memory probe", memory), ("interrupt probe", interrupt),
-                         ("crash probe", crash), ("run_command probe", command)]:
+                         ("crash probe", crash), ("file probe", file_round_trip),
+                         ("run_command probe", command)]:
             await step(name, fn())
     finally:
         await step("destroy", check_destroyed(s, 60000))
