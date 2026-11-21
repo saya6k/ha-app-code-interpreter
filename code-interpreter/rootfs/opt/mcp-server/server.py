@@ -11,7 +11,7 @@ import signal
 from mcp.server.fastmcp import Context, FastMCP
 
 from audit import Audit
-from service import Service, load_options
+from service import DEFAULT_TIMEOUT_S, Service, load_options
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("mcp-server")
@@ -44,7 +44,7 @@ svc = Service(options, audit=Audit(retention_days=options.audit_retention_days))
 
 @mcp.tool()
 async def run_code(
-    code: str, ctx: Context, session_id: str | None = None, timeout_s: int = 60, reset: bool = False
+    code: str, ctx: Context, session_id: str | None = None, timeout_s: int = DEFAULT_TIMEOUT_S, reset: bool = False
 ) -> dict:
     """Run Python code in a sandbox. Variables persist across calls with the same session_id.
 
@@ -60,17 +60,26 @@ async def run_code(
     networkx, matplotlib (Agg; Korean labels work by default), seaborn, openpyxl,
     xlsxwriter, pyarrow, pillow, lxml, beautifulsoup4, python-docx, fpdf2,
     pyyaml, tabulate. There is no /proc (psutil does not work) and no network
-    unless the app's allowlist permits a host. timeout_s is capped at 600.
+    unless the app's allowlist permits a host.
+
+    Home Assistant ends any tool call after 30 s, so keep timeout_s at its
+    default (25) or lower there: work that needs more than ~25 s (large pip
+    installs, long training) cannot finish in one call. Split it into
+    shorter steps; variables survive between calls. A timed-out cell is
+    interrupted with its variables kept. Other clients may allow up to 600.
     """
     return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset))
 
 
 @mcp.tool()
-async def run_command(command: str, ctx: Context, session_id: str | None = None, timeout_s: int = 60) -> dict:
+async def run_command(
+    command: str, ctx: Context, session_id: str | None = None, timeout_s: int = DEFAULT_TIMEOUT_S
+) -> dict:
     """Run a shell command (sh -c) in a session's sandbox, in /sandbox.
 
     Shares files with run_code in the same session, but not variables.
-    Returns stdout, stderr and exit_code.
+    Returns stdout, stderr and exit_code. Same time limit as run_code: keep
+    timeout_s at 25 or lower under Home Assistant (it ends calls at 30 s).
     """
     return await with_heartbeat(ctx, svc.run_command(command, session_id, timeout_s))
 

@@ -27,6 +27,10 @@ log = logging.getLogger("mcp-server")
 
 OPTIONS_PATH = Path("/data/options.json")
 MAX_TIMEOUT_S = 600
+# Home Assistant's MCP integration ends a tool call after 30 s
+# (asyncio.timeout(30)): stopping at 25 s ourselves lets the cell be
+# interrupted cleanly, variables kept, instead of the call being cut off.
+DEFAULT_TIMEOUT_S = 25
 MIB = 1 << 20
 DEFAULT_EXPORT_DIR = "/share/code-interpreter"
 TEXT_LIMIT = 16000  # chars returned by read_file
@@ -205,7 +209,7 @@ class Service:
         return self.options.max_file_mb * MIB
 
     async def run_code(
-        self, code: str, session_id: str | None = None, timeout_s: float = 60, reset: bool = False
+        self, code: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S, reset: bool = False
     ) -> dict:
         async def snapshot(s) -> dict:
             # new_files is a convenience: a listing problem must never cost
@@ -276,7 +280,7 @@ class Service:
 
         return await self._call(session_id, exp, "file.export", path=path)
 
-    async def run_command(self, command: str, session_id: str | None = None, timeout_s: float = 60) -> dict:
+    async def run_command(self, command: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
         async def cmd(s):
             t0 = time.monotonic()
             r = await s.run_command(command, _clamp(timeout_s))

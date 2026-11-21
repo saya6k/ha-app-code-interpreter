@@ -355,3 +355,12 @@ def test_listing_failure_does_not_cost_run_code_its_result(tmp_path):
         assert (r["result"], r["new_files"], r["error"]) == ("1", [], None)
 
     run(go())
+
+
+def test_default_timeout_stays_under_home_assistants_30_s_cap(tmp_path):
+    async def go():
+        svc, created = make(tmp_path)
+        await svc.run_code("1")
+        assert created[0].last_timeout == service.DEFAULT_TIMEOUT_S < 30
+
+    run(go())
