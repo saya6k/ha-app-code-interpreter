@@ -3,7 +3,8 @@
 # real MCP client drives the tools. Phases: default options (incl. idle
 # expiry and shutdown cleanup), network allowlist, and lifecycle (SIGKILL +
 # restart leaves nothing behind; a normal stop closes every session).
-# Runs the container as Supervisor does (seccomp=unconfined).
+# Runs the container as Supervisor does (seccomp=unconfined). Extra docker run
+# options (e.g. an AppArmor profile in CI) come from $DOCKER_RUN_EXTRA.
 #   scripts/smoke.sh [image] [idle-wait-seconds, default 150; 0 = skip]
 set -eu
 repo=$(cd "$(dirname "$0")/.." && pwd)
@@ -37,7 +38,8 @@ start_app() { # options-json
   mkdir -p "$tmp/data" "$tmp/share"
   printf 'kwh\n1\n2\n3\n' > "$tmp/share/energy.csv"
   printf '%s\n' "$1" > "$tmp/data/options.json"
-  docker run -d --name "$name" --security-opt seccomp=unconfined \
+  # shellcheck disable=SC2086 # DOCKER_RUN_EXTRA is a list of options
+  docker run -d --name "$name" --security-opt seccomp=unconfined ${DOCKER_RUN_EXTRA:-} \
     -v "$tmp/data:/data" -v "$tmp/share:/share" \
     -v "$repo/scripts/smoke_client.py:/smoke_client.py:ro" "$image" >/dev/null
   wait_ready 1

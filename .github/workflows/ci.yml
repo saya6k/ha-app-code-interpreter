@@ -149,7 +149,23 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=min,scope=${{ matrix.arch }}
+      # HAOS runs the app under its own apparmor.txt with seccomp off. Mirror
+      # that: load the real profile, and lift Ubuntu's unprivileged-userns
+      # restriction (an Ubuntu-only sysctl HAOS does not have).
+      - name: Prepare host for bubblewrap
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo apparmor_parser -r -W code-interpreter/apparmor.txt
+      - name: Sandbox integration tests
+        env:
+          DOCKER_RUN_EXTRA: --security-opt apparmor=code-interpreter
+        run: >-
+          bash scripts/test-sandbox.sh code-interpreter-app:ci
+          ci/tests mcp-server/tests/test_replclient.py
       - name: Smoke test
+        env:
+          DOCKER_RUN_EXTRA: --security-opt apparmor=code-interpreter
         run: bash scripts/smoke.sh code-interpreter-app:ci
 
   ci-ok:
