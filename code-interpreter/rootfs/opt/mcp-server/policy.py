@@ -11,6 +11,7 @@ MIB = 1 << 20
 SANDBOX_ROOT = Path("/opt/sandbox-root")
 INNER_ID = "65534"  # what the sandbox sees; outside it is the session uid
 PROXY_PORT = 3128
+BLAS_THREADS = 2
 SBXEXEC = Path(__file__).with_name("sbxexec.py")
 
 
@@ -54,6 +55,12 @@ def sandbox_env(policy: SandboxPolicy) -> dict[str, str]:
         "MPLBACKEND": "Agg",
         "MPLCONFIGDIR": "/tmp/mpl",
         "MATPLOTLIBRC": "/opt/ci/matplotlibrc",  # Korean font by default
+        # OpenBLAS reserves buffers per thread and RLIMIT_AS counts the
+        # reservations: one thread per core made it abort under 1 GB on a
+        # many-core arm64 host. A fixed pool also keeps CPU use modest
+        # without cgroups.
+        "OPENBLAS_NUM_THREADS": str(BLAS_THREADS),
+        "OMP_NUM_THREADS": str(BLAS_THREADS),
     }
     if policy.allowlist:
         url = f"http://127.0.0.1:{PROXY_PORT}"

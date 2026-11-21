@@ -45,6 +45,7 @@ def test_env_without_allowlist_has_no_proxy():
     env = sandbox_env(SandboxPolicy())
     assert env["HOME"] == "/sandbox" and env["MPLBACKEND"] == "Agg"
     assert env["CI_IN_SANDBOX"] == "1"
+    assert env["OPENBLAS_NUM_THREADS"] == env["OMP_NUM_THREADS"] == "2"
     assert not any("PROXY" in k.upper() for k in env)
 
 

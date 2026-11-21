@@ -506,3 +506,15 @@ def test_kernel_death_reports_the_sandbox_stderr(h, sbx):
     r = code(h, sbx, "import os; os.write(2, b'native lib: fatal error\\n'); os.abort()")
     assert r["error"] == "KernelDied" and r["kernel_restarted"] is True
     assert "native lib: fatal error" in r["stderr"]
+
+
+def test_blas_threads_are_capped_so_the_memory_limit_holds_on_many_cores(h, sbx):
+    """OpenBLAS reserves buffers per thread, and RLIMIT_AS counts reservations:
+    on hosts with many cores (a 1 GB limit, an arm64 CI runner) an uncapped
+    pool aborts the REPL. The sandbox caps it, whatever the core count."""
+    r = code(h, sbx, "import os; (os.environ.get('OPENBLAS_NUM_THREADS'), os.environ.get('OMP_NUM_THREADS'))")
+    assert r["result"] == "('2', '2')"
+    r = code(h, sbx, "import numpy as np; from threadpoolctl import threadpool_info; "
+                     "max(i['num_threads'] for i in threadpool_info())")
+    assert r["result"] == "2", r
+
