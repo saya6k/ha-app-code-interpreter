@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Code Interpreter</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1d232a; --muted: #66707a; --line: #e3e6ea;
+    --accent: #2b6cb0; --ok: #2f855a; --warn: #b7791f; --bad: #c53030; --code-bg: #f0f2f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111417; --card: #1b2026; --text: #e6e9ec; --muted: #9aa4ae; --line: #2b323a;
+      --accent: #63a4ff; --ok: #68d391; --warn: #f6c35b; --bad: #fc8181; --code-bg: #12161a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; margin: 4px 0 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; display: flex; align-items: center; gap: 8px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+          padding: 14px 16px; margin-bottom: 16px; }
+  .muted { color: var(--muted); }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+  tr.click { cursor: pointer; }
+  tr.click:hover, tr.selected { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 12px;
+           border: 1px solid currentColor; white-space: nowrap; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  button, select { font: inherit; color: var(--text); background: var(--card);
+                   border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; }
+  button { cursor: pointer; } button:hover { border-color: var(--accent); }
+  button.danger { color: var(--bad); }
+  pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+        margin: 6px 0 0; overflow-x: auto; white-space: pre-wrap; word-break: break-word; max-height: 360px; }
+  details summary { cursor: pointer; }
+  .empty { color: var(--muted); padding: 8px 0; }
+  .scroll { overflow-x: auto; }
+  .settings span { margin-right: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Code Interpreter</h1>
+
+  <section class="card">
+    <h2>Live sessions <span class="muted" id="live-count"></span></h2>
+    <div class="settings muted" id="settings"></div>
+    <div class="scroll"><table>
+      <thead><tr><th>Session</th><th>Created</th><th>Last used</th><th>Expires in</th><th></th></tr></thead>
+      <tbody id="live"></tbody>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <h2>Audit log</h2>
+    <div class="row">
+      <label>Day <select id="day"></select></label>
+      <button id="refresh">Refresh</button>
+    </div>
+    <div class="scroll"><table>
+      <thead><tr><th>Session</th><th>Started</th><th>Ended</th><th>Code</th><th>Cmds</th>
+        <th>Files</th><th>Net ✓/✗</th><th>Errors</th><th>Violations</th></tr></thead>
+      <tbody id="sessions"></tbody>
+    </table></div>
+  </section>
+
+  <section class="card" id="events-card" hidden>
+    <h2>Events <span class="muted mono" id="events-title"></span></h2>
+    <div class="row">
+      <label>Type <select id="event-type">
+        <option value="">all</option>
+        <option>session.create</option><option>session.destroy</option>
+        <option>code.exec</option><option>command.exec</option>
+        <option>file.import</option><option>file.export</option><option>file.write</option>
+        <option>file.read</option><option>file.list</option>
+        <option>net.connect</option><option>policy.violation</option><option>ui.close_session</option>
+      </select></label>
+      <span class="muted" id="events-note"></span>
+    </div>
+    <div id="events"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+// Every value from the audit log (code, hosts, paths) is untrusted: it is only
+// ever placed with textContent, never parsed as HTML.
+const $ = (id) => document.getElementById(id);
+const api = (path, opts) => fetch(path, opts).then(async (r) => {
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+});
+function el(tag, text, cls) {
+  const e = document.createElement(tag);
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  if (cls) e.className = cls;
+  return e;
+}
+// Audit times are UTC ISO strings; show them in the viewer's local time, like
+// the live-session times.
+const time = (iso) => iso ? new Date(iso).toLocaleString() : "—";
+const local = (epoch) => new Date(epoch * 1000).toLocaleString();
+function badge(outcome) {
+  const cls = { ok: "ok", allowed: "ok", error: "bad", denied: "bad" }[outcome] || "warn";
+  return el("span", outcome, "badge " + cls);
+}
+function emptyRow(tbody, cols, text) {
+  const tr = el("tr"); const td = el("td", text, "empty"); td.colSpan = cols; tr.append(td); tbody.append(tr);
+}
+
+async function loadLive() {
+  const data = await api("api/sessions");
+  const s = data.settings;
+  $("settings").replaceChildren(
+    el("span", `idle timeout ${s.idle_timeout_minutes} min`),
+    el("span", `max ${s.max_sessions} sessions`),
+    el("span", `memory ${s.memory_limit_mb} MB`),
+    el("span", s.network_allowlist.length ? `network: ${s.network_allowlist.join(", ")}` : "network: none"),
+  );
+  const tbody = $("live"); tbody.replaceChildren();
+  $("live-count").textContent = `(${data.sessions.length})`;
+  if (!data.sessions.length) return emptyRow(tbody, 5, "No active sessions.");
+  for (const x of data.sessions) {
+    const tr = el("tr");
+    const close = el("button", "Close", "danger");
+    close.onclick = async () => {
+      if (!window.confirm(`Close session ${x.session_id}? Its variables and files are discarded.`)) return;
+      close.disabled = true;
+      try {
+        await api(`api/sessions/${encodeURIComponent(x.session_id)}/close`,
+                  { method: "POST", headers: { "X-Requested-With": "code-interpreter-ui" } });
+      } catch (e) { window.alert(`Could not close: ${e.message}`); }
+      loadLive(); loadSessions();
+    };
+    const td = el("td"); td.append(close);
+    tr.append(el("td", x.session_id, "mono"), el("td", local(x.created)), el("td", local(x.last_used)),
+              el("td", `${Math.floor(x.expires_in_s / 60)}m ${x.expires_in_s % 60}s`), td);
+    tbody.append(tr);
+  }
+}
+
+let selected = null;
+async function loadDays() {
+  const { days } = await api("api/audit/days");
+  const sel = $("day"); const keep = sel.value; sel.replaceChildren();
+  if (!days.length) sel.append(el("option", "no audit log yet"));
+  for (const d of days) {
+    const o = el("option", `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6)}`); o.value = d; sel.append(o);
+  }
+  const want = keep || linked.day;
+  if (want && days.includes(want)) sel.value = want;
+}
+
+// Deep link: #day=YYYYMMDD&session=<id> opens that session's events directly.
+const linked = Object.fromEntries(new URLSearchParams(location.hash.slice(1)));
+if (linked.session) selected = linked.session;
+
+async function loadSessions() {
+  const day = $("day").value; const tbody = $("sessions"); tbody.replaceChildren();
+  if (!/^\d{8}$/.test(day)) return emptyRow(tbody, 9, "Nothing recorded yet.");
+  const { sessions } = await api(`api/audit/sessions?day=${day}`);
+  if (!sessions.length) return emptyRow(tbody, 9, "No sessions on this day.");
+  for (const s of sessions) {
+    const tr = el("tr", undefined, "click" + (s.session_id === selected ? " selected" : ""));
+    const ended = s.ended ? `${time(s.ended)} (${s.end_reason || "?"})` : "open";
+    tr.append(el("td", s.session_id, "mono"), el("td", time(s.started)), el("td", ended),
+              el("td", s.code_runs), el("td", s.commands), el("td", s.files),
+              el("td", `${s.net_allowed} / ${s.net_denied}`),
+              el("td", s.errors, s.errors ? "bad" : ""), el("td", s.violations, s.violations ? "bad" : ""));
+    tr.onclick = () => {
+      selected = s.session_id;
+      history.replaceState(null, "", `#day=${day}&session=${encodeURIComponent(selected)}`);
+      loadSessions(); loadEvents();
+    };
+    tbody.append(tr);
+  }
+}
+
+function summary(e) {
+  const d = e.detail || {};
+  switch (e.event) {
+    case "code.exec": return `${d.ms ?? "?"} ms${d.error ? " · " + d.error : ""}${d.kernel_restarted ? " · kernel restarted" : ""} · out ${d.stdout_chars ?? 0}/${d.stderr_chars ?? 0} chars`;
+    case "command.exec": return `exit ${d.exit_code ?? "—"} · ${d.ms ?? "?"} ms${d.error ? " · " + d.error : ""}`;
+    case "net.connect": return `${d.host}:${d.port}${d.reason ? " · " + d.reason : ""} · ↑${d.bytes_up} ↓${d.bytes_down} B`;
+    case "policy.violation": return `${d.kind}${d.host ? " · " + d.host : ""}${d.message ? " · " + d.message : ""}`;
+    case "session.destroy": return `${d.reason} · lived ${d.lifetime_s}s`;
+    case "session.create": return `uid ${d.uid ?? "?"}${d.error ? " · " + d.error : ""}`;
+    case "ui.close_session": return `by ${d.user || "unknown"} · ${d.result}`;
+    default: return [d.path, d.share_path, d.size !== undefined ? `${d.size} B` : null, d.message].filter(Boolean).join(" · ");
+  }
+}
+
+async function loadEvents() {
+  if (!selected) return;
+  $("events-card").hidden = false;
+  $("events-title").textContent = selected;
+  const params = new URLSearchParams({ day: $("day").value, session_id: selected });
+  if ($("event-type").value) params.set("event", $("event-type").value);
+  const data = await api(`api/audit/events?${params}`);
+  $("events-note").textContent = data.truncated ? `showing ${data.events.length} of ${data.total}` : `${data.total} events`;
+  const box = $("events"); box.replaceChildren();
+  if (!data.events.length) return box.append(el("div", "No matching events.", "empty"));
+  const table = el("table"); const tbody = el("tbody"); table.append(tbody);
+  for (const e of data.events) {
+    const tr = el("tr");
+    const what = el("td"); what.append(el("div", summary(e)));
+    const d = e.detail || {};
+    const source = d.code ?? d.command;
+    if (source !== undefined) {
+      const det = el("details"); det.append(el("summary", d.code !== undefined ? "code" : "command"), el("pre", source, "mono"));
+      what.append(det);
+    }
+    const raw = el("details"); raw.append(el("summary", "raw"), el("pre", JSON.stringify(e, null, 2), "mono"));
+    what.append(raw);
+    const outcome = el("td"); outcome.append(badge(e.outcome));
+    tr.append(el("td", time(e.time), "mono"), el("td", e.event, "mono"), outcome, what);
+    tbody.append(tr);
+  }
+  box.append(table);
+}
+
+async function refreshAll() {
+  try { await Promise.all([loadLive(), loadDays().then(loadSessions)]); await loadEvents(); }
+  catch (e) { console.error(e); }
+}
+$("day").onchange = () => { selected = null; $("events-card").hidden = true; loadSessions(); };
+$("event-type").onchange = loadEvents;
+$("refresh").onclick = refreshAll;
+refreshAll();
+setInterval(() => loadLive().catch(() => {}), 10000);
+</script>
+</body>
+</html>

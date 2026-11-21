@@ -8,9 +8,11 @@ import contextlib
 import logging
 import signal
 
+import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 
-from audit import Audit
+import web
+from audit import AUDIT_DIR, Audit
 from service import DEFAULT_TIMEOUT_S, Service, load_options
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -146,6 +148,15 @@ async def prune_audit() -> None:
         await asyncio.sleep(3600)
 
 
+class _EmbeddedServer(uvicorn.Server):
+    """The Ingress UI server: leaves signals to the MCP server, whose
+    shutdown then stops this one too."""
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        yield
+
+
 async def main() -> None:
     svc.clear_leftovers()
     problem = await svc.self_check()
@@ -156,6 +167,10 @@ async def main() -> None:
         log.info("[mcp-server] sandbox self-check ok")
     reaper = asyncio.create_task(svc.run_reaper())
     pruner = asyncio.create_task(prune_audit())
+    ui = _EmbeddedServer(uvicorn.Config(
+        web.build_app(svc, AUDIT_DIR), host="0.0.0.0", port=web.INGRESS_PORT, log_level="warning",
+    ))
+    ui_task = asyncio.create_task(ui.serve())
     # uvicorn handles SIGTERM itself, then restores the previous handler and
     # re-raises the signal. With the default handler that kills the process
     # before the cleanup below; a no-op handler lets serve() return instead.
@@ -163,6 +178,9 @@ async def main() -> None:
     try:
         await mcp.run_streamable_http_async()
     finally:
+        ui.should_exit = True
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(ui_task, 5)
         for task in (reaper, pruner):
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

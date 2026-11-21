@@ -114,7 +114,9 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test deps
-        run: pip install pytest
+        # The MCP server's own requirements too, so the web UI tests run
+        # against the same Starlette the image ships (not skipped).
+        run: pip install pytest -r code-interpreter/rootfs/opt/mcp-server/requirements.txt
       - name: pytest
         run: python -m pytest code-interpreter/rootfs/opt -q
 

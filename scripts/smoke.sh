@@ -21,7 +21,8 @@ fail() { echo "FAIL | $1"; rc=1; }
 
 wait_ready() {
   i=0
-  until [ "$(docker logs "$name" 2>&1 | grep -c "Uvicorn running")" -ge "$1" ]; do
+  # One line per boot: the MCP server's (the Ingress UI on 8098 logs one too).
+  until [ "$(docker logs "$name" 2>&1 | grep -c "Uvicorn running on http://0.0.0.0:8099")" -ge "$1" ]; do
     i=$((i + 1))
     if [ "$i" -gt 120 ]; then fail "server did not start"; docker logs "$name" 2>&1 | tail -20; return 1; fi
     sleep 0.5
