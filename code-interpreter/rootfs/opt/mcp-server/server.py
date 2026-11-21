@@ -8,7 +8,7 @@ import contextlib
 import logging
 import signal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from audit import Audit
 from service import Service, load_options
@@ -17,12 +17,35 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("mcp-server")
 
 mcp = FastMCP("Code Interpreter", host="0.0.0.0", port=8099, stateless_http=True)
+HEARTBEAT_S = 2.0
+
+
+async def with_heartbeat(ctx: Context, coro):
+    """Run a tool body while sending a log notification every HEARTBEAT_S on
+    the request's SSE stream. Home Assistant's MCP client reads with httpx's
+    default 5 s timeout: a quiet stream is dropped ("SSE stream ended without
+    a response"). Clients ignore these notifications unless they log them."""
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_S)
+            if done:
+                return task.result()
+            with contextlib.suppress(Exception):  # a heartbeat must never fail the call
+                await ctx.debug("still running")
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 options = load_options()
 svc = Service(options, audit=Audit(retention_days=options.audit_retention_days))
 
 
 @mcp.tool()
-async def run_code(code: str, session_id: str | None = None, timeout_s: int = 60, reset: bool = False) -> dict:
+async def run_code(
+    code: str, ctx: Context, session_id: str | None = None, timeout_s: int = 60, reset: bool = False
+) -> dict:
     """Run Python code in a sandbox. Variables persist across calls with the same session_id.
 
     Omit session_id to start a new session and pass the returned session_id on
@@ -39,17 +62,17 @@ async def run_code(code: str, session_id: str | None = None, timeout_s: int = 60
     pyyaml, tabulate. There is no /proc (psutil does not work) and no network
     unless the app's allowlist permits a host. timeout_s is capped at 600.
     """
-    return await svc.run_code(code, session_id, timeout_s, reset)
+    return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset))
 
 
 @mcp.tool()
-async def run_command(command: str, session_id: str | None = None, timeout_s: int = 60) -> dict:
+async def run_command(command: str, ctx: Context, session_id: str | None = None, timeout_s: int = 60) -> dict:
     """Run a shell command (sh -c) in a session's sandbox, in /sandbox.
 
     Shares files with run_code in the same session, but not variables.
     Returns stdout, stderr and exit_code.
     """
-    return await svc.run_command(command, session_id, timeout_s)
+    return await with_heartbeat(ctx, svc.run_command(command, session_id, timeout_s))
 
 
 @mcp.tool()
@@ -75,23 +98,25 @@ async def write_file(session_id: str, path: str, content: str) -> dict:
 
 
 @mcp.tool()
-async def import_from_share(share_path: str, session_id: str | None = None, dest: str | None = None) -> dict:
+async def import_from_share(
+    share_path: str, ctx: Context, session_id: str | None = None, dest: str | None = None
+) -> dict:
     """Copy a file from Home Assistant's /share into the session's /sandbox.
 
     share_path is relative to /share (e.g. "energy.csv"). Omit session_id to
     start a new session. dest defaults to the file name in /sandbox.
     """
-    return await svc.import_from_share(share_path, session_id, dest)
+    return await with_heartbeat(ctx, svc.import_from_share(share_path, session_id, dest))
 
 
 @mcp.tool()
-async def export_to_share(session_id: str, path: str) -> dict:
+async def export_to_share(session_id: str, path: str, ctx: Context) -> dict:
     """Copy a /sandbox file (e.g. a plot) to /share so the user can open it.
 
     Returns share_path, under /share/code-interpreter/<session_id>/. Tell the
     user that path.
     """
-    return await svc.export_to_share(session_id, path)
+    return await with_heartbeat(ctx, svc.export_to_share(session_id, path))
 
 
 @mcp.tool()

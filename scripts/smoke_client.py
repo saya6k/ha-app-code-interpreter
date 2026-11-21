@@ -101,7 +101,29 @@ async def after_kill(call) -> None:
     check("old session id -> session_not_found", r.get("error") == "session_not_found", r)
 
 
+async def ha_like_long_call() -> None:
+    """Home Assistant's MCP client uses httpx's default 5 s read timeout and a
+    30 s cap per call: a call quiet for 5 s used to fail with "SSE stream
+    ended without a response"."""
+    import httpx
+    from mcp.client.streamable_http import streamable_http_client
+
+    async with httpx.AsyncClient() as http, streamable_http_client(url=URL, http_client=http) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            try:
+                async with asyncio.timeout(30):  # HA's per-call cap
+                    res = payload(await s.call_tool("run_code", {"code": "import time; time.sleep(8); 'slept'"}))
+            except Exception as e:  # noqa: BLE001
+                res = {"error": f"{type(e).__name__}: {e}"}
+            check("8 s call through a 5 s read timeout (HA client)", res.get("result") == "'slept'", res)
+            if res.get("session_id"):
+                await s.call_tool("close_session", {"session_id": res["session_id"]})
+
+
 async def main(idle_wait_s: int, mode: str) -> int:
+    if mode == "default":
+        await ha_like_long_call()
     async with streamablehttp_client(URL) as (read, write, _):
         async with ClientSession(read, write) as s:
             await s.initialize()
