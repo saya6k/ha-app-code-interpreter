@@ -158,7 +158,8 @@ shows as a one-line `[audit]` summary in the app log.
 ## Licenses and trademarks
 
 The app's source is at
-<https://github.com/saya6k/ha-app-code-interpreter>. The sandbox bundles
+<https://github.com/saya6k/ha-app-code-interpreter> under the MIT license.
+The sandbox bundles
 bubblewrap (LGPL-2.0-or-later) and the Python packages listed above under
 their own open-source licenses.
 
