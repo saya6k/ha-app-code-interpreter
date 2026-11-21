@@ -14,3 +14,6 @@ arch:
 init: true
 startup: once
 boot: manual
+# Same mounts as the real app, so the sandbox's view of /share is tested.
+map:
+  - share:rw

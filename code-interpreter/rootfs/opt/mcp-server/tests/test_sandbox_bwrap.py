@@ -114,11 +114,12 @@ ok
 
 def test_seccomp_blocks_nested_userns_but_threads_and_processes_work(h, sbx):
     r = code(h, sbx, """
-import os, ctypes, errno, threading, multiprocessing as m
-try:
-    os.unshare(os.CLONE_NEWUSER); userns = 'allowed'
-except PermissionError:
-    userns = 'blocked'
+import os, ctypes, errno, threading, subprocess, sys, multiprocessing as m
+# The REPL is multithreaded, where unshare(CLONE_NEWUSER) fails with EINVAL
+# regardless of seccomp; only a single-threaded child shows the filter.
+p = subprocess.run([sys.executable, '-c', 'import os; os.unshare(os.CLONE_NEWUSER)'],
+                   capture_output=True, text=True)
+userns = 'allowed' if p.returncode == 0 else ('blocked' if 'PermissionError' in p.stderr else p.stderr)
 libc = ctypes.CDLL(None, use_errno=True)
 keyctl_nr = {'x86_64': 250, 'aarch64': 219}[os.uname().machine]
 libc.syscall(keyctl_nr, 0, 0, 0, 0, 0)
