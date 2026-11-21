@@ -36,12 +36,30 @@ SANDBOX_CMD = [PY, "/opt/ci/launch.py", PY, "-u", "/opt/ci/repl/server.py"]
 STDERR_TAIL = 4096
 KERNEL_DIED_TAIL = 2000
 READY_TIMEOUT_S = 30.0
+REAP_TIMEOUT_S = 5.0
 AGENT_TIMEOUT_S = 60.0  # covers streaming a max_file_mb file
 AGENT_REPLY_MAX = 1 << 20  # a full listing (files.LIST_CAP entries) fits
 
 
 class SandboxError(RuntimeError):
     pass
+
+
+def processes_of(uid: int, proc: Path = Path("/proc")) -> int:
+    """Processes (zombies included) whose real uid is `uid`, as this
+    container's /proc sees them."""
+    n = 0
+    for entry in proc.iterdir() if proc.is_dir() else ():
+        if not entry.name.isdigit():
+            continue
+        try:
+            for line in (entry / "status").read_text().splitlines():
+                if line.startswith("Uid:"):
+                    n += int(line.split()[1]) == uid
+                    break
+        except (OSError, ValueError):
+            continue
+    return n
 
 
 class FileOpError(ValueError):
@@ -357,3 +375,17 @@ class Sandbox:
             await egress.close(self._proxy)
             self._proxy = None
         await asyncio.to_thread(shutil.rmtree, self.dir, True)
+        await self._wait_reaped()
+
+    async def _wait_reaped(self) -> None:
+        """Killing is asynchronous: the sandbox's processes die and get reaped
+        a moment after destroy() signals them. Until then they still count
+        against RLIMIT_NPROC for this uid, and the uid goes to the next
+        session right away. Wait for them; if they will not go, raise so the
+        session manager retires the uid."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REAP_TIMEOUT_S
+        while (left := await asyncio.to_thread(processes_of, self.uid)) and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+        if left:
+            raise SandboxError(f"{left} process(es) of uid {self.uid} still alive after destroy")

@@ -146,10 +146,13 @@ try:
 except OSError:
     pass
 n = len(ps)
-for p in ps: p.kill(); p.wait()
 n
 """)
     assert int(r["result"]) < 130
+    # The flood is still alive: destroy() must not hand the uid on before
+    # every one of them is gone (they would eat the next session's NPROC).
+    h.do(sbx.destroy())
+    assert procs_of(UID) == []
 
 
 def test_analysis_stack_with_threads_under_nproc_limit(h, sbx):
