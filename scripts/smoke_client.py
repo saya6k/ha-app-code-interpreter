@@ -75,13 +75,39 @@ async def allowlist_mode(call) -> None:
     check("egress denial audited as policy.violation", bool(viol), viol[:1])
 
 
+SIDS = "/data/smoke-sids.json"  # survives the container restart (volume)
+
+
+async def open_two(call) -> None:
+    sids = []
+    for _ in range(2):
+        r = payload(await call("run_code", code="import subprocess; subprocess.Popen(['sleep', '600']); x = 1"))
+        sids.append(r.get("session_id"))
+    check("two sessions with background processes", all(sids) and procs_of(60000) + procs_of(60001) > 0, sids)
+    with open(SIDS, "w") as f:
+        json.dump(sids, f)
+
+
+async def after_kill(call) -> None:
+    with open(SIDS) as f:
+        old = json.load(f)
+    r = payload(await call("list_sessions"))
+    check("after kill+restart: no sessions", r["sessions"] == [], r)
+    left = sum(procs_of(u) for u in range(59999, 60010))
+    check("after kill+restart: no sandbox processes", left == 0, left)
+    check("after kill+restart: no session dirs", os.listdir("/var/cache/code-interpreter") == [],
+          os.listdir("/var/cache/code-interpreter"))
+    r = payload(await call("run_code", code="x", session_id=old[0]))
+    check("old session id -> session_not_found", r.get("error") == "session_not_found", r)
+
+
 async def main(idle_wait_s: int, mode: str) -> int:
     async with streamablehttp_client(URL) as (read, write, _):
         async with ClientSession(read, write) as s:
             await s.initialize()
             call = lambda name, **args: s.call_tool(name, args)  # noqa: E731
-            if mode == "allowlist":
-                await allowlist_mode(call)
+            if mode != "default":
+                await {"allowlist": allowlist_mode, "open2": open_two, "after_kill": after_kill}[mode](call)
                 return 1 if fails else 0
 
             names = sorted(t.name for t in (await s.list_tools()).tools)
