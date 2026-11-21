@@ -16,7 +16,8 @@ the metadata.
 
 ## Trademarks
 
-The app icon and logo are the unmodified "Python Powered" badges published by
-the Python Software Foundation. "Python" and the Python logos are trademarks or
+The app icon is the unmodified Python logo symbol as published on python.org,
+and the app logo is the unmodified "Python Powered" badge from
+python.org/community/logos; both are only scaled. "Python" and the Python logos are trademarks or
 registered trademarks of the Python Software Foundation. This app is an
 independent community project and is not affiliated with or endorsed by the PSF.
