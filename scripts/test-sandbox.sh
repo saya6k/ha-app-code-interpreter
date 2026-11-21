@@ -1,19 +1,28 @@
 #!/bin/sh
-# Run sandbox.py integration tests against the local Docker daemon.
-# The test runner (not the sandbox) gets docker.sock; the sandbox gets no mounts.
-# Usage: scripts/test-sandbox.sh [sandbox-image]
-# Set SANDBOX_TEST_NO_CGROUP_LIMITS=1 on hosts without a memory/cpu cgroup
-# controller (the linux-test VM); CI runs with full limits.
+# Sandbox checks against the app image on a Docker host (linux-test, CI).
+# Runs the image as Supervisor does (seccomp=unconfined, default caps).
+#   scripts/test-sandbox.sh [image]
 set -eu
-repo=$(cd "$(dirname "$0")/.." && pwd)
-image=${1:-python:3.13-slim}
-docker pull -q python:3.13-slim >/dev/null
-docker run --rm \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v "$repo/code-interpreter/rootfs/opt:/src:ro" \
-  -e SANDBOX_TEST_IMAGE="$image" \
-  -e SANDBOX_TEST_NO_CGROUP_LIMITS="${SANDBOX_TEST_NO_CGROUP_LIMITS:-0}" \
-  -e PYTHONDONTWRITEBYTECODE=1 \
-  -w /src python:3.13-slim \
-  sh -c 'pip install -q --root-user-action=ignore pytest docker==7.1.0 \
-    && python -m pytest -q -p no:cacheprovider mcp-server/tests/test_sandbox_docker.py'
+image=${1:-app-code-interpreter:dev}
+docker run --rm --security-opt seccomp=unconfined --entrypoint /bin/sh "$image" -c '
+set -eu
+uid=60000
+mkdir -p /tmp/sbx-work && chown "$uid:$uid" /tmp/sbx-work
+su_exec() { setpriv --reuid "$uid" --regid "$uid" --clear-groups "$@" 2>/dev/null \
+  || python3 -c "import os,sys; os.setgroups([]); os.setgid($uid); os.setuid($uid); os.execvp(sys.argv[1], sys.argv[1:])" "$@"; }
+su_exec bwrap --unshare-all --unshare-user --die-with-parent \
+  --uid 65534 --gid 65534 --cap-drop ALL --clearenv \
+  --setenv PATH /opt/venv/bin:/usr/bin:/bin --setenv HOME /tmp --setenv MPLBACKEND Agg \
+  --ro-bind /opt/sandbox-root / --dev /dev --tmpfs /tmp --bind /tmp/sbx-work /sandbox --chdir /sandbox \
+  python3 -c "
+import numpy, pandas, matplotlib.pyplot as plt, os, socket, subprocess
+assert os.path.exists(\"/opt/ci/repl/server.py\"), \"ci code missing\"
+assert not os.path.exists(\"/opt/mcp-server\"), \"app rootfs leaked\"
+assert [n for _, n in socket.if_nameindex()] == [\"lo\"]
+r = subprocess.run([\"python3\", \"-c\", \"import os; os.unshare(os.CLONE_NEWUSER)\"], capture_output=True)
+print(\"INFO nested userns:\", \"blocked\" if r.returncode else \"allowed (seccomp filter pending, R4)\")
+plt.plot([1, 2]); plt.savefig(\"/sandbox/p.png\")
+print(\"PASS sandbox rootfs: imports, ci code, no app rootfs, lo only, /sandbox rw\")
+"
+ls -l /tmp/sbx-work/p.png >/dev/null && echo "PASS file visible to app"
+'

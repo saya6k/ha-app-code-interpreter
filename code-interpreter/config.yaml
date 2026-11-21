@@ -4,8 +4,8 @@ version: dev
 slug: code-interpreter
 description: >-
   Stateful Python code execution for Assist conversation agents over MCP.
-  Each session runs in a hardened throwaway container with no network by
-  default, files shared via /share, and a JSONL audit log.
+  Each session runs in a bubblewrap sandbox inside the app with no network
+  by default, files shared via /share, and a JSONL audit log.
 url: https://github.com/saya6k/ha-app-code-interpreter
 stage: experimental
 arch:
@@ -13,7 +13,6 @@ arch:
   - amd64
 init: false
 startup: services
-docker_api: true
 map:
   - share:rw
 discovery:
@@ -28,8 +27,7 @@ ports_description:
 options:
   idle_timeout_minutes: 20
   max_sessions: 3
-  sandbox_image: ''
-  memory_limit_mb: 512
+  memory_limit_mb: 1024
   network_allowlist: []
   max_file_mb: 20
   export_dir: /share/code-interpreter
@@ -37,8 +35,7 @@ options:
 schema:
   idle_timeout_minutes: int(1,1440)
   max_sessions: int(1,10)
-  sandbox_image: str?
-  memory_limit_mb: int(128,8192)
+  memory_limit_mb: int(768,8192)
   network_allowlist:
     - str?
   max_file_mb: int(1,500)

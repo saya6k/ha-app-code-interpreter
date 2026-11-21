@@ -114,7 +114,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test deps
-        run: pip install pytest docker==7.1.0
+        run: pip install pytest
       - name: pytest
         run: python -m pytest code-interpreter/rootfs/opt -q
 
