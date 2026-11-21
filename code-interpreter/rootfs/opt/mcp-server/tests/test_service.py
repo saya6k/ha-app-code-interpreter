@@ -162,3 +162,12 @@ def test_self_check_reports_ok_and_failure(tmp_path):
         assert "no userns" in await svc2.self_check()
 
     run(go())
+
+
+def test_invalid_allowlist_entry_is_dropped_and_logged(tmp_path, caplog):
+    p = tmp_path / "o.json"
+    p.write_text(json.dumps({"network_allowlist": ["https://pypi.org", "pypi.org"]}))
+    with caplog.at_level("ERROR"):
+        o = service.load_options(p)
+    assert o.policy.allowlist == ("pypi.org",)
+    assert "https://pypi.org" in caplog.text

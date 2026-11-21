@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 
 PROXY_SOCK = os.environ.get("CI_PROXY_SOCK", "/run/ci/proxy.sock")
 PROXY_PORT = int(os.environ.get("CI_PROXY_PORT", "3128"))
@@ -45,9 +46,18 @@ def _relay(client: socket.socket) -> None:
 
 
 def _serve(listener: socket.socket) -> None:
+    # Must survive transient limits (EMFILE under RLIMIT_NOFILE, no thread
+    # under RLIMIT_NPROC): if this loop dies, egress is gone for the session.
     while True:
-        client, _ = listener.accept()
-        threading.Thread(target=_relay, args=(client,), daemon=True).start()
+        try:
+            client, _ = listener.accept()
+        except OSError:
+            time.sleep(0.1)
+            continue
+        try:
+            threading.Thread(target=_relay, args=(client,), daemon=True).start()
+        except RuntimeError:
+            client.close()
 
 
 def main(argv: list[str]) -> int:

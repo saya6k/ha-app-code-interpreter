@@ -204,7 +204,10 @@ async def allowlisted():
             pypi, example = await result_of(s, FETCH)
             report("pypi.org reachable through proxy", pypi == 200, pypi)
             report("example.com refused", "403" in str(example), example)
-            await asyncio.sleep(0.5)
+            for _ in range(100):  # entries land when each tunnel closes (<= 5 s drain)
+                if {"pypi.org", "example.com"} <= {e["host"] for e in events}:
+                    break
+                await asyncio.sleep(0.1)
             hosts = {(e["host"], e["allowed"], e["session_id"]) for e in events}
             report("connections logged per session",
                    {("pypi.org", True, "check2"), ("example.com", False, "check2")} <= hosts, sorted(hosts))

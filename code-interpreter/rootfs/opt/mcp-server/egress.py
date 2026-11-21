@@ -14,8 +14,10 @@ non-public addresses are refused (no reaching the HA host or LAN by DNS).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import ipaddress
 import os
+import re
 import socket
 import time
 from typing import Awaitable, Callable
@@ -23,6 +25,10 @@ from typing import Awaitable, Callable
 CONNECT_TIMEOUT_S = 10
 HEADER_TIMEOUT_S = 10
 HEADER_LIMIT = 8192
+# After the client half-closes, how long upstream may keep answering.
+DRAIN_AFTER_CLIENT_EOF_S = 5
+CLOSE_TIMEOUT_S = 5
+_HOST_RE = re.compile(r"^(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)*$")
 
 Rule = tuple[str, int]
 
@@ -31,17 +37,19 @@ def _norm(host: str) -> str:
     return host.strip().lower().rstrip(".")
 
 
+def parse_rule(entry: str) -> Rule:
+    """`host[:port]` or `*.domain[:port]`; ValueError naming the entry otherwise."""
+    host, sep, port = entry.strip().rpartition(":")
+    if not sep:
+        host, port = entry.strip(), "443"
+    host = _norm(host)
+    if not _HOST_RE.match(host) or is_ip_literal(host) or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"invalid allowlist entry {entry!r}: expected host[:port] or *.domain[:port]")
+    return host, int(port)
+
+
 def parse_allowlist(entries: list[str]) -> list[Rule]:
-    rules = []
-    for entry in entries:
-        entry = entry.strip()
-        if not entry:
-            continue
-        host, sep, port = entry.rpartition(":")
-        if not sep:
-            host, port = entry, "443"
-        rules.append((_norm(host), int(port)))
-    return rules
+    return [parse_rule(e) for e in entries if e.strip()]
 
 
 def is_allowed(host: str, port: int, rules: list[Rule]) -> bool:
@@ -109,6 +117,7 @@ async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, counter: l
 
 async def _handle(reader, writer, rules, log, resolver) -> None:
     start = time.monotonic()
+    upstream = None
     entry = {
         "host": None,
         "port": None,
@@ -151,7 +160,6 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
         if not public:
             return await reply("403 Forbidden", "non-public-address")
         entry["allowed"] = True
-        upstream = None
         for addr in public:
             try:
                 upstream = await asyncio.wait_for(
@@ -165,24 +173,25 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
         up_reader, up_writer = upstream
         await reply("200 Connection Established")
         up, down = [0], [0]
-        # A CONNECT tunnel carries TLS, which needs no half-close: once the
-        # client is done (or upstream hangs up), tear the tunnel down. Waiting
-        # for a keep-alive upstream would hold the connection and its log open.
-        pipes = [
-            asyncio.ensure_future(_pipe(reader, up_writer, up)),
-            asyncio.ensure_future(_pipe(up_reader, writer, down)),
-        ]
+        to_up = asyncio.ensure_future(_pipe(reader, up_writer, up))
+        to_client = asyncio.ensure_future(_pipe(up_reader, writer, down))
         try:
-            await asyncio.wait(pipes, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait({to_up, to_client}, return_when=asyncio.FIRST_COMPLETED)
+            if to_client not in done:
+                # The client half-closed. Let upstream finish its answer, but a
+                # keep-alive upstream must not hold the tunnel (and its log)
+                # open for long.
+                await asyncio.wait({to_client}, timeout=DRAIN_AFTER_CLIENT_EOF_S)
         finally:
-            for t in pipes:
+            for t in (to_up, to_client):
                 t.cancel()
-            await asyncio.gather(*pipes, return_exceptions=True)
+            await asyncio.gather(to_up, to_client, return_exceptions=True)
             entry["bytes_up"], entry["bytes_down"] = up[0], down[0]
-            up_writer.close()
     except (ConnectionError, OSError):
         pass
     finally:
+        if upstream is not None:
+            upstream[1].close()
         entry["duration_ms"] = int((time.monotonic() - start) * 1000)
         log(entry)
         writer.close()
@@ -196,12 +205,31 @@ async def serve_unix(
     owner: int | None = None,
     resolver: Callable[[str, int], Awaitable[list[str]]] | None = None,
 ) -> asyncio.Server:
-    """Listen on `path`; only `owner` (the session uid) may connect."""
+    """Listen on `path`; only `owner` (the session uid) may connect. Stop with close()."""
     resolver = resolver or _resolve
-    server = await asyncio.start_unix_server(
-        lambda r, w: _handle(r, w, rules, log, resolver), path, limit=HEADER_LIMIT
-    )
+    handlers: set[asyncio.Task] = set()
+
+    async def handle(r, w):
+        task = asyncio.current_task()
+        handlers.add(task)
+        try:
+            await _handle(r, w, rules, log, resolver)
+        finally:
+            handlers.discard(task)
+
+    server = await asyncio.start_unix_server(handle, path, limit=HEADER_LIMIT)
+    server.handlers = handlers  # for close()
     if owner is not None:
         os.chown(path, owner, owner)
     os.chmod(path, 0o600)
     return server
+
+
+async def close(server: asyncio.Server) -> None:
+    """Stop listening and end open tunnels now. A handler stuck in DNS or a
+    connect timeout would otherwise hold wait_closed() (and session teardown)."""
+    server.close()
+    for task in list(server.handlers):
+        task.cancel()
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(server.wait_closed(), CLOSE_TIMEOUT_S)

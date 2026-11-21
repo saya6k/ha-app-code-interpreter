@@ -296,6 +296,12 @@ def get(url):
     assert pypi == 200
     assert "403" in example
 
+    # A keep-alive upstream holds the tunnel for up to DRAIN_AFTER_CLIENT_EOF_S
+    # after the client is done; the log entry is written when it closes.
+    for _ in range(100):
+        if {"pypi.org", "example.com"} <= {e["host"] for e in events}:
+            break
+        h.do(asyncio.sleep(0.1))
     by_host = {e["host"]: e for e in events}
     assert by_host["pypi.org"]["allowed"] is True and by_host["pypi.org"]["bytes_down"] > 0
     assert by_host["example.com"]["allowed"] is False
@@ -320,3 +326,37 @@ def test_destroy_closes_the_proxy(net):
     h, s, _ = net
     h.do(s.destroy())
     assert not (s.proxy_dir / "proxy.sock").exists()
+
+
+# ---- teardown races (code review) ------------------------------------------
+
+def test_destroy_during_running_cell_leaves_nothing(h):
+    """destroy() must win over the restart that the dying cell triggers."""
+    s = h.create()
+
+    async def race():
+        cell = asyncio.ensure_future(s.run_code("import time; time.sleep(60)", timeout_s=60))
+        await asyncio.sleep(1)
+        await s.destroy()
+        return await cell
+
+    r = h.do(race())
+    assert r["error"] == "KernelDied"
+    h.do(asyncio.sleep(0.5))
+    assert procs_of(UID) == [], procs_of(UID, states=True)
+    assert not s.dir.exists()
+
+
+def test_cancelled_run_command_is_killed(h, sbx):
+    async def go():
+        task = asyncio.ensure_future(sbx.run_command("sleep 300", timeout_s=600))
+        await asyncio.sleep(1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.5)
+
+    h.do(go())
+    names = [n for _, n, _ in procs_of(UID, states=True)]
+    assert "sleep" not in names, names
+    assert code(h, sbx, "1")["result"] == "1"  # the session itself is fine

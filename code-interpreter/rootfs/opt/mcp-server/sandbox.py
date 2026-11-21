@@ -80,6 +80,10 @@ class Sandbox:
         self._commands: set[asyncio.subprocess.Process] = set()
         self._on_net_event = on_net_event
         self._proxy: asyncio.Server | None = None
+        # Set first thing in destroy(): no process may start after it, or it
+        # would outlive the session and keep running under a uid that the
+        # next session gets.
+        self._closed = False
 
     @classmethod
     async def create(cls, sid: str, uid: int, policy: SandboxPolicy, **kw) -> Sandbox:
@@ -120,11 +124,15 @@ class Sandbox:
         )
 
     async def _spawn(self, cmd: list[str], env_extra: dict[str, str], keep_fds: tuple[int, ...], **io):
+        if self._closed:
+            raise SandboxError("sandbox is closed")
         env = sandbox_env(self.policy) | env_extra
         r, w = os.pipe()
         try:
-            os.write(w, compile_filter())
-            os.close(w)
+            try:
+                os.write(w, compile_filter())
+            finally:
+                os.close(w)
             argv = exec_prefix(self.policy, self.uid) + bwrap_argv(
                 self.policy,
                 work=self.work,
@@ -134,7 +142,7 @@ class Sandbox:
                 root=self.root,
                 bwrap=self.bwrap,
             ) + LAUNCH + cmd
-            return await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.DEVNULL,
                 pass_fds=(r, *keep_fds),
@@ -143,6 +151,10 @@ class Sandbox:
             )
         finally:
             os.close(r)
+        if self._closed:  # destroy() ran while we were spawning
+            await self._kill(proc)
+            raise SandboxError("sandbox is closed")
+        return proc
 
     async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
         while chunk := await stream.read(65536):
@@ -150,6 +162,7 @@ class Sandbox:
             del self._stderr_tail[:-STDERR_TAIL]
 
     async def _start_repl(self) -> None:
+        self._stderr_tail.clear()
         (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
         try:
             self._repl = await self._spawn(
@@ -159,6 +172,10 @@ class Sandbox:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
+        except BaseException:
+            app_repl.close()
+            app_ctl.close()
+            raise
         finally:
             child_repl.close()
             child_ctl.close()
@@ -174,9 +191,11 @@ class Sandbox:
 
     async def _kill(self, proc: asyncio.subprocess.Process) -> None:
         # The outer bwrap leads the process group; --die-with-parent then takes
-        # down the sandbox's pid namespace with it.
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
+        # down the sandbox's pid namespace with it. Once asyncio has reaped the
+        # process its pid may belong to someone else: never signal it then.
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
         await proc.wait()
 
     async def _stop_repl(self) -> None:
@@ -196,7 +215,7 @@ class Sandbox:
                 await self._restart()
         r = await self._client.run(code, timeout_s)
         restarted = r.pop("restart_required")
-        if restarted:
+        if restarted and not self._closed:
             await self._restart()
         r["kernel_restarted"] = restarted
         return r
@@ -219,13 +238,19 @@ class Sandbox:
         )
         error = None
         try:
-            await asyncio.wait_for(proc.wait(), timeout_s)
-        except TimeoutError:
-            error = "TimeoutError"
-            await self._kill(proc)
+            try:
+                await asyncio.wait_for(proc.wait(), timeout_s)
+            except TimeoutError:
+                error = "TimeoutError"
+                await self._kill(proc)
+            (out, out_trunc), (err, err_trunc) = await readers
+        except BaseException:  # e.g. the caller was cancelled
+            readers.cancel()
+            raise
         finally:
+            if proc.returncode is None:  # never leave a command running untracked
+                await self._kill(proc)
             self._commands.discard(proc)
-        (out, out_trunc), (err, err_trunc) = await readers
         return {
             "stdout": out.decode(errors="replace"),
             "stderr": err.decode(errors="replace"),
@@ -235,11 +260,11 @@ class Sandbox:
         }
 
     async def destroy(self) -> None:
+        self._closed = True
         await self._stop_repl()
         for proc in list(self._commands):
             await self._kill(proc)
         if self._proxy is not None:
-            self._proxy.close()
-            await self._proxy.wait_closed()
+            await egress.close(self._proxy)
             self._proxy = None
         await asyncio.to_thread(shutil.rmtree, self.dir, True)

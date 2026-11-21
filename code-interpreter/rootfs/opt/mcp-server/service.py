@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Awaitable, Callable
 
+import egress
 from policy import SandboxPolicy
 from sandbox import BASE_DIR, Sandbox, SandboxError
 from sessions import UID_BASE, Session, SessionManager, SessionNotFound
@@ -41,11 +42,20 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
         raw = json.loads(path.read_text())
     except (OSError, ValueError):
         raw = {}
-    allow = tuple(e.strip() for e in raw.get("network_allowlist") or [] if e and e.strip())
+    allow = []
+    for entry in raw.get("network_allowlist") or []:
+        if not entry or not entry.strip():
+            continue
+        try:
+            egress.parse_rule(entry)
+        except ValueError as e:  # dropping only narrows egress: fail-closed
+            log.error("[mcp-server] %s — ignored", e)
+            continue
+        allow.append(entry.strip())
     return Options(
         idle_timeout_minutes=int(raw.get("idle_timeout_minutes", 20)),
         max_sessions=int(raw.get("max_sessions", 3)),
-        policy=SandboxPolicy(memory_mb=int(raw.get("memory_limit_mb", 1024)), allowlist=allow),
+        policy=SandboxPolicy(memory_mb=int(raw.get("memory_limit_mb", 1024)), allowlist=tuple(allow)),
     )
 
 

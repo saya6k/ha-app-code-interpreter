@@ -180,7 +180,7 @@ def test_tunnel_closes_and_logs_when_client_is_done_even_if_upstream_lingers(mon
                 w.write(b"ping")
                 assert await asyncio.wait_for(r.readexactly(4), 5) == b"ping"
                 w.write_eof()
-                for _ in range(40):
+                for _ in range(160):  # within DRAIN_AFTER_CLIENT_EOF_S + slack
                     if logs:
                         break
                     await asyncio.sleep(0.05)
@@ -192,3 +192,75 @@ def test_tunnel_closes_and_logs_when_client_is_done_even_if_upstream_lingers(mon
     asyncio.run(asyncio.wait_for(go(), 10))
     assert logs and logs[0]["allowed"] is True
     assert logs[0]["bytes_up"] == 4 and logs[0]["bytes_down"] == 4
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["https://pypi.org", "pypi.org:0", "pypi.org:99999", "pypi.org:http", "1.2.3.4", "*.", "a b.com", "*"],
+)
+def test_invalid_allowlist_entries_are_rejected_by_name(entry):
+    with pytest.raises(ValueError, match="invalid allowlist entry"):
+        proxy.parse_rule(entry)
+
+
+def test_half_closed_client_still_gets_the_upstream_answer(monkeypatch):
+    """nc -N style: send, shutdown(SHUT_WR), then read."""
+    monkeypatch.setattr(proxy, "is_public_ip", lambda ip: True)
+
+    async def go():
+        async def upstream(r, w):  # answers only after the client's EOF
+            await r.read()
+            w.write(b"pong")
+            await w.drain()
+            w.close()
+
+        up = await asyncio.start_server(upstream, "127.0.0.1", 0)
+        port = up.sockets[0].getsockname()[1]
+
+        async def resolver(host, p):
+            return ["127.0.0.1"]
+
+        d = tempfile.mkdtemp(prefix="egress-", dir="/tmp")
+        path = os.path.join(d, "proxy.sock")
+        try:
+            server = await proxy.serve_unix(path, proxy.parse_allowlist([f"allowed.test:{port}"]),
+                                            log=lambda e: None, resolver=resolver)
+            r, w = await asyncio.open_unix_connection(path)
+            w.write(f"CONNECT allowed.test:{port} HTTP/1.1\r\n\r\n".encode())
+            await r.readuntil(b"\r\n\r\n")
+            w.write(b"ping")
+            w.write_eof()
+            got = await asyncio.wait_for(r.read(), 5)
+            w.close()
+            await proxy.close(server)
+            up.close()
+            return got
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    assert asyncio.run(asyncio.wait_for(go(), 10)) == b"pong"
+
+
+def test_close_ends_a_handler_stuck_in_dns_quickly():
+    logs = []
+
+    async def go():
+        async def stuck(host, port):
+            await asyncio.sleep(3600)
+
+        d = tempfile.mkdtemp(prefix="egress-", dir="/tmp")
+        path = os.path.join(d, "proxy.sock")
+        try:
+            server = await proxy.serve_unix(path, proxy.parse_allowlist(["allowed.test"]),
+                                            log=logs.append, resolver=stuck)
+            r, w = await asyncio.open_unix_connection(path)
+            w.write(b"CONNECT allowed.test:443 HTTP/1.1\r\n\r\n")
+            await asyncio.sleep(0.2)
+            t = asyncio.get_running_loop().time()
+            await proxy.close(server)
+            return asyncio.get_running_loop().time() - t
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    assert asyncio.run(asyncio.wait_for(go(), 10)) < 2
+    assert logs and logs[0]["host"] == "allowed.test"

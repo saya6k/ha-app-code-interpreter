@@ -95,3 +95,38 @@ def test_child_exit_code_is_passed_through(tmp):
 def test_child_killed_by_signal_maps_to_128_plus_signal(tmp):
     p = launch(tmp, free_port(), "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
     assert p.returncode == 128 + 9
+
+
+def test_forwarder_survives_running_out_of_fds(tmp):
+    """EMFILE in accept() must not end the forwarder for the session."""
+    srv = echo_server(tmp / "proxy.sock")
+    port = free_port()
+    code = f"""
+import socket, time
+held = []
+for _ in range(40):  # each relay costs launch.py 2 fds; its NOFILE is 24
+    try:
+        held.append(socket.create_connection(("127.0.0.1", {port}), timeout=1))
+    except OSError:
+        break
+time.sleep(0.5)
+for s in held:
+    s.close()
+time.sleep(0.5)
+s = socket.create_connection(("127.0.0.1", {port}), timeout=5)
+s.sendall(b"ok"); s.shutdown(socket.SHUT_WR)
+print(s.recv(10).decode())
+"""
+    env = dict(os.environ, CI_PROXY_SOCK=str(tmp / "proxy.sock"), CI_PROXY_PORT=str(port))
+    import resource
+
+    def limit():
+        resource.setrlimit(resource.RLIMIT_NOFILE, (24, 24))
+
+    try:
+        p = subprocess.run([sys.executable, str(LAUNCH), sys.executable, "-c", code],
+                           env=env, capture_output=True, text=True, timeout=30, preexec_fn=limit)
+    finally:
+        srv.close()
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.strip() == "OK"
