@@ -27,7 +27,7 @@ ports_description:
 options:
   idle_timeout_minutes: 20
   max_sessions: 3
-  memory_limit_mb: 1024
+  memory_limit_mb: 2048
   network_allowlist: []
   max_file_mb: 20
   export_dir: /share/code-interpreter

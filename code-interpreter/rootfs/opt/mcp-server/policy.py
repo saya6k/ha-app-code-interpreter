@@ -17,7 +17,10 @@ SBXEXEC = Path(__file__).with_name("sbxexec.py")
 
 @dataclass(frozen=True)
 class SandboxPolicy:
-    memory_mb: int = 1024  # RLIMIT_AS: address space, not RSS
+    # RLIMIT_AS: address space, not RSS. 1024 left ~10% headroom for the
+    # analysis stack with a few threads (stacks and buffers are reserved up
+    # front) and failed intermittently on CI; 896 always failed.
+    memory_mb: int = 2048
     nproc: int = 128  # RLIMIT_NPROC: counts threads too
     fsize_mb: int = 256
     nofile: int = 1024

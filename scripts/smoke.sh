@@ -67,7 +67,7 @@ stop_app() {
 }
 
 echo "## default options"
-if start_app '{"idle_timeout_minutes": 1, "max_sessions": 3, "memory_limit_mb": 1024, "network_allowlist": []}'; then
+if start_app '{"idle_timeout_minutes": 1, "max_sessions": 3, "memory_limit_mb": 2048, "network_allowlist": []}'; then
   client "$idle_wait"
   stop_app
 fi

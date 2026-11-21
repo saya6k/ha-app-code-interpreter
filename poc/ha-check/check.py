@@ -163,8 +163,8 @@ async def isolated():
             report("no IP egress, HA host, or DNS", "open" not in v[:3] and v[3] == "failed", v)
 
         async def memory():
-            r = await s.run_code("b = bytearray(2 * 1024**3)", timeout_s=30)
-            report("2 GB allocation -> MemoryError", r["error"] == "MemoryError", r["error"])
+            r = await s.run_code("b = bytearray(3 * 1024**3)", timeout_s=30)
+            report("3 GB allocation -> MemoryError", r["error"] == "MemoryError", r["error"])
 
         async def interrupt():
             r = await s.run_code("while True: pass", timeout_s=1)

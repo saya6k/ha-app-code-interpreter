@@ -77,7 +77,7 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
     return Options(
         idle_timeout_minutes=int(raw.get("idle_timeout_minutes", 20)),
         max_sessions=int(raw.get("max_sessions", 3)),
-        policy=SandboxPolicy(memory_mb=int(raw.get("memory_limit_mb", 1024)), allowlist=tuple(allow)),
+        policy=SandboxPolicy(memory_mb=int(raw.get("memory_limit_mb", 2048)), allowlist=tuple(allow)),
         max_file_mb=int(raw.get("max_file_mb", 20)),
         export_dir=export_dir,
         audit_retention_days=int(raw.get("audit_retention_days", 30)),

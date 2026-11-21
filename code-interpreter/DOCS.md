@@ -104,7 +104,7 @@ are ignored with an error in the log.
 |---|---|---|
 | `idle_timeout_minutes` | `20` | Close a session after this many minutes without a call |
 | `max_sessions` | `3` | Sessions at once; the least recently used idle session is closed to make room |
-| `memory_limit_mb` | `1024` | Address-space limit per sandbox (`RLIMIT_AS`, minimum 768). This counts reserved memory, so real use is lower. Allocations beyond it raise `MemoryError` |
+| `memory_limit_mb` | `2048` | Address-space limit per sandbox (`RLIMIT_AS`, minimum 768). This counts reserved memory, so real use is lower. Allocations beyond it raise `MemoryError` |
 | `network_allowlist` | empty | Hosts the sandbox may reach over HTTPS (see above). Empty = no network |
 | `max_file_mb` | `20` | Largest file for import, export and `write_file` |
 | `export_dir` | `/share/code-interpreter` | Where exported files go; must be under `/share` |

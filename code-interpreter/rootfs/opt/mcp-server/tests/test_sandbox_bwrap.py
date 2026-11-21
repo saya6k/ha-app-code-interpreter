@@ -132,7 +132,7 @@ with m.Pool(2) as p: pool = p.map(abs, [-1, -2])
 
 
 def test_memory_limit_raises_memoryerror(h, sbx):
-    r = code(h, sbx, "b = bytearray(2 * 1024**3)")
+    r = code(h, sbx, "b = bytearray(3 * 1024**3)")
     assert r["error"] == "MemoryError"
     assert code(h, sbx, "1")["result"] == "1"
 
