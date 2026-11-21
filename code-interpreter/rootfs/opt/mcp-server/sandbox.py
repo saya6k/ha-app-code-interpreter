@@ -174,35 +174,56 @@ class Sandbox:
             await asyncio.sleep(0.1)  # let the stderr drain catch the last words
             raise self._failure(f"{what}: {e}") from None
 
-    def _agent_call(self, req: dict, fds: list[int], stream=None) -> dict:
+    @staticmethod
+    def _agent_call(sock: socket.socket, req: dict, fds: list[int], stream=None) -> dict:
         """Blocking request on the SOCK_SEQPACKET agent channel (run in a thread).
         `stream` runs after the request is sent, e.g. to feed or drain a pipe."""
-        self._agent.settimeout(AGENT_TIMEOUT_S)
-        socket.send_fds(self._agent, [json.dumps(req).encode()], fds)
+        sock.settimeout(AGENT_TIMEOUT_S)
+        socket.send_fds(sock, [json.dumps(req).encode()], fds)
         if stream is not None:
             stream()
-        data = self._agent.recv(AGENT_REPLY_MAX)
+        data = sock.recv(AGENT_REPLY_MAX)
         if not data:
             raise ConnectionError("agent closed")
         return json.loads(data)
 
+    async def _run_locked(self, work):
+        """Run work(sock) in a thread under the agent lock. The lock is held
+        until the thread is done even if the caller is cancelled: agent replies
+        carry no id, so a second request must never overlap a pending one."""
+        async with self._agent_lock:
+            sock = self._agent
+            if self._closed or sock is None:
+                raise SandboxError("sandbox is closed")
+            fut = asyncio.ensure_future(asyncio.to_thread(work, sock))
+            cancelled = False
+            while not fut.done():
+                try:
+                    await asyncio.shield(fut)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except BaseException:
+                    break
+            if cancelled:
+                if not fut.cancelled():
+                    fut.exception()  # mark it retrieved: the caller is gone
+                raise asyncio.CancelledError
+            return fut.result()
+
     async def _agent_op(self, req: dict) -> dict:
-        return await self._agent_op_thread(lambda: self._agent_call(req, []))
+        return await self._agent_op_thread(lambda sock: self._agent_call(sock, req, []))
 
     async def _agent_op_thread(self, work) -> dict:
-        if self._closed or self._agent is None:
-            raise SandboxError("sandbox is closed")
         try:
-            async with self._agent_lock:
-                reply = await asyncio.to_thread(work)
+            reply = await self._run_locked(work)
         except (OSError, ValueError) as e:
             raise self._failure(f"sandbox is gone, its files are lost ({e})") from None
         if not reply.get("ok"):
             raise FileOpError(reply.get("error", "file operation failed"))
         return reply
 
-    async def list_files(self, path: str = "/sandbox", recursive: bool = False) -> dict:
-        reply = await self._agent_op({"op": "list", "path": path, "recursive": recursive})
+    async def list_files(self, path: str = "/sandbox", recursive: bool = False, skip_dot: bool = False) -> dict:
+        reply = await self._agent_op({"op": "list", "path": path, "recursive": recursive, "skip_dot": skip_dot})
         return {"entries": reply["entries"], "truncated": reply["truncated"]}
 
     async def read_file(self, path: str, limit: int) -> tuple[bytes, int]:
@@ -233,7 +254,7 @@ class Sandbox:
         other. The pipe is created, used and closed inside the worker thread,
         so each fd is closed exactly once even if the caller is cancelled."""
 
-        def stream_op() -> dict:
+        def stream_op(sock: socket.socket) -> dict:
             r, w = os.pipe()
             mine, theirs = (r, w) if give == "w" else (w, r)
             open_fds = {mine, theirs}
@@ -251,7 +272,7 @@ class Sandbox:
                     close(mine)  # EOF for the agent when we were writing
 
             try:
-                return self._agent_call(req, [theirs], after_send)
+                return self._agent_call(sock, req, [theirs], after_send)
             finally:
                 for fd in list(open_fds):
                     close(fd)
@@ -266,12 +287,10 @@ class Sandbox:
             self._client.close()
             self._client = None
         (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
+        fds = [child_repl.fileno(), child_ctl.fileno()]
         try:
-            async with self._agent_lock:
-                reply = await asyncio.to_thread(
-                    self._agent_call, {"op": "restart"}, [child_repl.fileno(), child_ctl.fileno()]
-                )
-        except (OSError, ValueError) as e:
+            reply = await self._run_locked(lambda sock: self._agent_call(sock, {"op": "restart"}, fds))
+        except (OSError, ValueError, SandboxError) as e:
             app_repl.close()
             app_ctl.close()
             raise self._failure(f"sandbox is gone, its files are lost ({e})") from None
@@ -308,8 +327,10 @@ class Sandbox:
             self._client.close()
             self._client = None
         if self._agent is not None:
-            self._agent.close()
-            self._agent = None
+            # Wake a worker blocked in recv() on it; the socket itself is
+            # closed below, once that worker has let go of the lock.
+            with contextlib.suppress(OSError):
+                self._agent.shutdown(socket.SHUT_RDWR)
         if self._proc is not None:
             # The outer bwrap leads the process group; --die-with-parent then
             # takes down the sandbox's pid namespace (and its tmpfs) with it.
@@ -319,6 +340,10 @@ class Sandbox:
                     os.killpg(self._proc.pid, signal.SIGKILL)
             await self._proc.wait()
             self._proc = None
+        if self._agent is not None:
+            async with self._agent_lock:  # killing the sandbox above ended any transfer
+                self._agent.close()
+                self._agent = None
         if self._proxy is not None:
             await egress.close(self._proxy)
             self._proxy = None

@@ -129,7 +129,13 @@ def _agent(argv: list[str], agent: socket.socket) -> int:
             for fd in fds:
                 os.close(fd)
             reply = {"ok": op == "ping"}
-        agent.send(json.dumps(reply).encode())
+        try:
+            agent.send(json.dumps(reply).encode())
+        except OSError as e:  # e.g. EMSGSIZE: report it, never die (the sandbox would go with us)
+            try:
+                agent.send(json.dumps({"ok": False, "error": f"reply not sent: {e}"}).encode())
+            except OSError:
+                pass
 
 
 def main(argv: list[str]) -> int:

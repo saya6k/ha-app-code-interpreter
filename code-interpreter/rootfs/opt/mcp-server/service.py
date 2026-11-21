@@ -207,14 +207,19 @@ class Service:
     async def run_code(
         self, code: str, session_id: str | None = None, timeout_s: float = 60, reset: bool = False
     ) -> dict:
+        async def snapshot(s) -> dict:
+            # new_files is a convenience: a listing problem must never cost
+            # the call itself (or its result, once the code has run).
+            try:
+                return _snapshot(await s.list_files("/sandbox", recursive=True, skip_dot=True))
+            except (FileOpError, SandboxError):
+                return {}
+
         async def run(s):
             t0 = time.monotonic()
-            before = _snapshot(await s.list_files("/sandbox", recursive=True))
+            before = await snapshot(s)
             r = await s.run_code(code, _clamp(timeout_s), reset)
-            try:
-                after = _snapshot(await s.list_files("/sandbox", recursive=True))
-            except SandboxError:
-                after = {}  # the sandbox died with the cell; run_code's own result says so
+            after = await snapshot(s)
             changed = sorted(p for p, meta in after.items() if before.get(p) != meta)
             r["new_files"] = changed[:NEW_FILES_CAP]
             self.audit.record(

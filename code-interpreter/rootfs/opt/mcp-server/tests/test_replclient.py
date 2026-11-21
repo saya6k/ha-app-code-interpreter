@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -28,10 +29,12 @@ class Repl:
 
     def start(self) -> None:
         (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
+        self.sandbox_dir = tempfile.mkdtemp(prefix="sbx-")
         env = dict(
             os.environ,
             REPL_FD=str(child_repl.fileno()),
             REPL_CTL_FD=str(child_ctl.fileno()),
+            CI_SANDBOX_DIR=self.sandbox_dir,
         )
         self.proc = subprocess.Popen(
             [sys.executable, str(SERVER)],
@@ -241,3 +244,15 @@ def test_cancelled_request_does_not_leak_its_reply_into_the_next(repl):
         return await repl.client.run("'next'", timeout_s=10)
 
     assert repl.do(go())["result"] == "'next'"
+
+
+def test_command_runs_in_sandbox_dir_even_after_chdir(repl):
+    repl("import os; os.chdir('/')")
+    r = repl.do(repl.client.command("pwd", timeout_s=10))
+    assert os.path.realpath(r["stdout"].strip()) == os.path.realpath(repl.sandbox_dir)
+
+
+def test_command_with_detached_grandchild_is_not_a_timeout(repl):
+    # The grandchild keeps the pipes open; the command itself exits at once.
+    r = repl.do(repl.client.command("(sleep 30 &) ; echo done", timeout_s=2))
+    assert r["error"] is None and r["exit_code"] == 0 and r["stdout"].startswith("done")

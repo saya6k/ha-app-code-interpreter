@@ -35,7 +35,9 @@ class FakeSandbox:
         return {"stdout": "", "stderr": "", "result": result, "error": None,
                 "truncated": False, "kernel_restarted": False}
 
-    async def list_files(self, path="/sandbox", recursive=False):
+    async def list_files(self, path="/sandbox", recursive=False, skip_dot=False):
+        if getattr(self, "list_fails", False):
+            raise FileOpError("PermissionError: listing failed")
         entries = [{"path": p, "type": "file", "size": len(d), "mtime": 0} for p, d in sorted(self.files.items())]
         return {"entries": entries, "truncated": False}
 
@@ -342,3 +344,14 @@ def test_audit_net_events_attribute_session_and_flag_denials(tmp_path):
         ("net.connect", "allowed"), ("net.connect", "denied"), ("policy.violation", "denied")]
     assert ev[0]["session_id"] == "s1" and ev[0]["detail"]["bytes_down"] == 99
     assert ev[2]["detail"] == {"kind": "egress", "host": "example.com", "port": 443, "reason": "not-allowlisted"}
+
+
+def test_listing_failure_does_not_cost_run_code_its_result(tmp_path):
+    async def go():
+        svc, created = make(tmp_path)
+        r = await svc.run_code("set a=1")
+        created[0].list_fails = True
+        r = await svc.run_code("a", session_id=r["session_id"])
+        assert (r["result"], r["new_files"], r["error"]) == ("1", [], None)
+
+    run(go())

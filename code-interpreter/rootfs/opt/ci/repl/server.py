@@ -19,11 +19,14 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 
 from proto import recv, send
 
 OUT_LIMIT = 16000
+SANDBOX_DIR = os.environ.get("CI_SANDBOX_DIR", "/sandbox")
+READER_GRACE_S = 2.0  # total, for both output readers after the command ends
 RESULT_LIMIT = 4000
 
 _executing = False
@@ -119,14 +122,14 @@ def execute(code: str, g: dict, cell: int) -> dict:
 
 
 def _read_capped(stream, limit: int, out: list) -> None:
-    buf, truncated = bytearray(), False
-    while chunk := stream.read(65536):
-        room = limit - len(buf)
+    """Append into out = [bytearray, truncated] as data arrives, so whatever
+    was read is kept even if a detached grandchild never closes the pipe."""
+    while chunk := stream.read1(65536):
+        room = limit - len(out[0])
         if room > 0:
-            buf += chunk[:room]
+            out[0] += chunk[:room]
         if len(chunk) > room:
-            truncated = True
-    out[:] = [bytes(buf), truncated]
+            out[1] = True
 
 
 def run_command(command: str, timeout_s: float) -> dict:
@@ -134,12 +137,13 @@ def run_command(command: str, timeout_s: float) -> dict:
     global _executing
     proc = subprocess.Popen(
         ["/bin/sh", "-c", command],
+        cwd=SANDBOX_DIR if os.path.isdir(SANDBOX_DIR) else None,  # whatever chdir user code did
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         start_new_session=True,
     )
-    outs = [[b"", False], [b"", False]]
+    outs = [[bytearray(), False], [bytearray(), False]]
     readers = [
         threading.Thread(target=_read_capped, args=(s, OUT_LIMIT, o), daemon=True)
         for s, o in zip((proc.stdout, proc.stderr), outs)
@@ -164,8 +168,9 @@ def run_command(command: str, timeout_s: float) -> dict:
             except ProcessLookupError:
                 pass
             proc.wait()
+        deadline = time.monotonic() + READER_GRACE_S  # a detached grandchild may hold the pipes
         for t in readers:
-            t.join(2)  # a detached grandchild may still hold the pipe
+            t.join(max(0, deadline - time.monotonic()))
     rc = proc.returncode
     return {
         "stdout": outs[0][0].decode(errors="replace"),

@@ -6,12 +6,17 @@ cannot reach the read-only rootfs or /tmp. Contents travel over a pipe fd the
 app passes along with the request, so large files need no chunking.
 """
 
+import json
 import os
 import stat
+import tempfile
 
 LOGICAL = "/sandbox"
 ROOT = os.environ.get("CI_FILES_ROOT", LOGICAL)  # tests point this elsewhere
 LIST_CAP = 1000
+# One SOCK_SEQPACKET message must fit the socket send buffer (~208 KB by
+# default); a reply that does not would kill the agent and the sandbox.
+REPLY_BYTES = 128 * 1024
 CHUNK = 65536
 
 
@@ -42,37 +47,58 @@ def _kind(mode: int) -> str:
     return "other"
 
 
-def _entry(real: str) -> dict:
-    st = os.lstat(real)
+def _entry(real: str) -> dict | None:
+    try:
+        st = os.lstat(real)
+    except OSError:  # vanished since listdir, or unreadable: skip it
+        return None
     return {"path": logical(real), "type": _kind(st.st_mode), "size": st.st_size, "mtime": st.st_mtime}
 
 
-def list_entries(path: str, recursive: bool) -> dict:
+def _names(base: str, recursive: bool, skip_dot: bool):
+    if not recursive:
+        try:
+            yield from (os.path.join(base, n) for n in sorted(os.listdir(base)))
+        except OSError:
+            pass
+        return
+    for d, dirs, names in os.walk(base):  # unreadable dirs are skipped by os.walk
+        if skip_dot:
+            dirs[:] = [x for x in dirs if not x.startswith(".")]
+            names = [x for x in names if not x.startswith(".")]
+        dirs.sort()
+        yield from (os.path.join(d, n) for n in sorted(dirs + names))
+
+
+def list_entries(path: str, recursive: bool, skip_dot: bool = False) -> dict:
     base = resolve(path)
     if not os.path.isdir(base):
-        return {"entries": [_entry(base)], "truncated": False}
-    out = []
-    if recursive:
-        for d, dirs, names in os.walk(base):
-            dirs.sort()
-            for n in sorted(dirs + names):
-                out.append(_entry(os.path.join(d, n)))
-                if len(out) >= LIST_CAP:
-                    return {"entries": out, "truncated": True}
-    else:
-        for n in sorted(os.listdir(base))[: LIST_CAP + 1]:
-            out.append(_entry(os.path.join(base, n)))
-    return {"entries": out[:LIST_CAP], "truncated": len(out) > LIST_CAP}
+        entry = _entry(base)
+        return {"entries": [entry] if entry else [], "truncated": False}
+    out, size = [], 100
+    for real in _names(base, recursive, skip_dot):
+        entry = _entry(real)
+        if entry is None:
+            continue
+        size += len(json.dumps(entry)) + 2
+        if len(out) >= LIST_CAP or size > REPLY_BYTES:
+            return {"entries": out, "truncated": True}
+        out.append(entry)
+    return {"entries": out, "truncated": False}
 
 
 def read(path: str, limit: int, fd: int) -> dict:
     """Stream up to `limit` bytes into fd; report the full size."""
     try:
         real = resolve(path)
-        with open(real, "rb") as f:
-            size = os.fstat(f.fileno()).st_size
-            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-                raise ValueError(f"{path!r} is not a regular file")
+        # O_NONBLOCK: opening a FIFO without a writer must not block the agent.
+        src = os.open(real, os.O_RDONLY | os.O_NONBLOCK)
+        st = os.fstat(src)
+        if not stat.S_ISREG(st.st_mode):
+            os.close(src)
+            raise ValueError(f"{path!r} is not a regular file")
+        with os.fdopen(src, "rb") as f:
+            size = st.st_size
             sent = 0
             while sent < limit and (chunk := f.read(min(CHUNK, limit - sent))):
                 _write_all(fd, chunk)
@@ -89,26 +115,37 @@ def _write_all(fd: int, data: bytes) -> None:
 
 
 def write(path: str, max_bytes: int, fd: int) -> dict:
-    """Read fd to EOF into path (parents created). Over max_bytes: nothing kept."""
-    real = None
+    """Read fd to EOF into path (parents created). Written to a temp file and
+    renamed over the target only on success, so a failure (over max_bytes,
+    ENOSPC, permissions) leaves any existing file untouched."""
+    tmp = None
     try:
         real = resolve(path)
-        if os.path.isdir(real):
-            raise ValueError(f"{path!r} is a directory")
+        try:
+            st = os.lstat(real)
+        except FileNotFoundError:
+            st = None
+        if st is not None and not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"{path!r} exists and is not a regular file")
         os.makedirs(os.path.dirname(real), exist_ok=True)
+        out_fd, tmp = tempfile.mkstemp(dir=os.path.dirname(real), prefix=".ci-write-")
         size = 0
-        with open(real, "wb") as out:
+        with os.fdopen(out_fd, "wb") as out:
             while chunk := os.read(fd, CHUNK):
                 size += len(chunk)
                 if size > max_bytes:
                     raise ValueError(f"file exceeds {max_bytes} bytes")
                 out.write(chunk)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, real)
+        tmp = None
         return {"ok": True, "size": size, "path": logical(real)}
-    except BaseException:
-        if real and os.path.isfile(real):
-            os.unlink(real)
-        raise
     finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         os.close(fd)
 
 
@@ -120,7 +157,8 @@ def handle(req: dict, fds: list[int]) -> dict:
             for fd in fds:
                 os.close(fd)
             fds = []
-            return {"ok": True, **list_entries(req.get("path", LOGICAL), bool(req.get("recursive")))}
+            return {"ok": True, **list_entries(req.get("path", LOGICAL), bool(req.get("recursive")),
+                                               bool(req.get("skip_dot")))}
         if op in ("read", "write") and len(fds) == 1:
             fd, fds = fds[0], []
             if op == "read":

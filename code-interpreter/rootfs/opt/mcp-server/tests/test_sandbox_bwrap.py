@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import contextlib
 import os
 import shutil
 import tempfile
@@ -441,3 +442,61 @@ def test_listing_sees_code_output_and_survives_restart(h, sbx):
     code(h, sbx, "import os; os._exit(1)")
     names = [e["path"] for e in h.do(sbx.list_files())["entries"]]
     assert "/sandbox/out.csv" in names
+
+
+# ---- review fixes (00fd254^..HEAD) -----------------------------------------
+
+def test_fifo_in_sandbox_is_refused_without_hanging(h, sbx):
+    h.do(sbx.run_command("mkfifo /sandbox/p", timeout_s=10))
+
+    async def go():
+        return await asyncio.wait_for(sbx.read_file("/sandbox/p", 100), 10)
+
+    with pytest.raises(FileOpError, match="regular file"):
+        h.do(go())
+    assert code(h, sbx, "1")["result"] == "1"
+
+
+def test_huge_listing_does_not_kill_the_agent(h, sbx):
+    code(h, sbx, """
+import os
+d = '/sandbox/' + 'd' * 100
+os.makedirs(d)
+for i in range(3000):
+    open(f"{d}/{i:05d}-{'x' * 120}", 'w').close()
+""", timeout=120)
+    listing = h.do(sbx.list_files("/sandbox", recursive=True))
+    assert listing["truncated"] is True and listing["entries"]
+    assert code(h, sbx, "'alive'")["result"] == "'alive'"  # agent and files survived
+
+
+def test_cancelled_file_op_does_not_leak_its_reply(h, sbx):
+    data = os.urandom(20 * 1024 * 1024)
+    h.do(sbx.write_file("big.bin", data, 20 << 20))
+
+    async def go():
+        task = asyncio.ensure_future(sbx.read_file("big.bin", 21 << 20))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return await sbx.list_files()
+
+    listing = h.do(go())
+    assert "entries" in listing and any(e["path"] == "/sandbox/big.bin" for e in listing["entries"])
+
+
+def test_destroy_during_file_op_raises_cleanly(h):
+    s = h.create()
+    h.do(s.write_file("big.bin", os.urandom(20 * 1024 * 1024), 20 << 20))
+
+    async def go():
+        task = asyncio.ensure_future(s.read_file("big.bin", 21 << 20))
+        await asyncio.sleep(0.05)
+        await s.destroy()
+        return await asyncio.gather(task, return_exceptions=True)
+
+    (result,) = h.do(go())
+    assert not isinstance(result, AttributeError), result
+    assert isinstance(result, (SandboxError, tuple)), result
+    assert procs_of(UID) == []

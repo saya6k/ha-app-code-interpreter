@@ -15,6 +15,7 @@ import socket
 import struct
 
 GRACE_S = 5.0
+COMMAND_MARGIN_S = 5.0  # > server-side READER_GRACE_S (2 s) plus scheduling slack
 # Sandbox code can write to its end of the channel directly; never let a
 # forged length header make the app allocate without bound. Legit replies are
 # capped at 2 x 16000 chars of output plus a 4000-char result.
@@ -169,6 +170,7 @@ class ReplClient:
         return await self._bounded({"op": "exec", "code": code}, timeout_s, _blank(), _CODE_KEYS)
 
     async def command(self, command: str, timeout_s: float) -> dict:
-        """The server enforces timeout_s itself; the client allows a little more."""
+        """The server enforces timeout_s itself; the client allows more than the
+        server can add on top (its output readers get up to 2 s after exit)."""
         req = {"op": "command", "command": command, "timeout_s": timeout_s}
-        return await self._bounded(req, timeout_s + 2, _blank(command=True), _COMMAND_KEYS)
+        return await self._bounded(req, timeout_s + COMMAND_MARGIN_S, _blank(command=True), _COMMAND_KEYS)

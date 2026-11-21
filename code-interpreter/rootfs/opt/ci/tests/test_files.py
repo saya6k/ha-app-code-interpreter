@@ -125,3 +125,91 @@ def test_bad_request_closes_passed_fds(files):
     assert mod.handle({"op": "nope"}, [w])["ok"] is False
     assert os.read(r, 1) == b""  # w was closed
     os.close(r)
+
+
+# ---- review fixes (00fd254^..HEAD) -----------------------------------------
+
+def test_fifo_is_refused_without_blocking(files):
+    mod, root = files
+    os.mkfifo(root / "p")
+    result = {}
+    t = threading.Thread(target=lambda: result.update(r=read_via(mod, "p", 100)))
+    t.start()
+    t.join(3)
+    assert not t.is_alive(), "agent blocked opening a FIFO"
+    reply, got = result["r"]
+    assert reply["ok"] is False and "regular file" in reply["error"]
+    w = {}
+    t = threading.Thread(target=lambda: w.update(r=write_via(mod, "p", b"x", 100)))
+    t.start()
+    t.join(3)
+    assert not t.is_alive() and w["r"]["ok"] is False
+
+
+def test_failed_overwrite_keeps_the_original(files):
+    mod, root = files
+    (root / "data.csv").write_text("precious")
+    reply = write_via(mod, "data.csv", b"x" * 2000, 1000)  # over the limit
+    assert reply["ok"] is False
+    assert (root / "data.csv").read_text() == "precious"
+    assert sorted(p.name for p in root.iterdir()) == ["data.csv"]  # no temp file left
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_failed_write_into_readonly_file_keeps_it(files):
+    mod, root = files
+    f = root / "ro.txt"
+    f.write_text("keep")
+    os.chmod(root, 0o555)  # cannot create the temp file next to it
+    try:
+        assert write_via(mod, "ro.txt", b"new", 100)["ok"] is False
+    finally:
+        os.chmod(root, 0o755)
+    assert f.read_text() == "keep"
+
+
+def test_successful_overwrite_replaces_atomically(files):
+    mod, root = files
+    (root / "a.txt").write_text("old")
+    assert write_via(mod, "a.txt", b"new", 100)["ok"] is True
+    assert (root / "a.txt").read_text() == "new"
+    assert sorted(p.name for p in root.iterdir()) == ["a.txt"]
+
+
+def test_listing_skips_entries_it_cannot_stat_or_enter(files):
+    mod, root = files
+    (root / "ok.txt").write_text("1")
+    locked = root / "locked"
+    locked.mkdir()
+    (locked / "inner.txt").write_text("2")
+    os.chmod(locked, 0o600)  # readable, not traversable
+    try:
+        r = mod.handle({"op": "list", "path": "/sandbox", "recursive": True}, [])
+    finally:
+        os.chmod(locked, 0o755)
+    assert r["ok"] is True
+    assert "/sandbox/ok.txt" in [e["path"] for e in r["entries"]]
+
+
+def test_listing_without_dot_dirs_reaches_files_past_a_big_dot_tree(files, monkeypatch):
+    mod, root = files
+    monkeypatch.setattr(mod, "LIST_CAP", 20)
+    site = root / ".local" / "lib"
+    site.mkdir(parents=True)
+    for i in range(50):
+        (site / f"m{i}.py").write_text("")
+    (root / "out").mkdir()
+    (root / "out" / "plot.png").write_text("x")
+    r = mod.handle({"op": "list", "path": "/sandbox", "recursive": True, "skip_dot": True}, [])
+    paths = [e["path"] for e in r["entries"]]
+    assert "/sandbox/out/plot.png" in paths and not any("/." in p for p in paths)
+
+
+def test_listing_reply_is_capped_by_bytes(files, monkeypatch):
+    mod, root = files
+    monkeypatch.setattr(mod, "REPLY_BYTES", 2000)
+    for i in range(100):
+        (root / (f"{i:03d}-" + "n" * 100)).write_text("")
+    r = mod.handle({"op": "list", "path": "/sandbox"}, [])
+    import json as _json
+    assert r["truncated"] is True and len(_json.dumps(r)) <= 2000
