@@ -13,3 +13,10 @@ the metadata.
 1. Merge to `main` — release-drafter updates the draft.
 2. Publish the draft → `build.yml` pushes `ghcr.io/saya6k/app-code-interpreter:{ver}`.
 3. The build dispatches to ha-apps, which opens a version-bump PR.
+
+## Trademarks
+
+The app icon and logo are the unmodified "Python Powered" badges published by
+the Python Software Foundation. "Python" and the Python logos are trademarks or
+registered trademarks of the Python Software Foundation. This app is an
+independent community project and is not affiliated with or endorsed by the PSF.
