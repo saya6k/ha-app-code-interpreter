@@ -58,4 +58,9 @@ COPY --from=sandbox / /opt/sandbox-root/
 # do not re-ship the ~1 GB rootfs layer above.
 COPY rootfs/opt/ci /opt/sandbox-root/opt/ci
 
+# ---- rootfs (MCP server, s6 services) ---------------------------------------
+COPY rootfs /
+RUN find /etc/s6-overlay/s6-rc.d -type f \( -name run -o -name finish \) -exec chmod a+x {} \; \
+ && find /etc/s6-overlay/s6-rc.d -type f -name type -exec chmod 644 {} \;
+
 WORKDIR /
