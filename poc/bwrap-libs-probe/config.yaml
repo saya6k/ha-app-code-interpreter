@@ -1,0 +1,21 @@
+---
+# Throwaway probe #2: do the sandbox analysis libraries work under bubblewrap
+# without /proc, and do rlimit + oom_score_adj keep a memory hog from taking
+# down the app? Install as a local app (/addons/bwrap-libs-probe).
+name: bwrap libs probe
+version: 0.1.0
+slug: bwrap_libs_probe
+description: One-shot check of analysis libraries and memory limits under bubblewrap.
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: once
+boot: manual
+options:
+  oom_test: false
+schema:
+  # true: fill host memory inside the sandbox until the kernel OOM killer
+  # fires. Briefly pressures the whole HA host — run when nothing critical is
+  # going on.
+  oom_test: bool

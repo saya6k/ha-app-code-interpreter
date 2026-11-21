@@ -1,0 +1,19 @@
+#include <tunables/global>
+
+# Deliberately broad: the only question is whether lifting docker-default's
+# mount/pivot_root denials is enough for bubblewrap. The product profile will
+# be narrowed later. Supervisor renames the profile to the app slug on load.
+profile bwrap_libs_probe flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+
+  capability,
+  file,
+  network,
+  signal,
+  ptrace,
+  unix,
+  mount,
+  remount,
+  umount,
+  pivot_root,
+}
