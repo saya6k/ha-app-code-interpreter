@@ -315,3 +315,52 @@ def test_failed_destroy_retires_the_uid():
                 pass
 
     run(go())
+
+
+def test_create_that_leaves_processes_behind_retires_the_uid():
+    """Sandbox.create's own cleanup can fail to reap, like a failed destroy."""
+
+    class Leaked(RuntimeError):
+        uid_in_use = True
+
+    async def go():
+        mgr, rec = make(max_sessions=2)
+        real = mgr._factory
+        tried = []
+
+        async def factory(sid, uid):
+            if not tried:
+                tried.append(uid)
+                raise Leaked("still alive")
+            return await real(sid, uid)
+
+        mgr._factory = factory
+        with pytest.raises(Leaked):
+            async with mgr.acquire(None):
+                pass
+        async with mgr.acquire(None) as b:
+            assert b.uid != tried[0]
+
+    run(go())
+
+
+def test_plain_create_failure_keeps_the_uid():
+    async def go():
+        mgr, rec = make(max_sessions=1)
+        real = mgr._factory
+        tried = []
+
+        async def factory(sid, uid):
+            if not tried:
+                tried.append(uid)
+                raise RuntimeError("bwrap: no userns")
+            return await real(sid, uid)
+
+        mgr._factory = factory
+        with pytest.raises(RuntimeError, match="userns"):
+            async with mgr.acquire(None):
+                pass
+        async with mgr.acquire(None) as b:
+            assert b.uid == tried[0]
+
+    run(go())

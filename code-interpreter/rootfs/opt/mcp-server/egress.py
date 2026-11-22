@@ -5,7 +5,8 @@ socket that is bound into its sandbox at /run/ci/proxy.sock, so every
 connection belongs to exactly one session.
 
 HTTP CONNECT only. The target host:port must match the allowlist
-(`host[:port]`, `*.domain` = subdomains only, port defaults to 443). Plain
+(`host[:port]`, `*.domain` = subdomains only, `*` = any host, port defaults
+to 443). Plain
 HTTP proxying and IP-literal targets are refused, and names resolving only to
 non-public addresses are refused (no reaching the HA host or LAN by DNS).
 `log` gets one dict per connection.
@@ -28,7 +29,7 @@ HEADER_LIMIT = 8192
 # After the client half-closes, how long upstream may keep answering.
 DRAIN_AFTER_CLIENT_EOF_S = 5
 CLOSE_TIMEOUT_S = 5
-_HOST_RE = re.compile(r"^(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)*$")
+_HOST_RE = re.compile(r"^(\*|(\*\.)?[a-z0-9_-]+(\.[a-z0-9_-]+)*)$")
 
 Rule = tuple[str, int]
 
@@ -38,13 +39,16 @@ def _norm(host: str) -> str:
 
 
 def parse_rule(entry: str) -> Rule:
-    """`host[:port]` or `*.domain[:port]`; ValueError naming the entry otherwise."""
+    """`host[:port]`, `*.domain[:port]` or `*[:port]` (any host; the public-address
+    and IP-literal checks still apply); ValueError naming the entry otherwise."""
     host, sep, port = entry.strip().rpartition(":")
     if not sep:
         host, port = entry.strip(), "443"
-    host = _norm(host)
-    if not _HOST_RE.match(host) or is_ip_literal(host) or not port.isdigit() or not 0 < int(port) < 65536:
-        raise ValueError(f"invalid allowlist entry {entry!r}: expected host[:port] or *.domain[:port]")
+    raw, host = host.strip(), _norm(host)
+    # "*" must be written as such: "*." (a cut-off "*.domain") must not open everything.
+    cut_star = host == "*" and raw != "*"
+    if cut_star or not _HOST_RE.match(host) or is_ip_literal(host) or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"invalid allowlist entry {entry!r}: expected host[:port], *.domain[:port] or *[:port]")
     return host, int(port)
 
 
@@ -57,6 +61,8 @@ def is_allowed(host: str, port: int, rules: list[Rule]) -> bool:
     for pattern, rport in rules:
         if port != rport:
             continue
+        if pattern == "*":
+            return True
         if pattern.startswith("*."):
             if host.endswith(pattern[1:]):
                 return True
@@ -159,7 +165,6 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
         public = [a for a in addrs if is_public_ip(a)]
         if not public:
             return await reply("403 Forbidden", "non-public-address")
-        entry["allowed"] = True
         for addr in public:
             try:
                 upstream = await asyncio.wait_for(
@@ -170,6 +175,7 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
                 continue
         if upstream is None:
             return await reply("502 Bad Gateway", "connect-failed")
+        entry["allowed"] = True  # only once it is connected: connect-failed is not an allowed connection
         up_reader, up_writer = upstream
         await reply("200 Connection Established")
         up, down = [0], [0]

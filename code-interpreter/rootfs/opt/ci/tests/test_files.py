@@ -78,7 +78,7 @@ def test_read_limit_returns_prefix_and_full_size(files):
 def test_write_over_limit_keeps_nothing(files):
     mod, root = files
     reply = write_via(mod, "big", b"x" * 2000, 1000)
-    assert reply["ok"] is False and "exceeds" in reply["error"]
+    assert reply["ok"] is False and "exceeds" in reply["error"] and reply["violation"] == "size"
     assert not (root / "big").exists()
 
 
@@ -87,6 +87,13 @@ def test_paths_outside_sandbox_are_refused(files, path):
     mod, _ = files
     reply, got = read_via(mod, path, 100)
     assert reply["ok"] is False and "outside /sandbox" in reply["error"] and got == b""
+    assert reply["violation"] == "traversal"
+
+
+def test_missing_file_with_a_policy_word_in_its_name_is_no_violation(files):
+    mod, _ = files
+    reply, _ = read_via(mod, "/sandbox/outside_temps larger than.csv", 100)
+    assert reply["ok"] is False and "violation" not in reply
 
 
 def test_symlink_out_of_sandbox_is_refused(files, tmp_path):

@@ -105,8 +105,12 @@ def execute(code: str, g: dict, cell: int) -> dict:
             if len(result) > RESULT_LIMIT:
                 result, truncated = result[:RESULT_LIMIT], True
     except KeyboardInterrupt:
+        _executing = False
         error = "KeyboardInterrupt"
     except BaseException as exc:  # incl. SystemExit — never let user code end the server
+        # First thing: a timeout interrupt landing while a long traceback is
+        # formatted must not raise out of this handler and end the server.
+        _executing = False
         error = type(exc).__name__
         err.write(_format_exc(exc))
     finally:
@@ -132,24 +136,42 @@ def _read_capped(stream, limit: int, out: list) -> None:
             out[1] = True
 
 
+def _spawn_failed(exc: BaseException) -> dict:
+    return {
+        "stdout": "",
+        "stderr": f"{type(exc).__name__}: {exc}",
+        "exit_code": None,
+        "error": type(exc).__name__,
+        "truncated": False,
+    }
+
+
 def run_command(command: str, timeout_s: float) -> dict:
     """sh -c in /sandbox, capped output; timeout or interrupt kills its group."""
     global _executing
-    proc = subprocess.Popen(
-        ["/bin/sh", "-c", command],
-        cwd=SANDBOX_DIR if os.path.isdir(SANDBOX_DIR) else None,  # whatever chdir user code did
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", command],
+            cwd=SANDBOX_DIR if os.path.isdir(SANDBOX_DIR) else None,  # whatever chdir user code did
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError as exc:  # e.g. EAGAIN under RLIMIT_NPROC: report it, keep the REPL
+        return _spawn_failed(exc)
     outs = [[bytearray(), False], [bytearray(), False]]
     readers = [
         threading.Thread(target=_read_capped, args=(s, OUT_LIMIT, o), daemon=True)
         for s, o in zip((proc.stdout, proc.stderr), outs)
     ]
-    for t in readers:
-        t.start()
+    try:
+        for t in readers:
+            t.start()
+    except RuntimeError as exc:  # "can't start new thread": same limit, threads count too
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()  # a reader already started sees EOF and exits
+        return _spawn_failed(exc)
     error = None
     signal.signal(signal.SIGINT, _on_sigint)
     try:

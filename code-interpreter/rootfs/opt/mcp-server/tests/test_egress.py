@@ -40,6 +40,28 @@ def test_is_allowed(host, port, ok):
     assert proxy.is_allowed(host, port, rules) is ok
 
 
+@pytest.mark.parametrize(
+    "host,port,ok",
+    [("pypi.org", 443, True), ("anything.example", 443, True), ("pypi.org", 80, False),
+     ("example.com", 8080, True), ("example.com", 22, False)],
+)
+def test_star_allows_any_host_on_its_ports_only(host, port, ok):
+    rules = proxy.parse_allowlist(["*", "*:8080"])
+    assert rules == [("*", 443), ("*", 8080)]
+    assert proxy.is_allowed(host, port, rules) is ok
+
+
+def test_star_still_refuses_ip_literals_and_private_addresses():
+    reply, logs = _run_proxy_case(b"CONNECT 1.1.1.1:443 HTTP/1.1\r\n\r\n", allow=["*"])
+    assert reply.startswith(b"HTTP/1.1 403") and logs[0]["reason"] == "ip-literal"
+
+    async def resolver(host, port):
+        return ["192.168.1.10"]
+
+    reply, logs = _run_proxy_case(b"CONNECT nas.example:443 HTTP/1.1\r\n\r\n", resolver, allow=["*"])
+    assert reply.startswith(b"HTTP/1.1 403") and logs[0]["reason"] == "non-public-address"
+
+
 def test_empty_allowlist_denies_everything():
     assert proxy.is_allowed("pypi.org", 443, []) is False
 
@@ -97,7 +119,7 @@ async def _exchange(path: str, request: bytes) -> bytes:
     return data
 
 
-def _run_proxy_case(request: bytes, resolver=None):
+def _run_proxy_case(request: bytes, resolver=None, allow=("allowed.test",)):
     logs: list[dict] = []
 
     async def go():
@@ -105,7 +127,7 @@ def _run_proxy_case(request: bytes, resolver=None):
         path = os.path.join(d, "proxy.sock")
         try:
             server = await proxy.serve_unix(
-                path, proxy.parse_allowlist(["allowed.test"]), log=logs.append, resolver=resolver
+                path, proxy.parse_allowlist(list(allow)), log=logs.append, resolver=resolver
             )
             assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
             async with server:
@@ -196,7 +218,8 @@ def test_tunnel_closes_and_logs_when_client_is_done_even_if_upstream_lingers(mon
 
 @pytest.mark.parametrize(
     "entry",
-    ["https://pypi.org", "pypi.org:0", "pypi.org:99999", "pypi.org:http", "1.2.3.4", "*.", "a b.com", "*"],
+    ["https://pypi.org", "pypi.org:0", "pypi.org:99999", "pypi.org:http", "1.2.3.4", "*.", "a b.com", "**",
+     "*.*", "*:0", "*a.com"],
 )
 def test_invalid_allowlist_entries_are_rejected_by_name(entry):
     with pytest.raises(ValueError, match="invalid allowlist entry"):
@@ -264,3 +287,19 @@ def test_close_ends_a_handler_stuck_in_dns_quickly():
 
     assert asyncio.run(asyncio.wait_for(go(), 10)) < 2
     assert logs and logs[0]["host"] == "allowed.test"
+
+
+def test_upstream_connect_failure_is_not_logged_as_allowed(monkeypatch):
+    monkeypatch.setattr(proxy, "is_public_ip", lambda ip: True)
+
+    async def refused(host, port):  # the tunnel's upstream connect only
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(proxy.asyncio, "open_connection", refused)
+
+    async def resolver(host, port):
+        return ["203.0.113.7"]
+
+    reply, logs = _run_proxy_case(b"CONNECT allowed.test:443 HTTP/1.1\r\n\r\n", resolver)
+    assert reply.startswith(b"HTTP/1.1 502")
+    assert logs[0]["reason"] == "connect-failed" and logs[0]["allowed"] is False

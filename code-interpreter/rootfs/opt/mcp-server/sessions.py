@@ -109,7 +109,15 @@ class SessionManager:
                 await self._destroy(min(idle, key=lambda s: s.last_used), "evicted")
             uid = self._free_uid()
             sid = secrets.token_hex(8)
-            sandbox = await self._factory(sid, uid)
+            try:
+                sandbox = await self._factory(sid, uid)
+            except Exception as e:
+                # A failed create may leave processes behind, as a failed
+                # destroy does: keep the uid out of use then too.
+                if getattr(e, "uid_in_use", False):
+                    self._retired.add(uid)
+                    log.warning("[mcp-server] create failed sid=%s uid=%d retired", sid, uid)
+                raise
             now = self._clock()
             session = Session(sid, uid, sandbox, created=now, last_used=now)
             self._sessions[sid] = session

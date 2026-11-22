@@ -27,11 +27,16 @@ jobs:
     steps:
       - name: Resolve version
         id: version
+        # Through env, never ${{ }} inside the script: the input is free text.
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            ver="${{ inputs.version }}"
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            ver="${INPUT_VERSION}"
           else
-            ver="${{ github.event.release.tag_name }}"
+            ver="${TAG_NAME}"
           fi
           echo "version=${ver#v}" >> "$GITHUB_OUTPUT"
 
@@ -98,15 +103,17 @@ jobs:
         # anyone tracking it for testing never goes stale once a stable
         # release supersedes the last rc. :stable moves only on non-rc
         # publishes, for anyone who wants to guarantee they never land on an
-        # untested build. ha-apps' config.yaml pins an exact version
-        # regardless, so it never touches either floating tag.
+        # untested build. A manual (workflow_dispatch) build has no release to
+        # say whether it is an rc, so it never moves :stable. ha-apps'
+        # config.yaml pins an exact version regardless, so it never touches
+        # either floating tag.
         env:
-          IS_PRERELEASE: ${{ github.event.release.prerelease }}
+          IS_STABLE: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
         run: |
           set -euo pipefail
           metadata="$(mktemp)"
           tags=(--tag "${{ env.IMAGE }}:${VERSION}" --tag "${{ env.IMAGE }}:latest")
-          if [ "${IS_PRERELEASE}" != "true" ]; then
+          if [ "${IS_STABLE}" = "true" ]; then
             tags+=(--tag "${{ env.IMAGE }}:stable")
           fi
           docker buildx imagetools create \

@@ -184,6 +184,31 @@ def test_stuck_kernel_is_restarted_keeping_files(h, sbx):
     assert code(h, sbx, "open('/sandbox/kept.txt').read()")["result"] == "'y'"
 
 
+def test_restart_survives_a_cancelled_caller(h, sbx):
+    """HA cuts the call (cancel) while the stuck kernel's restart is running:
+    the restart must still finish, so the next call finds a working REPL."""
+    code(h, sbx, "open('/sandbox/kept.txt', 'w').write('y')")
+
+    async def go():
+        task = None
+        run_locked = sbx._run_locked
+
+        async def cancel_inside(work):  # the restart's agent call: cancel lands mid-call
+            task.cancel()
+            return await run_locked(work)
+
+        sbx._run_locked = cancel_inside
+        task = asyncio.ensure_future(sbx.run_code(
+            "import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nwhile True: pass", timeout_s=1))
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        sbx._run_locked = run_locked
+        return await sbx.run_code("open('/sandbox/kept.txt').read()", timeout_s=30)
+
+    r = h.do(go())
+    assert r["result"] == "'y'" and r["kernel_restarted"] is False
+
+
 def test_crash_restarts_kernel(h, sbx):
     r = code(h, sbx, "import os; os._exit(3)")
     assert r["error"] == "KernelDied" and r["kernel_restarted"] is True

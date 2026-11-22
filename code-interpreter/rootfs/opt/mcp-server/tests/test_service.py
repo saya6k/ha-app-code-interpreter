@@ -364,3 +364,81 @@ def test_default_timeout_stays_under_home_assistants_30_s_cap(tmp_path):
         assert created[0].last_timeout == service.DEFAULT_TIMEOUT_S < 30
 
     run(go())
+
+
+def test_policy_words_in_a_file_name_are_no_violation(tmp_path):
+    """Violations come from the refusing code, never from matching message text."""
+    async def go():
+        svc, created = make(tmp_path)
+        sid = (await svc.run_code("1 + 1"))["session_id"]
+        r = await svc.read_file(sid, "/sandbox/outside_temps larger than.csv")
+        assert r["error"] == "file_error"
+
+        async def refused(path, limit):
+            raise FileOpError("ValueError: '../x' is outside /sandbox", "traversal")
+
+        created[0].read_file = refused
+        await svc.read_file(sid, "../x")
+
+    run(go())
+    viol = [e for e in events(tmp_path) if e["event"] == "policy.violation"]
+    assert [(v["detail"]["kind"], v["detail"]["during"]) for v in viol] == [("traversal", "file.read")]
+
+
+def test_size_refusals_are_size_violations(tmp_path):
+    async def go():
+        svc, _ = make(tmp_path, options={"max_file_mb": 1})
+        (tmp_path / "share" / "big.bin").write_bytes(b"x" * (service.MIB + 1))
+        r = await svc.import_from_share("big.bin")
+        assert r["error"] == "share_error"
+        r = await svc.write_file(r["session_id"], "big.txt", "x" * (service.MIB + 1))
+        assert r["error"] == "file_error"
+
+    run(go())
+    kinds = [e["detail"]["kind"] for e in events(tmp_path) if e["event"] == "policy.violation"]
+    assert kinds == ["size", "size"]
+
+
+def test_sandbox_failure_after_a_concurrent_close_keeps_the_real_error(tmp_path):
+    async def go():
+        svc, created = make(tmp_path)
+        sid = (await svc.run_code("1 + 1"))["session_id"]
+
+        async def closed_meanwhile(command, timeout_s):
+            await svc.close_session(sid)  # e.g. the Ingress Close button
+            raise SandboxError("sandbox is closed")
+
+        created[0].run_command = closed_meanwhile
+        r = await svc.run_command("ls", session_id=sid)
+        assert r["error"] == "sandbox_unavailable" and "closed" in r["detail"]
+
+    run(go())
+
+
+def test_self_check_fails_closed_when_cleanup_or_run_fails(tmp_path):
+    async def go():
+        async def leaky(sid, uid, policy, **kw):
+            s = FakeSandbox(sid, uid, policy)
+
+            async def destroy():
+                raise SandboxError("1 process(es) of uid 59999 still alive after destroy")
+
+            s.destroy = destroy
+            return s
+
+        svc, _ = make(tmp_path, create=leaky)
+        assert "still alive" in await svc.self_check()
+
+        async def dead(sid, uid, policy, **kw):
+            s = FakeSandbox(sid, uid, policy)
+
+            async def run_code(code, timeout_s, reset=False):
+                raise SandboxError("REPL did not restart")
+
+            s.run_code = run_code
+            return s
+
+        svc2, _ = make(tmp_path, create=dead)
+        assert "did not restart" in await svc2.self_check()
+
+    run(go())
