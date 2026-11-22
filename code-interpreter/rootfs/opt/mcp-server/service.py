@@ -248,7 +248,8 @@ class Service:
             if len(data) > self.max_bytes:
                 raise FileOpError(f"content is larger than max_file_mb ({self.options.max_file_mb} MB)", "size")
             out = await s.write_file(path, data, self.max_bytes)
-            self.audit.record("file.write", s.sid, path=out["path"], size=out["size"], sha256=sha256(data))
+            digest = await asyncio.to_thread(sha256, data)  # hashlib drops the GIL: up to max_file_mb off the loop
+            self.audit.record("file.write", s.sid, path=out["path"], size=out["size"], sha256=digest)
             return out
 
         return await self._call(session_id, write, "file.write", path=path, size=len(data))
@@ -259,8 +260,9 @@ class Service:
             data = await asyncio.to_thread(sharefs.read_share, share_path, self.max_bytes, root=self.share_root)
             target = dest or Path(share_path).name
             out = await s.write_file(target, data, self.max_bytes)
+            digest = await asyncio.to_thread(sha256, data)
             self.audit.record("file.import", s.sid, share_path=share_path, path=out["path"],
-                              size=out["size"], sha256=sha256(data))
+                              size=out["size"], sha256=digest)
             return out
 
         return await self._call(session_id, imp, "file.import", share_path=share_path)
@@ -271,7 +273,8 @@ class Service:
             if size > self.max_bytes:
                 raise FileOpError(f"{path} is larger than max_file_mb ({self.options.max_file_mb} MB)", "size")
             dest = await asyncio.to_thread(sharefs.export, data, path, self.options.export_dir, s.sid, root=self.share_root)
-            self.audit.record("file.export", s.sid, path=path, share_path=str(dest), size=size, sha256=sha256(data))
+            digest = await asyncio.to_thread(sha256, data)
+            self.audit.record("file.export", s.sid, path=path, share_path=str(dest), size=size, sha256=digest)
             return {"share_path": str(dest), "size": size}
 
         return await self._call(session_id, exp, "file.export", path=path)
