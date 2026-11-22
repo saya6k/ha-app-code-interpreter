@@ -32,6 +32,11 @@ RUN /opt/venv/bin/pip install --only-binary=:all: -c /tmp/requirements-sandbox.t
 RUN /opt/venv/bin/pip install --only-binary=:all: -r /tmp/requirements-sandbox.txt \
  && rm /tmp/requirements-sandbox.txt
 
+# The packages' own test suites (~185 MB, a fifth of the rootfs) are never
+# run in a session. Removing them in a later layer still shrinks the image:
+# the app stage copies this stage's filesystem, not its layers.
+RUN find /opt/venv/lib -type d -name tests -prune -exec rm -rf {} +
+
 # Mount points: the rootfs is read-only inside bubblewrap, so bind targets
 # must already exist.
 RUN mkdir -p /sandbox /run/ci

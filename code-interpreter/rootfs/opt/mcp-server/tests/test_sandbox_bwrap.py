@@ -169,6 +169,37 @@ plt.plot([1, 2]); plt.title('한글'); plt.savefig('/sandbox/p.png')
     assert int(code(h, sbx, "import os; os.path.getsize('/sandbox/p.png')")["result"]) > 0
 
 
+def test_every_preinstalled_package_imports(h, sbx):
+    # The image deletes the packages' tests/ directories; nothing may need them.
+    r = code(h, sbx, """
+import importlib
+mods = ('numpy pandas scipy.stats statsmodels.api sklearn.linear_model sympy networkx '
+        'matplotlib.pyplot seaborn openpyxl xlsxwriter pyarrow.parquet PIL.Image lxml.etree '
+        'bs4 docx fpdf pypdf pdfplumber yaml tabulate').split()
+[m for m in mods if not importlib.import_module(m)]
+""", timeout=120)
+    assert r["error"] is None and r["result"] == "[]", r
+
+
+def test_pdf_text_and_tables(h, sbx):
+    r = code(h, sbx, """
+from fpdf import FPDF
+pdf = FPDF(); pdf.add_page(); pdf.set_font('helvetica', size=12)
+pdf.cell(text='Error codes'); pdf.ln(10)
+with pdf.table() as t:
+    for row in (('Code', 'Meaning'), ('E3', 'Door open'), ('E4', 'No water')):
+        t.row(row)
+pdf.output('/sandbox/m.pdf')
+import pypdf, pdfplumber
+text = pypdf.PdfReader('/sandbox/m.pdf').pages[0].extract_text()
+with pdfplumber.open('/sandbox/m.pdf') as p:
+    table = p.pages[0].extract_table()
+('Error codes' in text, table)
+""", timeout=60)
+    assert r["error"] is None, r["stderr"]
+    assert eval(r["result"]) == (True, [["Code", "Meaning"], ["E3", "Door open"], ["E4", "No water"]])
+
+
 def test_timeout_interrupt_keeps_variables(h, sbx):
     code(h, sbx, "keep = 7")
     r = code(h, sbx, "while True: pass", timeout=1)
