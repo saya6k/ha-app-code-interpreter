@@ -159,7 +159,6 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
         public = [a for a in addrs if is_public_ip(a)]
         if not public:
             return await reply("403 Forbidden", "non-public-address")
-        entry["allowed"] = True
         for addr in public:
             try:
                 upstream = await asyncio.wait_for(
@@ -170,6 +169,7 @@ async def _handle(reader, writer, rules, log, resolver) -> None:
                 continue
         if upstream is None:
             return await reply("502 Bad Gateway", "connect-failed")
+        entry["allowed"] = True  # only once it is connected: connect-failed is not an allowed connection
         up_reader, up_writer = upstream
         await reply("200 Connection Established")
         up, down = [0], [0]

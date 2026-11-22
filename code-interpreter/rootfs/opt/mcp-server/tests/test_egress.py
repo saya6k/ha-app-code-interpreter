@@ -264,3 +264,19 @@ def test_close_ends_a_handler_stuck_in_dns_quickly():
 
     assert asyncio.run(asyncio.wait_for(go(), 10)) < 2
     assert logs and logs[0]["host"] == "allowed.test"
+
+
+def test_upstream_connect_failure_is_not_logged_as_allowed(monkeypatch):
+    monkeypatch.setattr(proxy, "is_public_ip", lambda ip: True)
+
+    async def refused(host, port):  # the tunnel's upstream connect only
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(proxy.asyncio, "open_connection", refused)
+
+    async def resolver(host, port):
+        return ["203.0.113.7"]
+
+    reply, logs = _run_proxy_case(b"CONNECT allowed.test:443 HTTP/1.1\r\n\r\n", resolver)
+    assert reply.startswith(b"HTTP/1.1 502")
+    assert logs[0]["reason"] == "connect-failed" and logs[0]["allowed"] is False

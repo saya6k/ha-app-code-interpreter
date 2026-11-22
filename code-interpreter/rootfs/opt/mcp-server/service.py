@@ -6,6 +6,8 @@ not start is something the model should read and react to, not a crash.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import mimetypes
@@ -85,14 +87,6 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
 
 
 EGRESS_VIOLATIONS = {"not-allowlisted", "ip-literal", "non-public-address", "method-not-allowed"}
-
-
-def _violation_kind(message: str) -> str | None:
-    if "outside" in message:
-        return "traversal"
-    if "larger than" in message or "exceeds" in message:
-        return "size"
-    return None
 
 
 def _ms(t0: float) -> int:
@@ -176,9 +170,8 @@ class Service:
 
     async def _call(self, session_id: str | None, fn, event: str, **detail) -> dict:
         """Run fn(sandbox) in a session; on failure audit `event` as an error."""
-        def failed(sid, error: str, message: str) -> None:
+        def failed(sid, error: str, message: str, kind: str | None = None) -> None:
             self.audit.record(event, sid, "error", **detail, error=error, message=message)
-            kind = _violation_kind(message) if error in ("file_error", "share_error") else None
             if kind:
                 self.audit.record("policy.violation", sid, "denied", kind=kind, during=event, message=message)
 
@@ -188,13 +181,15 @@ class Service:
                     out = await fn(session.sandbox)
                 except SandboxError as e:
                     failed(session.id, "sandbox_unavailable", str(e))
-                    await self.manager.close(session.id, "sandbox_failed")
+                    # Closed meanwhile (Ingress, close_session, eviction): the real error still stands.
+                    with contextlib.suppress(SessionNotFound):
+                        await self.manager.close(session.id, "sandbox_failed")
                     return {"error": "sandbox_unavailable", "detail": str(e)}
                 except FileOpError as e:
-                    failed(session.id, "file_error", str(e))
+                    failed(session.id, "file_error", str(e), e.violation)
                     return {"session_id": session.id, "error": "file_error", "detail": str(e)}
                 except ShareError as e:
-                    failed(session.id, "share_error", str(e))
+                    failed(session.id, "share_error", str(e), e.violation)
                     return {"session_id": session.id, "error": "share_error", "detail": str(e)}
                 return {"session_id": session.id, **out}
         except SessionNotFound:
@@ -251,7 +246,7 @@ class Service:
 
         async def write(s):
             if len(data) > self.max_bytes:
-                raise FileOpError(f"content is larger than max_file_mb ({self.options.max_file_mb} MB)")
+                raise FileOpError(f"content is larger than max_file_mb ({self.options.max_file_mb} MB)", "size")
             out = await s.write_file(path, data, self.max_bytes)
             self.audit.record("file.write", s.sid, path=out["path"], size=out["size"], sha256=sha256(data))
             return out
@@ -260,7 +255,8 @@ class Service:
 
     async def import_from_share(self, share_path: str, session_id: str | None = None, dest: str | None = None) -> dict:
         async def imp(s):
-            data = sharefs.read_share(share_path, self.max_bytes, root=self.share_root)
+            # Off the event loop: up to max_file_mb of disk I/O would stall every call.
+            data = await asyncio.to_thread(sharefs.read_share, share_path, self.max_bytes, root=self.share_root)
             target = dest or Path(share_path).name
             out = await s.write_file(target, data, self.max_bytes)
             self.audit.record("file.import", s.sid, share_path=share_path, path=out["path"],
@@ -273,8 +269,8 @@ class Service:
         async def exp(s):
             data, size = await s.read_file(path, self.max_bytes + 1)
             if size > self.max_bytes:
-                raise FileOpError(f"{path} is larger than max_file_mb ({self.options.max_file_mb} MB)")
-            dest = sharefs.export(data, path, self.options.export_dir, s.sid, root=self.share_root)
+                raise FileOpError(f"{path} is larger than max_file_mb ({self.options.max_file_mb} MB)", "size")
+            dest = await asyncio.to_thread(sharefs.export, data, path, self.options.export_dir, s.sid, root=self.share_root)
             self.audit.record("file.export", s.sid, path=path, share_path=str(dest), size=size, sha256=sha256(data))
             return {"share_path": str(dest), "size": size}
 
@@ -324,9 +320,15 @@ class Service:
             return str(e)
         try:
             r = await sbx.run_code("1 + 1", 30)
-            return None if r.get("result") == "2" else f"unexpected result: {r}"
+            problem = None if r.get("result") == "2" else f"unexpected result: {r}"
+        except SandboxError as e:
+            problem = str(e)
         finally:
-            await sbx.destroy()
+            try:
+                await sbx.destroy()
+            except SandboxError as e:  # fail closed, never crash the app over it
+                problem = f"self-check sandbox was not cleaned up: {e}"
+        return problem
 
     async def run_reaper(self) -> None:
         await self.manager.run_reaper()

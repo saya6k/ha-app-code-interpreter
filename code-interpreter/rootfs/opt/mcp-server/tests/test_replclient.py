@@ -256,3 +256,43 @@ def test_command_with_detached_grandchild_is_not_a_timeout(repl):
     # The grandchild keeps the pipes open; the command itself exits at once.
     r = repl.do(repl.client.command("(sleep 30 &) ; echo done", timeout_s=2))
     assert r["error"] is None and r["exit_code"] == 0 and r["stdout"].startswith("done")
+
+
+def test_command_spawn_failure_is_an_error_not_a_dead_kernel(repl):
+    """EAGAIN from fork under RLIMIT_NPROC must not take the variables with it."""
+    repl("keep = 7")
+    repl("import subprocess\n"
+         "def _no_fork(*a, **k):\n"
+         "    raise BlockingIOError(11, 'Resource temporarily unavailable')\n"
+         "subprocess.Popen = _no_fork")
+    r = repl.do(repl.client.command("true", timeout_s=10))
+    assert r["error"] == "BlockingIOError" and r["exit_code"] is None
+    assert not r["restart_required"]
+    assert repl("keep")["result"] == "7"
+
+
+def test_command_reader_thread_failure_is_an_error_not_a_dead_kernel(repl):
+    repl("keep = 7")
+    repl("import threading\n"
+         "def _no_thread(self):\n"
+         "    raise RuntimeError(\"can't start new thread\")\n"
+         "threading.Thread.start = _no_thread")
+    r = repl.do(repl.client.command("sleep 30", timeout_s=10))
+    assert r["error"] == "RuntimeError" and r["exit_code"] is None
+    assert not r["restart_required"]
+    assert repl("keep")["result"] == "7"
+
+
+def test_interrupt_while_formatting_a_traceback_keeps_the_server(repl):
+    """SIGINT landing in the except handler (the timeout racing a failing cell)."""
+    repl("keep = 7")
+    r = repl("import os, signal, time, traceback\n"
+             "_orig = traceback.TracebackException.from_exception\n"
+             "def _slow(*a, **k):\n"
+             "    os.kill(os.getpid(), signal.SIGINT)\n"
+             "    time.sleep(0.2)\n"
+             "    return _orig(*a, **k)\n"
+             "traceback.TracebackException.from_exception = _slow\n"
+             "raise ValueError('boom')")
+    assert r["error"] == "ValueError" and not r["restart_required"]
+    assert repl("keep")["result"] == "7"

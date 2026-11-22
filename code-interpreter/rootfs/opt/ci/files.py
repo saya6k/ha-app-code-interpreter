@@ -20,6 +20,14 @@ REPLY_BYTES = 128 * 1024
 CHUNK = 65536
 
 
+class Violation(ValueError):
+    """A policy refusal; its kind travels in the reply as "violation"."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
 def resolve(path: str) -> str:
     if path == LOGICAL or path.startswith(LOGICAL + "/"):
         path = ROOT + path[len(LOGICAL):]
@@ -28,7 +36,7 @@ def resolve(path: str) -> str:
     real = os.path.realpath(path)
     root = os.path.realpath(ROOT)
     if real != root and not real.startswith(root + "/"):
-        raise ValueError(f"{path!r} is outside /sandbox")
+        raise Violation("traversal", f"{path!r} is outside /sandbox")
     return real
 
 
@@ -134,7 +142,7 @@ def write(path: str, max_bytes: int, fd: int) -> dict:
             while chunk := os.read(fd, CHUNK):
                 size += len(chunk)
                 if size > max_bytes:
-                    raise ValueError(f"file exceeds {max_bytes} bytes")
+                    raise Violation("size", f"file exceeds {max_bytes} bytes")
                 out.write(chunk)
         os.chmod(tmp, 0o644)
         os.replace(tmp, real)
@@ -165,6 +173,8 @@ def handle(req: dict, fds: list[int]) -> dict:
                 return read(req["path"], int(req["limit"]), fd)
             return write(req["path"], int(req["max_bytes"]), fd)
         return {"ok": False, "error": f"bad request {op!r}"}
+    except Violation as e:
+        return {"ok": False, "error": f"ValueError: {e}", "violation": e.kind}
     except (OSError, ValueError, KeyError) as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     finally:

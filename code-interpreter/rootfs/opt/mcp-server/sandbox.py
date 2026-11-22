@@ -45,6 +45,14 @@ class SandboxError(RuntimeError):
     pass
 
 
+class SandboxLeaked(SandboxError):
+    """destroy() could not get rid of the sandbox's processes: its uid is
+    still in use. The session manager checks `uid_in_use` (duck-typed, it
+    does not import this module) to retire the uid."""
+
+    uid_in_use = True
+
+
 def processes_of(uid: int, proc: Path = Path("/proc")) -> int:
     """Processes (zombies included) whose real uid is `uid`, as this
     container's /proc sees them."""
@@ -62,8 +70,16 @@ def processes_of(uid: int, proc: Path = Path("/proc")) -> int:
     return n
 
 
+VIOLATIONS = ("traversal", "size")
+
+
 class FileOpError(ValueError):
-    """The agent refused a file op (outside /sandbox, too large, missing...)."""
+    """The agent refused a file op (outside /sandbox, too large, missing...).
+    `violation` is the policy kind for the audit log, or None."""
+
+    def __init__(self, message: str, violation: str | None = None) -> None:
+        super().__init__(message)
+        self.violation = violation
 
 
 class Sandbox:
@@ -92,6 +108,9 @@ class Sandbox:
         self._agent: socket.socket | None = None
         self._agent_lock = asyncio.Lock()
         self._client: ReplClient | None = None
+        # A REPL restart in flight: it outlives a cancelled caller, and the
+        # next call waits for it instead of finding no client.
+        self._restarting: asyncio.Future | None = None
         self._stderr_tail = bytearray()
         self._on_net_event = on_net_event
         self._proxy: asyncio.Server | None = None
@@ -186,6 +205,9 @@ class Sandbox:
         await self._attach(ReplClient(app_repl, app_ctl), "sandbox did not start")
 
     async def _attach(self, client: ReplClient, what: str) -> None:
+        if self._closed:  # destroy() ran while a shielded restart was pending
+            client.close()
+            raise SandboxError("sandbox is closed")
         self._client = client
         try:
             await client.wait_ready(self.ready_timeout_s)
@@ -238,7 +260,8 @@ class Sandbox:
         except (OSError, ValueError) as e:
             raise self._failure(f"sandbox is gone, its files are lost ({e})") from None
         if not reply.get("ok"):
-            raise FileOpError(reply.get("error", "file operation failed"))
+            kind = reply.get("violation")  # the agent is sandbox-side: accept known kinds only
+            raise FileOpError(reply.get("error", "file operation failed"), kind if kind in VIOLATIONS else None)
         return reply
 
     async def list_files(self, path: str = "/sandbox", recursive: bool = False, skip_dot: bool = False) -> dict:
@@ -299,7 +322,22 @@ class Sandbox:
         return await self._agent_op_thread(stream_op)
 
     async def _restart_repl(self) -> None:
-        """Fresh REPL in the same sandbox: variables go, files stay."""
+        """Fresh REPL in the same sandbox: variables go, files stay. Shielded:
+        if the caller is cancelled the restart still finishes, so the agent's
+        new REPL is never left without an app-side client."""
+        task = asyncio.ensure_future(self._do_restart_repl())
+        self._restarting = task
+
+        def done(t: asyncio.Future) -> None:
+            if self._restarting is t:
+                self._restarting = None
+            if not t.cancelled():
+                t.exception()  # mark retrieved: the caller may be gone
+
+        task.add_done_callback(done)
+        await asyncio.shield(task)
+
+    async def _do_restart_repl(self) -> None:
         if self._closed or self._agent is None:
             raise SandboxError("sandbox is closed")
         if self._client is not None:
@@ -313,6 +351,10 @@ class Sandbox:
             app_repl.close()
             app_ctl.close()
             raise self._failure(f"sandbox is gone, its files are lost ({e})") from None
+        except BaseException:
+            app_repl.close()
+            app_ctl.close()
+            raise
         finally:
             child_repl.close()
             child_ctl.close()
@@ -323,6 +365,8 @@ class Sandbox:
         await self._attach(ReplClient(app_repl, app_ctl), "REPL did not restart")
 
     async def _with_restart(self, call) -> dict:
+        if self._restarting is not None:
+            await asyncio.shield(self._restarting)  # raises if that restart failed
         if self._client is None:
             raise SandboxError("sandbox is not running")
         self._stderr_tail.clear()
@@ -388,4 +432,4 @@ class Sandbox:
         while (left := await asyncio.to_thread(processes_of, self.uid)) and loop.time() < deadline:
             await asyncio.sleep(0.05)
         if left:
-            raise SandboxError(f"{left} process(es) of uid {self.uid} still alive after destroy")
+            raise SandboxLeaked(f"{left} process(es) of uid {self.uid} still alive after destroy")

@@ -16,7 +16,11 @@ MAX_SUFFIX = 1000
 
 
 class ShareError(ValueError):
-    pass
+    """`violation` is the policy kind ("traversal", "size") for the audit log, or None."""
+
+    def __init__(self, message: str, violation: str | None = None) -> None:
+        super().__init__(message)
+        self.violation = violation
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -38,13 +42,13 @@ def resolve_share(p: str, root: Path = SHARE) -> Path:
     # Containment first: a path aiming outside /share is a traversal attempt
     # whether or not its target exists.
     if not _inside((real_root / rel).resolve(), real_root):
-        raise ShareError(f"/share/{rel} points outside /share")
+        raise ShareError(f"/share/{rel} points outside /share", "traversal")
     try:
         path = (real_root / rel).resolve(strict=True)
     except (OSError, RuntimeError):
         raise ShareError(f"/share/{rel} does not exist") from None
     if not _inside(path, real_root):
-        raise ShareError(f"/share/{rel} points outside /share")
+        raise ShareError(f"/share/{rel} points outside /share", "traversal")
     if not path.is_file():
         raise ShareError(f"/share/{rel} is not a regular file")
     return path
@@ -54,10 +58,10 @@ def read_share(p: str, max_bytes: int, root: Path = SHARE) -> bytes:
     path = resolve_share(p, root)
     size = path.stat().st_size
     if size > max_bytes:
-        raise ShareError(f"/share/{p.lstrip('/')} is larger than {max_bytes} bytes ({size})")
+        raise ShareError(f"/share/{p.lstrip('/')} is larger than {max_bytes} bytes ({size})", "size")
     data = path.read_bytes()
     if len(data) > max_bytes:  # grew while we looked
-        raise ShareError(f"/share/{p.lstrip('/')} is larger than {max_bytes} bytes")
+        raise ShareError(f"/share/{p.lstrip('/')} is larger than {max_bytes} bytes", "size")
     return data
 
 
@@ -77,7 +81,7 @@ def export(data: bytes, name: str, export_dir: Path, sid: str, root: Path = SHAR
     real_root = root.resolve()
     export_dir = Path(export_dir)
     if not _inside(export_dir.resolve(), real_root):
-        raise ShareError(f"export_dir {export_dir} is outside /share")
+        raise ShareError(f"export_dir {export_dir} is outside /share", "traversal")
     export_dir.mkdir(parents=True, exist_ok=True)
     session_dir = export_dir / sid
     try:
@@ -93,7 +97,7 @@ def export(data: bytes, name: str, export_dir: Path, sid: str, root: Path = SHAR
         raise ShareError(f"{session_dir} is a symlink or not a directory") from None
     try:
         if not _inside(session_dir.resolve(), real_root):
-            raise ShareError(f"{session_dir} points outside /share")
+            raise ShareError(f"{session_dir} points outside /share", "traversal")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
         for candidate in _candidates(base):
             try:
