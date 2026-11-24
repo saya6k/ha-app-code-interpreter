@@ -7,7 +7,6 @@ description: >-
   Each session runs in a bubblewrap sandbox inside the app with no network
   by default, files shared via /share, and a JSONL audit log.
 url: https://github.com/saya6k/ha-app-code-interpreter
-stage: experimental
 arch:
   - aarch64
   - amd64
