@@ -48,27 +48,17 @@ svc = Service(options, audit=Audit(retention_days=options.audit_retention_days))
 async def run_code(
     code: str, ctx: Context, session_id: str | None = None, timeout_s: int = DEFAULT_TIMEOUT_S, reset: bool = False
 ) -> dict:
-    """Run Python code in a sandbox. Variables persist across calls with the same session_id.
+    """Run Python code in a sandbox: calculations, data analysis, charts and file processing.
 
-    Omit session_id to start a new session and pass the returned session_id on
-    follow-up calls. If a call returns session_not_found, the old variables and
-    files are gone: start again without session_id. The last expression's value
-    is returned as `result`, and files the call created or changed under
-    /sandbox as `new_files`. Files live under /sandbox (256 MB); /tmp is
-    scratch (64 MB). Use import_from_share / export_to_share to move files
-    between /sandbox and Home Assistant's /share.
-
-    Preinstalled: numpy, pandas, scipy, statsmodels, scikit-learn, sympy,
-    networkx, matplotlib (Agg; Korean labels work by default), seaborn, openpyxl,
-    xlsxwriter, pyarrow, pillow, lxml, beautifulsoup4, python-docx, fpdf2,
-    pyyaml, tabulate. There is no /proc (psutil does not work) and no network
+    Variables persist across calls with the same session_id; omit it to start a
+    new session, and start again without it on session_not_found. Returns the
+    last expression's value as `result` and files changed under /sandbox as
+    `new_files`. Preinstalled: numpy, pandas, scipy, sympy, scikit-learn,
+    matplotlib (Korean labels work) and other common data libraries. No network
     unless the app's allowlist permits a host.
 
-    Home Assistant ends any tool call after 30 s, so keep timeout_s at its
-    default (25) or lower there: work that needs more than ~25 s (large pip
-    installs, long training) cannot finish in one call. Split it into
-    shorter steps; variables survive between calls. A timed-out cell is
-    interrupted with its variables kept. Other clients may allow up to 600.
+    Home Assistant ends a tool call after 30 s: keep timeout_s at 25 or lower
+    and split longer work into steps (a timed-out cell keeps its variables).
     """
     return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset))
 
