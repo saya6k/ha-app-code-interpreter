@@ -1,0 +1,17 @@
+---
+# P0 probe for SPEC-code-mode: Node in the real bubblewrap sandbox, and the
+# Home Assistant MCP Server endpoints the app would use. Assemble first:
+#   scripts/assemble-node-probe.sh <dir>   then copy <dir> to /addons/node-probe
+name: node probe
+version: 0.1.0
+slug: node_probe
+description: One-shot check of Node under the Code Interpreter sandbox and of HA's MCP Server.
+arch:
+  - aarch64
+  - amd64
+# init: true reaps orphaned bwrap processes, as s6 does in the real app.
+init: true
+startup: once
+boot: manual
+# /core/api/mcp/<api> and the websocket API through the Supervisor proxy.
+homeassistant_api: true

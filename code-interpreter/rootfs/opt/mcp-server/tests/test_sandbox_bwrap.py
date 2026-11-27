@@ -1,6 +1,6 @@
 """Sandbox against real bubblewrap. Runs inside the app image only:
 
-    scripts/test-sandbox.sh   (linux-test / CI; container runs seccomp=unconfined)
+    scripts/test-sandbox.sh   (local docker / CI; container runs seccomp=unconfined)
 """
 
 import asyncio

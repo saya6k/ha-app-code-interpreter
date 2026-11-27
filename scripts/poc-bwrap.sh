@@ -1,5 +1,5 @@
 #!/bin/sh
-# Local run of poc/bwrap-probe on a Docker host (linux-test). Mimics Supervisor:
+# Local run of poc/bwrap-probe with docker (on the Mac: socktainer). Mimics Supervisor:
 # seccomp=unconfined, default capabilities. Local hosts usually lack AppArmor,
 # so the AppArmor question is only answered on real HAOS.
 set -eu

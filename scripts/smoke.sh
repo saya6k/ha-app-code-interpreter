@@ -1,5 +1,5 @@
 #!/bin/sh
-# Smoke test of the app image (linux-test, CI): s6 boots the MCP server and a
+# Smoke test of the app image (local docker, CI): s6 boots the MCP server and a
 # real MCP client drives the tools. Phases: default options (incl. idle
 # expiry and shutdown cleanup), network allowlist, and lifecycle (SIGKILL +
 # restart leaves nothing behind; a normal stop closes every session).
