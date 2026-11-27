@@ -74,7 +74,9 @@ async def run_code(
     Globals:
       ha.tools(): Promise<Tool[]>              Home Assistant tools for entities exposed to Assist
       ha.<domain>.<tool>(args): Promise<any>   e.g. ha.intent.HassTurnOff({name: "Kitchen light"}),
-                                               ha.homeassistant.GetLiveContext()
+                                               ha.homeassistant.GetLiveContext() -> {result: text,
+                                               entities: [{names, domain, state, areas, attributes}]}:
+                                               filter ctx.entities, do not parse the text
       ha.call(name, args)                      the same by full name, e.g. "light__HassLightSet"
       ha.admin?                                administrators only: read-only tools (logs, history,
                                                traces, configuration); undefined for everyone else
@@ -90,8 +92,8 @@ async def run_code(
                                                prefer a fitting skill over writing the code again
 
     Example, one call:
-      const ctx = await ha.homeassistant.GetLiveContext();
-      const on = /* parse ctx */ [];
+      const { entities } = await ha.homeassistant.GetLiveContext();
+      const on = entities.filter((e) => e.domain === "light" && e.state === "on").map((e) => e.names);
       await Promise.all(on.map((name) => ha.intent.HassTurnOff({ name })));
       ({ turnedOff: on })
     Example, analysis with Python (numpy, pandas, scipy, statsmodels,

@@ -149,3 +149,38 @@ def test_generate_data_network_errors_are_unavailable(monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
     with pytest.raises(HaUnavailable, match="ConnectError"):
         asyncio.run(HomeAssistant(token="t").generate_data("task", "do it", {}))
+
+
+LIVE = (
+    "Live Context: An overview of the areas and the devices in this smart home:\n"
+    "- names: TV light, Ambient\n"
+    "  domain: light\n"
+    "  state: 'on'\n"
+    "  areas: Living room\n"
+    "  attributes:\n"
+    "    brightness: '13'\n"
+    "- names: Kitchen\n"
+    "  domain: light\n"
+    "  state: 'off'\n"
+    "- names: Purifier filter\n"
+    "  domain: sensor\n"
+    "  state: '94'\n"
+)
+
+
+def test_live_context_gets_parsed_entities_beside_the_text():
+    v = hamcp.enrich(hamcp.LIVE_CONTEXT, {"result": LIVE})
+    assert v["result"] == LIVE  # the text stays
+    assert [e["names"] for e in v["entities"] if e["domain"] == "light" and e["state"] == "on"] == ["TV light, Ambient"]
+    assert v["entities"][0]["attributes"] == {"brightness": "13"}
+    assert all(isinstance(e["state"], str) for e in v["entities"])  # 'on' stays a string, not True
+
+
+@pytest.mark.parametrize("name,value", [
+    ("llm__GetDateTime", {"date": "2026-11-27"}),
+    (hamcp.LIVE_CONTEXT, {"result": "No entities are exposed."}),
+    (hamcp.LIVE_CONTEXT, {"result": "Live Context:\n- [unbalanced"}),
+    (hamcp.LIVE_CONTEXT, "plain text"),
+])
+def test_anything_else_is_left_as_it_was(name, value):
+    assert hamcp.enrich(name, value) == value
