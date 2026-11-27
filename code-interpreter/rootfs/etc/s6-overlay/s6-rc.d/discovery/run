@@ -27,7 +27,12 @@ fi
 
 # The MCP server writes its token before it listens; Home Assistant sends it
 # back as a bearer token on every request (2026.12+).
-token=$(cat /data/mcp_token)
+token=$(cat /data/mcp_token 2>/dev/null || true)
+if [ -z "${token}" ]; then
+    # Without it Home Assistant would store no token and every call would be refused.
+    bashio::log.warning "MCP server did not start; not announcing. Restart the app."
+    exit 0
+fi
 if bashio::discovery "mcp" "{\"url\": \"http://$(hostname):8099/mcp\", \"token\": \"${token}\"}" > /dev/null; then
     bashio::log.info "Announced MCP endpoint to Home Assistant."
 else

@@ -19,6 +19,8 @@ panel_icon: mdi:code-tags
 panel_title: Code Interpreter
 # /core/api/mcp/<api> and the websocket API through the Supervisor proxy:
 # the app calls Home Assistant's MCP Server for the cells (ha.*).
+# The MCP endpoint requires the discovery token (Home Assistant core #190779).
+homeassistant: 2026.12.0b0
 homeassistant_api: true
 # hassio.app_stdin: skill requests from automations and scripts (DOCS: Skills).
 stdin: true
