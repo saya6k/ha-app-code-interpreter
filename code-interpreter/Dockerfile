@@ -78,10 +78,12 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 LABEL io.hass.type="app"
 
 # ---- hab (Home Assistant Builder) for ha.admin.hab() -------------------------
-# A static Go binary run by the app, never inside the sandbox (it uses the
-# Supervisor token). Pinned by checksum; its update check is off at run time.
+# Run by the app, never inside the sandbox (it uses the Supervisor token).
+# Pinned by checksum; its update check is off at run time. The amd64 release
+# is linked against glibc (arm64 is static): gcompat gives it a loader here.
 ARG HAB_VERSION=1.10.0
-RUN case "$(uname -m)" in \
+RUN apk add --no-cache gcompat \
+ && case "$(uname -m)" in \
       aarch64) arch=arm64 sha=719c61fb3b0c7a8295a61113b4730f251b3c3fa5c833c5bab64e8865e3af5b90 ;; \
       x86_64) arch=amd64 sha=2d2c0529f61f1e6bd8759f1cdf0ece153c04f51b7eee0e6def28ad6bbac8bca0 ;; \
       *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
