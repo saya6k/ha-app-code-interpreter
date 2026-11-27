@@ -21,7 +21,7 @@ import sharefs
 from hab import Hab, HabRefused, Rules
 from hamcp import ADMIN, APIS, ASSIST, HaToolError, HaUnavailable, HomeAssistant
 from audit import Audit, code_detail, sha256
-from plugins import ACCESS, Plugin, Plugins
+from plugins import ACCESS, Plugin, Plugins, valid_api
 from policy import SandboxPolicy
 from replclient import RpcError
 from skills import SkillError, SkillReviewer, SkillStore
@@ -84,10 +84,14 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
     for entry in raw.get("plugins") or []:
         name = str((entry or {}).get("name") or "").strip()
         access = str((entry or {}).get("access") or "").strip()
+        api = str((entry or {}).get("api") or "").strip() or None
         if not name or access not in ACCESS:  # dropping only narrows access: fail-closed
             log.error("[mcp-server] plugin %r: needs a name and access all or admin — ignored", entry)
             continue
-        plugins.append(Plugin(name, access))
+        if api is not None and not valid_api(api):
+            log.error("[mcp-server] plugin %r: api %r is not an LLM API id a plugin may use — ignored", name, api)
+            continue
+        plugins.append(Plugin(name, access, api))
     export_dir = Path(raw.get("export_dir") or DEFAULT_EXPORT_DIR)
     if not export_dir.is_absolute() or ".." in export_dir.parts or not (
         export_dir == sharefs.SHARE or sharefs.SHARE in export_dir.parents
@@ -180,7 +184,7 @@ class _CellCalls:
             return await self._ha(op, args)
         if op == "ha.hab":
             return await self._hab(args)
-        if op in ("skills.list", "skills.get"):
+        if op in ("skills.list", "skills.get", "skills.request"):
             return self._skills(op, args)
         if op in ("plugins.list", "plugins.call"):
             return await self._plugin(op, args)
@@ -197,6 +201,16 @@ class _CellCalls:
         if not self.user_id:
             raise RpcError("NoUser", "skills belong to a Home Assistant user; this call has none")
         try:
+            if op == "skills.request":
+                text = args.get("request")
+                if not isinstance(text, str) or not text.strip():
+                    raise RpcError("TypeError", "skills.request(text) takes what the skill should do, as a string")
+                if not svc.reviewer.enabled:
+                    raise RpcError("SkillsOff", "skill requests are off (the app's skill_workflow option)")
+                svc.reviewer.ask(self.user_id, text, s.sid)
+                return {"requested": True, "note": (
+                    "The skill is being written in the background. It waits for an administrator's approval "
+                    "in the Code Interpreter panel and cannot be used before that.")}
             if op == "skills.list":
                 return [{"name": k["name"], "status": "active" if k.get("active") else "pending",
                          "description": (k.get("active") or k.get("pending") or {}).get("description", ""),

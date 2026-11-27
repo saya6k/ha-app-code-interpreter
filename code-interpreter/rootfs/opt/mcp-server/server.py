@@ -96,6 +96,9 @@ async def run_code(
                                                you (plugins.tools() lists them); undefined if none
       skills.list(), skills.<name>(args)       this user's saved skills (approved ones run);
                                                prefer a fitting skill over writing the code again
+      skills.request(text)                     ask for a new skill when the user wants one; it is
+                                               written in the background and runs only once an
+                                               administrator approves it
 
     Example, one call:
       const { entities } = await ha.homeassistant.GetLiveContext();

@@ -128,8 +128,8 @@ def test_tools_are_cached_per_api_and_unknown_apis_refused():
 
     assert asyncio.run(go())[0]["name"] == "intent__HassTurnOn"
     assert opened == ["assist", "assist"]
-    with pytest.raises(ValueError):
-        asyncio.run(ha.tools("mcp_client_for_this_app"))
+    with pytest.raises(ValueError):  # not an API id at all; which ids a cell may use is plugins.py's call
+        asyncio.run(ha.tools("../config"))
 
 
 def test_why_names_the_missing_integration_and_token_problems():
@@ -179,9 +179,18 @@ def test_plugin_results_are_taken_out_of_home_assistants_envelope():
         hamcp.unwrap_plugin({"content": [{"type": "text", "text": "Fact not found: x"}], "isError": True})
 
 
+def test_results_are_unwrapped_for_plugin_apis_and_enriched_for_assist():
+    envelope = types.CallToolResult(content=[types.TextContent(type="text", text=json.dumps({"content": [
+        {"type": "text", "text": "[1, 2]"}]}))])
+    assert hamcp._value("wardrowbe__X", "wardrowbe__get_latest_outfit", envelope) == [1, 2]
+    assert hamcp._value("assist", "intent__HassTurnOn", envelope) == {"content": [{"type": "text", "text": "[1, 2]"}]}
+
+
 @pytest.mark.parametrize("api,ok", [("assist", True), ("homeassistant", True), ("mcp-01KYW9YR29S3RJZ0RH6RVWCWRT", True),
-                                    ("mcp-", False), ("mcp-../x", False), ("all", False), ("conversation", False)])
-def test_only_known_and_plugin_apis_are_accepted(api, ok):
+                                    ("wardrowbe__01KXR8H9T6QN4SRQCEQWRFBQ7W", True), ("", False), ("mcp-../x", False),
+                                    ("a/b", False), ("a b", False), ("x" * 101, False)])
+def test_api_ids_are_checked_for_shape(api, ok):
+    # Which APIs a cell may reach is plugins.py's decision; this only keeps the URL path sane.
     if ok:
         hamcp.check_api(api)
     else:

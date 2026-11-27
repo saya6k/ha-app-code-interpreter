@@ -850,3 +850,48 @@ def test_a_request_offers_the_users_plugin_tools(tmp_path):
     request(svc, json.dumps({"type": "skill.request", "user": "bob", "request": "remember"}))
     ((instructions, _),) = svc.ha.asked
     assert "plugin.memory__search" in instructions and "secrets__read" not in instructions
+
+
+def test_plugin_options_take_an_api_id_but_never_the_ha_apis(tmp_path):
+    svc, _ = make(tmp_path, {"plugins": [{"name": "Wardrowbe", "access": "admin", "api": "wardrowbe__W9"},
+                                         {"name": "sneaky", "access": "all", "api": "homeassistant"},
+                                         {"name": "path", "access": "all", "api": "../x"}]})
+    assert [(p.name, p.api) for p in svc.options.plugins] == [("Wardrowbe", "wardrowbe__W9")]
+
+
+def ask(svc, sid, user, text="today's outfit"):
+    return asyncio.run(svc.run_code(f"call skills.request {json.dumps({'request': text})}", session_id=sid, user_id=user))
+
+
+def test_a_skill_asked_for_in_a_conversation_becomes_pending_for_the_speaker(tmp_path):
+    answer = {"save": True, "name": "todays_outfit", "description": "d", "params": "{}",
+              "code": "async () => plugins.wardrowbe.suggest_outfit({})", "reason": "asked",
+              "uses": '{"plugins": ["wardrowbe__suggest_outfit"]}'}
+    svc, _ = skill_service(tmp_path, answer)
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    r = ask(svc, sid, "bob")
+    assert json.loads(r["result"])["requested"] is True
+    asyncio.run(svc.reviewer.wait())
+    ((instructions, _),) = svc.ha.asked
+    assert "today's outfit" in instructions
+    pending = svc.skills.get("bob", "todays_outfit")["pending"]
+    assert pending["source"]["request"] == "today's outfit" and pending["source"]["session_id"] == sid
+    assert svc.skills.get("bob", "todays_outfit")["active"] is None  # nothing runs before approval
+    (ev,) = [e for e in events(tmp_path) if e["event"] == "skill.requested"]
+    assert ev["session_id"] == sid and ev["detail"]["via"] == "conversation" and ev["detail"]["user_id"] == "bob"
+
+
+def test_skill_requests_need_a_user_the_workflow_and_one_at_a_time(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    anon = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    assert ask(svc, anon, None)["error"].startswith("NoUser: ")
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(svc, sid, "bob", "  ")["error"].startswith("TypeError: ")
+    svc.reviewer._writing.add("bob")  # a request of bob's is being written
+    assert ask(svc, sid, "bob")["error"].startswith("SkillError: ")
+    svc.reviewer._writing.clear()
+    (tmp_path / "off").mkdir()
+    off, _ = skill_service(tmp_path / "off", {}, skill_workflow=False)
+    osid = asyncio.run(off.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(off, osid, "bob")["error"].startswith("SkillsOff: ")
+    assert off.ha.asked == []

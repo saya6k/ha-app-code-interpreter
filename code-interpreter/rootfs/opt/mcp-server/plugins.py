@@ -14,7 +14,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from hamcp import CACHE_S, HaUnavailable
+from hamcp import APIS, API_ID, CACHE_S, HaUnavailable
 
 log = logging.getLogger("mcp-server")
 
@@ -26,8 +26,15 @@ SELF_TOOL = "__run_code"
 
 @dataclass(frozen=True)
 class Plugin:
-    name: str  # the MCP client config entry's title
+    name: str  # the MCP client config entry's title, or a label when api is set
     access: str = "admin"
+    api: str | None = None  # an LLM API id Home Assistant's MCP Server serves, e.g. wardrowbe__<entry id>
+
+
+def valid_api(api: str) -> bool:
+    """A plugin may name any LLM API but the two ha.* and ha.admin use (they
+    have their own rules)."""
+    return bool(API_ID.match(api)) and api not in APIS
 
 
 class Plugins:
@@ -45,23 +52,28 @@ class Plugins:
             return []
         if self._resolved and self.clock() - self._resolved[0] < CACHE_S:
             return self._resolved[1]
-        entries = await self.ha.mcp_servers()
+        entries = await self.ha.mcp_servers() if any(not p.api for p in self.configured) else []
         out, problems = [], []
         for p in self.configured:
-            match = [e for e in entries if e["title"].casefold() == p.name.casefold()]
-            if len(match) != 1:
-                problems.append(f"{p.name}: {'several' if match else 'no'} MCP client entries with that title")
-                continue
-            entry = match[0]
-            if entry["state"] != "loaded":
-                problems.append(f"{p.name}: not loaded ({entry['state']})")
-                continue
-            api = f"mcp-{entry['entry_id']}"
+            if p.api:
+                api = p.api
+            else:
+                match = [e for e in entries if e["title"].casefold() == p.name.casefold()]
+                if len(match) != 1:
+                    problems.append(f"{p.name}: {'several' if match else 'no'} MCP client entries with that title")
+                    continue
+                entry = match[0]
+                if entry["state"] != "loaded":
+                    problems.append(f"{p.name}: not loaded ({entry['state']})")
+                    continue
+                api = f"mcp-{entry['entry_id']}"
             try:
                 names = [t["name"] for t in await self.ha.tools(api)]
             except (HaUnavailable, ValueError) as e:
                 problems.append(f"{p.name}: {e}")
                 continue
+            # An API that offers this app's own tool is this app (or an API
+            # that bundles it): calling it would recurse.
             if any(n.endswith(SELF_TOOL) for n in names):
                 problems.append(f"{p.name}: this app itself, never a plugin")
                 continue
