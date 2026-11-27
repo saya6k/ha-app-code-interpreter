@@ -47,7 +47,7 @@ def sessions(directory: Path, day: str) -> list[dict]:
             continue
         s = summary.setdefault(sid, {
             "session_id": sid, "started": None, "ended": None, "end_reason": None,
-            "last": None, "events": 0, "code_runs": 0, "commands": 0, "errors": 0,
+            "last": None, "events": 0, "code_runs": 0, "commands": 0, "ha_calls": 0, "errors": 0,
             "files": 0, "net_allowed": 0, "net_denied": 0, "violations": 0,
         })
         s["events"] += 1
@@ -60,8 +60,10 @@ def sessions(directory: Path, day: str) -> list[dict]:
             s["end_reason"] = (e.get("detail") or {}).get("reason")
         elif kind == "code.exec":
             s["code_runs"] += 1
-        elif kind == "command.exec":
+        elif kind == "command.exec":  # before 0.5.0
             s["commands"] += 1
+        elif kind == "ha.call":
+            s["ha_calls"] += 1
         elif kind.startswith("file."):
             s["files"] += 1
         elif kind == "net.connect":

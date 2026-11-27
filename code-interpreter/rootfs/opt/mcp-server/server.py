@@ -60,105 +60,48 @@ svc = Service(options, audit=Audit(retention_days=options.audit_retention_days))
 async def run_code(
     code: str, ctx: Context, session_id: str | None = None, timeout_s: int = DEFAULT_TIMEOUT_S, reset: bool = False
 ) -> dict:
-    """Run JavaScript (Node 26) in a sandbox. Variables persist across calls with the same session_id.
+    """Run JavaScript (Node 26) in a sandbox that can also reach Home Assistant.
 
-    Omit session_id to start a new session and pass the returned session_id on
-    follow-up calls. If a call returns session_not_found, the old variables and
-    files are gone: start again without session_id. The last expression's value
-    is returned as `result`, and files the call created or changed under
-    /sandbox as `new_files`. Top-level await works; const/let/function/class
-    declared at the top level stay defined for later calls; promises inside
-    a returned object are awaited. Globals: $`cmd ${x}` runs sh -c in /sandbox
-    (values quoted; .text() .lines() .json() .nothrow() .timeout(ms); a
-    non-zero exit throws ShellError), file(p).text()/json()/lines()/exists(),
-    write(p, s), sleep(ms), log(...), require for Node built-ins, and for
-    Home Assistant's /share: await share.list(dir?), share.import(share_path,
-    dest?), share.export(path) (to /share/code-interpreter/<session>/).
-    Home Assistant itself: await ha.tools() lists the tools for entities
-    exposed to Assist; call one as ha.<domain>.<tool>(args), e.g.
-    await ha.intent.HassTurnOff({name: 'Kitchen light'}) or
-    await ha.homeassistant.GetLiveContext(), or ha.call('<domain>__<tool>',
-    args). Filter state in code and return only what you need. Name rooms
-    and devices explicitly ("here" is not known). For administrators only,
-    ha.admin offers read-only tools (logs, history, traces, configuration):
-    check await ha.admin?.tools(). At most 50 Home Assistant calls per run.
-    Files live under /sandbox (256 MB); /tmp is
-    scratch (64 MB). Use import_from_share / export_to_share to move files
-    between /sandbox and Home Assistant's /share.
+    One call runs a whole script: read state, filter it in code, act, and
+    return only what is needed. Top-level await works; const/let/function/
+    class declared at the top level stay defined for later calls with the
+    same session_id (omit it to start a new session; session_not_found means
+    the old variables and files are gone). The last expression is returned as
+    `result` (promises inside a returned object are awaited); console.log and
+    log() output comes back as `logs`; a thrown error as `error` + `message`.
 
-    For analysis, write a Python script and run it with run_command
-    (python3). Preinstalled for Python: numpy, pandas, scipy, statsmodels,
-    scikit-learn, sympy, networkx, matplotlib (Agg; Korean labels work by
-    default), seaborn, openpyxl, xlsxwriter, pyarrow, pillow, lxml,
-    beautifulsoup4, python-docx, fpdf2, pyyaml, tabulate. No npm packages.
-    There is no /proc (process.memoryUsage() and psutil do not work), at most
-    one worker thread, and no network unless the app's allowlist permits a host.
+    Globals:
+      ha.tools(): Promise<Tool[]>              Home Assistant tools for entities exposed to Assist
+      ha.<domain>.<tool>(args): Promise<any>   e.g. ha.intent.HassTurnOff({name: "Kitchen light"}),
+                                               ha.homeassistant.GetLiveContext()
+      ha.call(name, args)                      the same by full name, e.g. "light__HassLightSet"
+      ha.admin?                                administrators only: read-only tools (logs, history,
+                                               traces, configuration); undefined for everyone else
+      $`cmd ${x}`                              sh -c in /sandbox, values quoted; .text() .lines()
+                                               .json() .nothrow() .timeout(ms); non-zero exit throws
+      file(p).text()/json()/lines()/exists(), write(p, s), sleep(ms), log(...), require(builtin)
+      share.list(dir?), share.import(sharePath, dest?), share.export(path)   Home Assistant's /share
 
-    Home Assistant ends any tool call after 30 s, so keep timeout_s at its
-    default (25) or lower there: work that needs more than ~25 s (long
-    training) cannot finish in one call. Split it into
-    shorter steps; variables survive between calls. A timed-out cell is
-    interrupted with its variables kept (a loop after an await cannot be
-    interrupted: the REPL restarts, files stay). Other clients may allow up to 600.
+    Example, one call:
+      const ctx = await ha.homeassistant.GetLiveContext();
+      const on = /* parse ctx */ [];
+      await Promise.all(on.map((name) => ha.intent.HassTurnOff({ name })));
+      ({ turnedOff: on })
+    Example, analysis with Python (numpy, pandas, scipy, statsmodels,
+    scikit-learn, sympy, networkx, matplotlib with Korean labels, seaborn,
+    openpyxl, pyarrow, pillow, python-docx, fpdf2, pypdf, pdfplumber, …):
+      await share.import("energy.csv");
+      await write("plot.py", "import pandas as pd ...; plt.savefig('plot.png')");
+      await $`python3 plot.py`; (await share.export("plot.png")).share_path
+
+    Limits: Home Assistant ends a call after 30 s, so keep timeout_s at 25 and
+    split longer work across calls (variables survive; a timed-out run is
+    interrupted, a loop after an await restarts the REPL but keeps files).
+    At most 50 Home Assistant calls per run. Name rooms and devices ("here" is
+    not known). Files: /sandbox (256 MB), /tmp (64 MB). No npm, no /proc, one
+    worker thread, no network unless the app's allowlist permits a host.
     """
     return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset, user_id=caller(ctx)))
-
-
-@mcp.tool()
-async def run_command(
-    command: str, ctx: Context, session_id: str | None = None, timeout_s: int = DEFAULT_TIMEOUT_S
-) -> dict:
-    """Run a shell command (sh -c) in a session's sandbox, in /sandbox.
-
-    Shares files with run_code in the same session, but not variables.
-    Returns stdout, stderr and exit_code. Same time limit as run_code: keep
-    timeout_s at 25 or lower under Home Assistant (it ends calls at 30 s).
-    """
-    return await with_heartbeat(ctx, svc.run_command(command, session_id, timeout_s, user_id=caller(ctx)))
-
-
-@mcp.tool()
-async def list_files(session_id: str, ctx: Context, path: str = "/sandbox") -> dict:
-    """List files in a session's /sandbox (name, type, size)."""
-    return await svc.list_files(session_id, path, user_id=caller(ctx))
-
-
-@mcp.tool()
-async def read_file(session_id: str, path: str, ctx: Context) -> dict:
-    """Read a text file from /sandbox (up to 16000 characters).
-
-    For binary files only the size and MIME type are returned; use
-    export_to_share to hand them to the user.
-    """
-    return await svc.read_file(session_id, path, user_id=caller(ctx))
-
-
-@mcp.tool()
-async def write_file(session_id: str, path: str, content: str, ctx: Context) -> dict:
-    """Write a text file into /sandbox (parent directories are created)."""
-    return await svc.write_file(session_id, path, content, user_id=caller(ctx))
-
-
-@mcp.tool()
-async def import_from_share(
-    share_path: str, ctx: Context, session_id: str | None = None, dest: str | None = None
-) -> dict:
-    """Copy a file from Home Assistant's /share into the session's /sandbox.
-
-    share_path is relative to /share (e.g. "energy.csv"). Omit session_id to
-    start a new session. dest defaults to the file name in /sandbox.
-    """
-    return await with_heartbeat(ctx, svc.import_from_share(share_path, session_id, dest, user_id=caller(ctx)))
-
-
-@mcp.tool()
-async def export_to_share(session_id: str, path: str, ctx: Context) -> dict:
-    """Copy a /sandbox file (e.g. a plot) to /share so the user can open it.
-
-    Returns share_path, under /share/code-interpreter/<session_id>/. Tell the
-    user that path.
-    """
-    return await with_heartbeat(ctx, svc.export_to_share(session_id, path, user_id=caller(ctx)))
 
 
 @mcp.tool()

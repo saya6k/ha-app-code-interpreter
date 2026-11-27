@@ -48,11 +48,11 @@ def procs_of(uid):
 
 async def allowlist_mode(call) -> None:
     """App started with network_allowlist [pypi.org, *.pythonhosted.org]."""
-    r = payload(await call("run_command", timeout_s=180,
-                           command="pip download -q --no-deps -d /tmp/dl requests && ls /tmp/dl"))
-    check("pip download via proxy", r.get("exit_code") == 0 and r.get("stdout", "").startswith("requests-"), r)
+    r = payload(await call("run_code", timeout_s=180,
+                           code="await $`pip download -q --no-deps -d /tmp/dl requests && ls /tmp/dl`.text()"))
+    check("pip download via proxy", (r.get("result") or "").startswith("requests-"), r)
     sid = r.get("session_id")
-    r = payload(await call("run_command", session_id=sid, command=(
+    probe = (
         "python3 - <<'EOF'\n"
         "import urllib.request, urllib.error, socket\n"
         "def get(u):\n"
@@ -62,9 +62,10 @@ async def allowlist_mode(call) -> None:
         "    try: socket.create_connection((h, p), timeout=3).close(); return 'open'\n"
         "    except OSError as e: return type(e).__name__\n"
         "print(repr((get('https://example.com/'), tcp('1.1.1.1', 443))))\n"
-        "EOF")))
-    example, ip = eval(r["stdout"]) if r.get("stdout") else (None, None)
-    check("example.com refused, direct IP blocked", "403" in str(example) and ip != "open", r.get("stdout"))
+        "EOF")
+    r = payload(await call("run_code", session_id=sid, code=f"(await $({json.dumps(probe)}).text()).trim()"))
+    example, ip = eval(r["result"]) if r.get("result") else (None, None)
+    check("example.com refused, direct IP blocked", "403" in str(example) and ip != "open", r.get("result"))
     r = payload(await call("run_code", session_id=sid, code="(await fetch('https://pypi.org/simple/requests/')).status"))
     check("fetch() in the REPL goes through the proxy", r.get("result") == "200", r)
     for _ in range(100):  # entries land when each tunnel closes
@@ -172,20 +173,19 @@ async def main(idle_wait_s: int, mode: str) -> int:
                 return 1 if fails else 0
 
             names = sorted(t.name for t in (await s.list_tools()).tools)
-            check("tools/list", names == ["close_session", "export_to_share", "import_from_share", "list_files",
-                                          "list_sessions", "read_file", "run_code", "run_command", "write_file"], names)
+            check("tools/list", names == ["close_session", "list_sessions", "run_code"], names)
 
             r1 = payload(await call("run_code", code="x = 20"))
             sid = r1.get("session_id")
             r2 = payload(await call("run_code", code="x + 1", session_id=sid))
             check("run_code keeps variables", r2.get("result") == "21" and r2.get("session_id") == sid, r2)
 
-            r = payload(await call("run_command", session_id=sid,
-                                   command="python3 -c \"import pandas as pd; print(pd.DataFrame({'a': [1, 2]}).a.sum())\""))
-            check("analysis stack (python3)", r.get("stdout") == "3\n", r)
+            pandas = "python3 -c \"import pandas as pd; print(pd.DataFrame({'a': [1, 2]}).a.sum())\""
+            r = payload(await call("run_code", session_id=sid, code=f"(await $({json.dumps(pandas)}).text()).trim()"))
+            check("analysis stack (python3 through $)", r.get("result") == "3", r)
 
-            r = payload(await call("run_command", command="echo hi; exit 2", session_id=sid))
-            check("run_command", (r.get("stdout"), r.get("exit_code")) == ("hi\n", 2), r)
+            r = payload(await call("run_code", session_id=sid, code="(await $`echo hi; exit 2`.nothrow()).exitCode"))
+            check("$ hands back a failing exit with nothrow", r.get("result") == "2", r)
 
             r = payload(await call("run_code", code="1", session_id="deadbeefdeadbeef"))
             check("unknown session -> session_not_found", r.get("error") == "session_not_found", r)
@@ -196,8 +196,8 @@ async def main(idle_wait_s: int, mode: str) -> int:
             await asyncio.to_thread(ingress_ui, ui_sid)
 
             # /share round trip (T7): smoke.sh puts energy.csv into /share.
-            r = payload(await call("import_from_share", share_path="energy.csv", session_id=sid))
-            check("import_from_share", r.get("path") == "/sandbox/energy.csv", r)
+            r = payload(await call("run_code", session_id=sid, code="(await share.import('energy.csv')).path"))
+            check("share.import", r.get("result") == "/sandbox/energy.csv", r)
             r = payload(await call("run_code", session_id=sid, code=(
                 "const PY = `import pandas as pd, matplotlib.pyplot as plt\n"
                 "df = pd.read_csv('energy.csv'); df.kwh.plot(); plt.title('전력'); plt.savefig('plot.png')\n"
@@ -206,12 +206,10 @@ async def main(idle_wait_s: int, mode: str) -> int:
                 "console.error(p.stderr); p.stdout.trim()")))
             check("run_code runs python3 on it and reports new_files",
                   r.get("result") == "2.0" and r.get("new_files") == ["/sandbox/plot.png"], r)
-            check("Korean title renders (no missing-glyph warning)", "Glyph" not in r.get("stderr", "x"), r.get("stderr"))
-            r = payload(await call("read_file", session_id=sid, path="/sandbox/plot.png"))
-            check("read_file on binary -> mime only", r.get("binary") is True and r.get("mime") == "image/png", r)
-            r = payload(await call("export_to_share", session_id=sid, path="/sandbox/plot.png"))
-            out = r.get("share_path", "")
-            check("export_to_share", out == f"/share/code-interpreter/{sid}/plot.png" and os.path.getsize(out) > 0, r)
+            check("Korean title renders (no missing-glyph warning)", "Glyph" not in r.get("logs", "x"), r.get("logs"))
+            r = payload(await call("run_code", session_id=sid, code="(await share.export('plot.png')).share_path"))
+            out = r.get("result") or ""
+            check("share.export", out == f"/share/code-interpreter/{sid}/plot.png" and os.path.getsize(out) > 0, r)
             r = payload(await call("run_code", session_id=sid, code=(
                 "const listed = await share.list();\n"
                 "const got = await share.import('energy.csv', 'via-cell.csv');\n"
@@ -224,17 +222,13 @@ async def main(idle_wait_s: int, mode: str) -> int:
             r = payload(await call("run_code", session_id=sid, code=(
                 "[await ha.tools().catch((e) => e.name), typeof ha.admin]")))
             check("ha.* without Home Assistant: HaUnavailable, no ha.admin", r.get("result") == '["HaUnavailable","undefined"]', r)
-            r = payload(await call("import_from_share", share_path="../etc/passwd", session_id=sid))
-            check("import outside /share refused", r.get("error") == "share_error", r)
-            r = payload(await call("read_file", session_id=sid, path="/etc/passwd"))
-            check("read outside /sandbox refused", r.get("error") == "file_error", r)
 
             # Audit (T9): events recorded, execution output never stored.
             r = payload(await call("run_code", session_id=sid, code="console.log('OUT' + 'PUT-MARKER-7')"))
-            check("marker printed", r.get("stdout") == "OUTPUT-MARKER-7\n", r)
+            check("marker printed", r.get("logs") == "OUTPUT-MARKER-7\n", r)
             ev = audit_events()
             names = {e["event"] for e in ev}
-            want = {"session.create", "code.exec", "command.exec", "file.import", "file.export", "policy.violation"}
+            want = {"session.create", "code.exec", "share.list", "file.import", "file.export", "policy.violation"}
             check("audit log has the expected events", want <= names, sorted(names))
             raw = "".join(open(os.path.join("/data/audit", n)).read() for n in os.listdir("/data/audit"))
             check("audit log holds no execution output", "OUTPUT-MARKER-7" not in raw and "np.float64" not in raw)

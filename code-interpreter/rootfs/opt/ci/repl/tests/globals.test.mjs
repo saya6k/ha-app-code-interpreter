@@ -39,6 +39,12 @@ test("plain string form with a timeout kills the command", async () => {
   await assert.rejects($("sleep 5", 200), ShellError);
 });
 
+test("a detached grandchild holding the pipes does not hold the command", async () => {
+  const t0 = Date.now();
+  const out = await $`(sleep 30 &) ; echo done`;
+  assert.ok(out.stdout.startsWith("done") && Date.now() - t0 < 5000);
+});
+
 test("commands run in the sandbox directory", async () => {
   assert.equal(fs.realpathSync((await $`pwd`.text()).trim()), fs.realpathSync(dir));
 });

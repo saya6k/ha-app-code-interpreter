@@ -15,7 +15,6 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 import util from "node:util";
 import vm from "node:vm";
@@ -23,10 +22,8 @@ import { fileURLToPath } from "node:url";
 import { install, installHa, installShare, killRunning } from "./globals.mjs";
 import { transform } from "./transform.mjs";
 
-const OUT_LIMIT = 16000;
-const RESULT_LIMIT = 4000;
-const READER_GRACE_MS = 2000; // total, for both output readers after a command ends
-const SANDBOX_DIR = process.env.CI_SANDBOX_DIR || "/sandbox";
+const LOGS_LIMIT = 16000;
+const RESULT_LIMIT = 16000;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const realExit = process.exit.bind(process);
 
@@ -106,8 +103,10 @@ async function awaitMembers(value) {
 
 async function execute(code, cell, ctx = {}) {
   installHa(globalThis, (...a) => rpc(...a), Boolean(ctx.admin));
-  const out = new Capped(OUT_LIMIT);
-  const err = new Capped(OUT_LIMIT);
+  // One log in the order things were written; stderr lines are marked.
+  const logs = new Capped(LOGS_LIMIT);
+  const out = logs;
+  const err = { write: (s) => logs.write(s.replace(/^(?=.)/gm, "[stderr] ")) };
   for (const e of late.splice(0)) err.write(`[earlier cell] ${formatError(e)}\n`);
   const saved = [process.stdout.write, process.stderr.write];
   const sink = (cap) => (chunk, enc, cb) => {
@@ -128,6 +127,7 @@ async function execute(code, cell, ctx = {}) {
   stopped.catch(() => {});
   let result = null;
   let error = null;
+  let message = null;
   let truncated = false;
   try {
     const script = new vm.Script(transform(code), {
@@ -144,72 +144,12 @@ async function execute(code, cell, ctx = {}) {
     }
   } catch (e) {
     error = errorName(e);
-    if (error !== "Interrupted") err.write(formatError(e) + "\n");
+    if (error !== "Interrupted") message = formatError(e);
   } finally {
     current = null;
     [process.stdout.write, process.stderr.write] = saved;
   }
-  return { stdout: out.text, stderr: err.text, result, error, truncated: truncated || out.truncated || err.truncated };
-}
-
-function runCommand(command, timeoutS) {
-  return new Promise((resolve) => {
-    const out = new Capped(OUT_LIMIT);
-    const err = new Capped(OUT_LIMIT);
-    let child;
-    try {
-      child = spawn("/bin/sh", ["-c", command], {
-        cwd: fs.existsSync(SANDBOX_DIR) ? SANDBOX_DIR : undefined,
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: true, // own process group: a timeout kills the whole pipeline
-      });
-    } catch (e) {
-      resolve({ stdout: "", stderr: `${e.name}: ${e.message}`, exit_code: null, error: e.name, truncated: false });
-      return;
-    }
-    let error = null;
-    const killGroup = () => {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {
-        // already gone
-      }
-    };
-    child.stdout.setEncoding("utf8").on("data", (s) => out.write(s));
-    child.stderr.setEncoding("utf8").on("data", (s) => err.write(s));
-    const timer = setTimeout(() => {
-      error = "TimeoutError";
-      killGroup();
-    }, timeoutS * 1000);
-    current = {
-      interrupt: () => {
-        error = "Interrupted";
-        killGroup();
-      },
-    };
-    child.on("error", (e) => {
-      // e.g. EAGAIN under RLIMIT_NPROC: report it, keep the REPL
-      clearTimeout(timer);
-      current = null;
-      resolve({ stdout: "", stderr: `${e.name}: ${e.message}`, exit_code: null, error: e.code || e.name, truncated: false });
-    });
-    child.on("exit", (code, signal) => {
-      clearTimeout(timer);
-      current = null;
-      const done = () => {
-        const rc = signal ? 128 + os.constants.signals[signal] : code;
-        resolve({ stdout: out.text, stderr: err.text, exit_code: error ? null : rc, error, truncated: out.truncated || err.truncated });
-      };
-      // A detached grandchild may hold the pipes open: wait for them a little.
-      let open = 2;
-      const grace = setTimeout(done, READER_GRACE_MS);
-      for (const s of [child.stdout, child.stderr]) {
-        if (s.readableEnded) open--;
-        else s.on("end", () => --open === 0 && (clearTimeout(grace), done()));
-      }
-      if (open === 0) (clearTimeout(grace), done());
-    });
-  });
+  return { logs: logs.text, result, error, message, truncated: truncated || logs.truncated };
 }
 
 function channel(env) {
@@ -285,7 +225,6 @@ function startControlHelper() {
 
 async function serve(req, cell) {
   if (req.op === "ping") return { pid: process.pid };
-  if (req.op === "command") return runCommand(String(req.command ?? ""), Number(req.timeout_s ?? 60));
   activeRequest = req.id ?? null;
   try {
     return await execute(String(req.code ?? ""), cell, req.ctx ?? {});

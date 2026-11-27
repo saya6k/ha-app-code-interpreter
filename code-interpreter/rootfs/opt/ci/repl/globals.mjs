@@ -8,6 +8,7 @@ import fsp from "node:fs/promises";
 import path from "node:path";
 import util from "node:util";
 
+const PIPE_GRACE_MS = 2000; // after exit: a detached grandchild may keep the pipes open
 const STREAM_LIMIT = 16 << 20; // per stream: enough to parse a big file in the cell, bounded by RLIMIT_AS anyway
 const running = new Set(); // child processes of $, killed when a cell is interrupted
 
@@ -80,7 +81,10 @@ function run(command, timeoutMs) {
     let timedOut = false;
     const timer = timeoutMs ? setTimeout(() => ((timedOut = true), killGroup(child)), timeoutMs) : null;
     child.on("error", (e) => (running.delete(child), clearTimeout(timer), rejectRun(e)));
-    child.on("close", (code, signal) => {
+    let settled = false;
+    const finish = (code, signal) => {
+      if (settled) return;
+      settled = true;
       running.delete(child);
       clearTimeout(timer);
       const o = out();
@@ -89,7 +93,9 @@ function run(command, timeoutMs) {
         command, stdout: o.text, stderr: e.text, exitCode: code, signal: signal ?? null,
         timedOut, truncated: o.truncated || e.truncated,
       }));
-    });
+    };
+    child.on("close", finish);
+    child.on("exit", (code, signal) => setTimeout(() => finish(code, signal), PIPE_GRACE_MS).unref());
   });
 }
 

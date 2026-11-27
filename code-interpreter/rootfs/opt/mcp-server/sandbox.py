@@ -1,8 +1,8 @@
 """One session's bubblewrap sandbox: REPL lifecycle, commands, teardown (SPEC §3.2-3.4).
 
 One bwrap per session. Inside it, launch.py (the agent) supervises the REPL;
-commands run through the REPL, so code, commands, /sandbox, /tmp and HOME
-all live in the same namespaces. /sandbox and /tmp are size-capped tmpfs:
+shell commands ($ in a cell) start from the REPL, so code, commands,
+/sandbox, /tmp and HOME all live in the same namespaces. /sandbox and /tmp are size-capped tmpfs:
 nothing a session writes lands on the HA data disk. Restarting a stuck or
 dead REPL happens inside the sandbox and keeps the files.
 
@@ -381,7 +381,7 @@ class Sandbox:
             await asyncio.sleep(0.1)  # let the drain catch up
             tail = self._stderr_tail.decode(errors="replace").strip()
             if tail:
-                r["stderr"] = (r["stderr"] + "\n" if r["stderr"] else "") + "[sandbox] " + tail[-KERNEL_DIED_TAIL:]
+                r["logs"] = (r["logs"] + "\n" if r["logs"] else "") + "[sandbox] " + tail[-KERNEL_DIED_TAIL:]
         if restarted and not self._closed:
             await self._restart_repl()
         r["kernel_restarted"] = restarted
@@ -394,9 +394,6 @@ class Sandbox:
             # Node has no safe way to empty globalThis: a fresh REPL does it.
             await self._restart_repl()
         return await self._with_restart(lambda c: c.run(code, timeout_s, rpc, ctx))
-
-    async def run_command(self, command: str, timeout_s: float) -> dict:
-        return await self._with_restart(lambda c: c.command(command, timeout_s))
 
     async def destroy(self) -> None:
         self._closed = True
