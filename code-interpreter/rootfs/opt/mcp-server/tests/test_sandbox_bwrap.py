@@ -518,11 +518,20 @@ def test_restart_keeps_files_and_ends_stray_processes(h, sbx):
 def test_sandbox_killed_from_inside_is_reported_and_files_are_gone(h, sbx):
     """kill(-1) from user code takes the agent down, so bwrap and the whole
     sandbox end. The app must say so instead of pretending a restart worked."""
-    code(h, sbx, "process.kill(-1, 'SIGKILL')")  # its reply may still get out
-    h.do(asyncio.sleep(0.5))  # bwrap tears the sandbox down once the agent is gone
+    # The kill also ends the REPL, so the app restarts it: depending on how fast
+    # bwrap goes, that restart already finds the sandbox gone (the first call
+    # raises) or the next call does. Either way it must say the files are lost.
+    errors = []
+    for src in ("process.kill(-1, 'SIGKILL')", "1"):
+        try:
+            code(h, sbx, src)
+        except SandboxError as e:
+            errors.append(str(e))
+            break
+        h.do(asyncio.sleep(0.5))  # bwrap tears the sandbox down once the agent is gone
+    assert errors and "files are lost" in errors[0], errors
+    h.do(asyncio.sleep(0.5))
     assert procs_of(UID) == []
-    with pytest.raises(SandboxError, match="files are lost"):
-        code(h, sbx, "1")
 
 
 # ---- file ops through the agent (T7) ---------------------------------------
