@@ -270,6 +270,13 @@ def test_restart_survives_a_cancelled_caller(h, sbx):
 KILL_REPL = "process.kill(process.pid, 'SIGKILL')"
 
 
+def test_globals_shell_file_and_python(h, sbx):
+    r = code(h, sbx, "await write('n.txt', '21'); "
+                     "(await $`python3 -c ${'print(int(open(\"n.txt\").read()) * 2)'}`.text()).trim()")
+    assert r["result"] == "42", r
+    assert code(h, sbx, "await file('/sandbox/n.txt').text()")["result"] == "21"
+
+
 def test_crash_restarts_kernel(h, sbx):
     r = code(h, sbx, KILL_REPL)
     assert r["error"] == "KernelDied" and r["kernel_restarted"] is True
