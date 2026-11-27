@@ -4,6 +4,7 @@ import json
 
 from pathlib import Path
 
+import hab
 import hamcp
 import replclient
 import service
@@ -531,3 +532,42 @@ def test_run_code_while_the_users_ha_call_is_in_flight_is_refused(tmp_path):
     assert asyncio.run(svc.run_code("1 + 1", user_id="alice"))["error"] == "nested_call"
     assert asyncio.run(svc.run_code("1 + 1", user_id="bob"))["result"] == "2"
     assert any(e["detail"].get("kind") == "nested" for e in events(tmp_path) if e["event"] == "policy.violation")
+
+
+class FakeHab:
+    def __init__(self):
+        self.calls = []
+
+    async def check(self, argv):
+        if argv[:2] == ["automation", "update"]:
+            raise hab.HabRefused("'hab automation update' changes Home Assistant (write); add a hab_allow rule")
+        return " ".join(argv[:2]), "read"
+
+    async def call(self, argv, stdin, timeout_s):
+        self.calls.append((argv, stdin))
+        return {"success": True, "data": {"id": argv[-1]}, "exit_code": 0}
+
+
+def test_hab_is_for_admins_checked_and_audited(tmp_path):
+    svc, _ = make_ha(tmp_path)
+    svc.hab = FakeHab()
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
+    r = asyncio.run(svc.run_code('call ha.hab {"argv": ["automation", "get", "night"], "stdin": "x"}', session_id=sid, user_id="alice"))
+    assert json.loads(r["result"])["data"] == {"id": "night"} and svc.hab.calls == [(["automation", "get", "night"], "x")]
+    r = asyncio.run(svc.run_code('call ha.hab {"argv": ["automation", "update", "night"]}', session_id=sid, user_id="alice"))
+    assert r["error"].startswith("NotAllowed: ") and "hab_allow" in r["error"]
+    other = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    r = asyncio.run(svc.run_code('call ha.hab {"argv": ["automation", "get", "night"]}', session_id=other, user_id="bob"))
+    assert r["error"].startswith("AdminOnly: ")
+    ev = events(tmp_path)
+    habs = [e for e in ev if e["event"] == "ha.hab"]
+    assert len(habs) == 1 and habs[0]["detail"]["command"] == "automation get" and habs[0]["detail"]["stdin_chars"] == 1
+    kinds = [e["detail"]["kind"] for e in ev if e["event"] == "policy.violation"]
+    assert "hab" in kinds and "admin" in kinds
+
+
+def test_hab_rules_come_from_the_options(tmp_path):
+    opts = tmp_path / "o.json"
+    opts.write_text(json.dumps({"hab_allow": ["automation *", " ", None], "hab_deny": ["automation delete *"]}))
+    o = service.load_options(opts)
+    assert o.hab_rules == hab.Rules(allow=("automation *",), deny=("automation delete *",))

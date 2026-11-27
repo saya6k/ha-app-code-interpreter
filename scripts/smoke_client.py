@@ -172,6 +172,14 @@ async def main(idle_wait_s: int, mode: str) -> int:
                 await {"allowlist": allowlist_mode, "open2": open_two, "after_kill": after_kill}[mode](call)
                 return 1 if fails else 0
 
+            import subprocess  # noqa: PLC0415
+
+            p = subprocess.run(["/usr/local/bin/hab", "--json", "--skip-update-check", "--config", "/tmp/hab-smoke",
+                                "schema", "--index", "--search", "automation update", "--limit", "5"],
+                               capture_output=True, text=True, timeout=30)
+            found = {c["path"]: c["side_effect"] for c in json.loads(p.stdout or "{}").get("data", {}).get("commands", [])}
+            check("hab binary runs and lists its commands", found.get("hab automation update") == "write", found or p.stdout[-200:])
+
             names = sorted(t.name for t in (await s.list_tools()).tools)
             check("tools/list", names == ["close_session", "list_sessions", "run_code"], names)
 

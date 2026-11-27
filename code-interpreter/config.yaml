@@ -39,6 +39,8 @@ options:
   max_file_mb: 20
   export_dir: /share/code-interpreter
   audit_retention_days: 30
+  hab_allow: []
+  hab_deny: []
 schema:
   idle_timeout_minutes: int(1,1440)
   max_sessions: int(1,10)
@@ -48,3 +50,7 @@ schema:
   max_file_mb: int(1,500)
   export_dir: str
   audit_retention_days: int(1,365)
+  hab_allow:
+    - str?
+  hab_deny:
+    - str?

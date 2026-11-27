@@ -299,6 +299,14 @@ def test_ha_admin_exists_only_in_an_admins_cell(repl):
     assert repl.do(repl.client.run("typeof ha.admin", timeout_s=10, rpc=calls))["result"] == "undefined"
 
 
+def test_ha_admin_hab_sends_argv_and_stdin(repl):
+    calls = FakeCalls()
+    r = repl.do(repl.client.run("(await ha.admin.hab(['automation', 'get', 'x'], {stdin: 'y'})).args", timeout_s=10,
+                                rpc=calls, ctx={"admin": True}))
+    assert r["result"] == '{"argv":["automation","get","x"],"stdin":"y"}' and calls.seen[-1][0] == "ha.hab"
+    assert repl.do(repl.client.run("typeof ha.hab", timeout_s=10, rpc=calls))["result"] == "object"
+
+
 def test_ha_namespaces_are_not_thenables(repl):
     assert repl("const d = await ha.intent; typeof d.HassTurnOn")["result"] == "function"
 
