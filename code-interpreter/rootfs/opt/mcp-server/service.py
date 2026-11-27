@@ -21,6 +21,7 @@ import sharefs
 from hab import Hab, HabRefused, Rules
 from hamcp import ADMIN, APIS, ASSIST, HaToolError, HaUnavailable, HomeAssistant
 from audit import Audit, code_detail, sha256
+from plugins import ACCESS, Plugin, Plugins
 from policy import SandboxPolicy
 from replclient import RpcError
 from skills import SkillError, SkillReviewer, SkillStore
@@ -60,6 +61,7 @@ class Options:
     hab_rules: Rules = field(default_factory=Rules)
     skill_workflow: bool = False
     skill_ai_task_entity: str | None = None  # None: Home Assistant's preferred AI Task entity
+    plugins: tuple[Plugin, ...] = ()
 
 
 def load_options(path: Path = OPTIONS_PATH) -> Options:
@@ -78,6 +80,14 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
             log.error("[mcp-server] %s — ignored", e)
             continue
         allow.append(entry.strip())
+    plugins = []
+    for entry in raw.get("plugins") or []:
+        name = str((entry or {}).get("name") or "").strip()
+        access = str((entry or {}).get("access") or "").strip()
+        if not name or access not in ACCESS:  # dropping only narrows access: fail-closed
+            log.error("[mcp-server] plugin %r: needs a name and access all or admin — ignored", entry)
+            continue
+        plugins.append(Plugin(name, access))
     export_dir = Path(raw.get("export_dir") or DEFAULT_EXPORT_DIR)
     if not export_dir.is_absolute() or ".." in export_dir.parts or not (
         export_dir == sharefs.SHARE or sharefs.SHARE in export_dir.parents
@@ -93,6 +103,7 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
         audit_retention_days=int(raw.get("audit_retention_days", 30)),
         skill_workflow=bool(raw.get("skill_workflow", False)),
         skill_ai_task_entity=(raw.get("skill_ai_task_entity") or "").strip() or None,
+        plugins=tuple(plugins),
         hab_rules=Rules(
             allow=tuple(r.strip() for r in raw.get("hab_allow") or [] if r and r.strip()),
             deny=tuple(r.strip() for r in raw.get("hab_deny") or [] if r and r.strip()),
@@ -171,6 +182,8 @@ class _CellCalls:
             return await self._hab(args)
         if op in ("skills.list", "skills.get"):
             return self._skills(op, args)
+        if op in ("plugins.list", "plugins.call"):
+            return await self._plugin(op, args)
         self.rejected(f"unknown call {op!r}")
         raise RpcError("RpcRejected", f"unknown call {op!r}")
 
@@ -234,6 +247,44 @@ class _CellCalls:
         svc.audit.record("ha.hab", s.sid, "ok" if ok else "error", **detail, ms=_ms(t0),
                          exit_code=out.get("exit_code"), output_chars=len(json.dumps(out, default=str)))
         return out
+
+    async def _plugin(self, op: str, args: dict):
+        """A tool of a plugin this caller may use (rights asked again on every
+        call, as for ha.admin)."""
+        svc, s = self.service, self.sandbox
+        if not self.user_id:
+            raise self._deny("plugin", "NoUser", "plugins are for Home Assistant users; this call has none")
+        try:
+            tools = await svc.plugins.tools(await svc.ha.is_admin(self.user_id))
+        except HaUnavailable as e:
+            raise RpcError("HaUnavailable", str(e)) from None
+        if op == "plugins.list":
+            return [{k: t[k] for k in ("name", "description", "input_schema", "read_only", "destructive", "plugin")}
+                    for t in tools]
+        name = str(args.get("name", ""))
+        tool_args = args.get("args") or {}
+        if not isinstance(tool_args, dict):
+            raise RpcError("TypeError", "tool arguments must be an object")
+        tool = next((t for t in tools if t["name"] == name), None)
+        if tool is None:
+            raise RpcError("UnknownTool", f"no plugin tool {name!r} for you (see await plugins.tools())")
+        self.ha_calls += 1
+        if self.ha_calls > HA_CALLS_PER_CELL:
+            raise self._deny("rate", "RateLimited", f"more than {HA_CALLS_PER_CELL} Home Assistant calls in one run")
+        raw = json.dumps(tool_args, sort_keys=True)
+        detail = dict(plugin=tool["plugin"], tool=name, args=raw[:ARGS_AUDIT_CAP], args_sha256=sha256(raw.encode()),
+                      read_only=tool["read_only"], user_id=self.user_id)
+        t0 = time.monotonic()
+        svc._ha_inflight[self.user_id] = svc._ha_inflight.get(self.user_id, 0) + 1
+        try:
+            value = await self.pool.call(tool["api"], name, tool_args, max(1.0, self.deadline - time.monotonic()))
+        except (HaToolError, HaUnavailable) as e:
+            svc.audit.record("plugin.call", s.sid, "error", **detail, ms=_ms(t0), error=type(e).__name__, message=str(e))
+            raise RpcError(type(e).__name__, str(e)) from None
+        finally:
+            svc._ha_inflight[self.user_id] -= 1
+        svc.audit.record("plugin.call", s.sid, **detail, ms=_ms(t0), result_chars=len(json.dumps(value, default=str)))
+        return value
 
     async def _allowed_tools(self, api: str) -> list[dict]:
         """What this caller may see of `api`, asked again on every call: admin
@@ -308,8 +359,9 @@ class Service:
         self._create = create_sandbox
         self.audit = audit or Audit(retention_days=options.audit_retention_days)
         self.skills = SkillStore()
+        self.plugins = Plugins(self.ha, options.plugins)
         self.reviewer = SkillReviewer(self.skills, self.ha, self.audit, enabled=options.skill_workflow,
-                                      entity_id=options.skill_ai_task_entity)
+                                      entity_id=options.skill_ai_task_entity, plugins=self.plugins)
         self.manager = SessionManager(
             self._factory,
             idle_timeout_s=options.idle_timeout_minutes * 60,
@@ -401,8 +453,9 @@ class Service:
             limit = _clamp(timeout_s)
             calls = _CellCalls(self, s, user_id, deadline=time.monotonic() + limit)
             admin = await self.ha.is_admin(user_id)  # ha.admin exists in the cell only for admins
+            plugins = await self._has_plugins(user_id, admin)
             try:
-                r = await s.run_code(code, limit, reset, rpc=calls, ctx={"admin": admin})
+                r = await s.run_code(code, limit, reset, rpc=calls, ctx={"admin": admin, "plugins": plugins})
             finally:
                 await calls.pool.close()
             after = await snapshot(s)
@@ -427,6 +480,15 @@ class Service:
             if out.get("error") != "session_not_found":  # closed in between: start a new one below
                 return {**out, "resumed": True}
         return await self._call(session_id, run, "code.exec", owner=user_id, **code_detail(code))
+
+    async def _has_plugins(self, user_id: str | None, admin: bool) -> bool:
+        """Whether `plugins` exists in this caller's cells."""
+        if not (user_id and self.options.plugins):
+            return False
+        try:
+            return any(p.access == "all" or admin for p, _ in await self.plugins.resolve())
+        except HaUnavailable:
+            return False
 
     async def _import(self, s, share_path: str, dest: str | None) -> dict:
         # Off the event loop: up to max_file_mb of disk I/O would stall every call.

@@ -19,7 +19,7 @@ import path from "node:path";
 import util from "node:util";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { install, installHa, installShare, installSkills, killRunning } from "./globals.mjs";
+import { install, installHa, installPlugins, installShare, installSkills, killRunning } from "./globals.mjs";
 import { transform } from "./transform.mjs";
 
 const LOGS_LIMIT = 16000;
@@ -104,6 +104,7 @@ async function awaitMembers(value) {
 
 async function execute(code, cell, ctx = {}) {
   installHa(globalThis, (...a) => rpc(...a), Boolean(ctx.admin));
+  installPlugins(globalThis, (...a) => rpc(...a), Boolean(ctx.plugins));
   // One log in the order things were written; stderr lines are marked.
   const logs = new Capped(LOGS_LIMIT);
   const out = logs;

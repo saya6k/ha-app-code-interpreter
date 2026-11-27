@@ -155,7 +155,8 @@ async function loadSkills() {
     // The manifest only describes the code; the skill runs with the speaker's rights.
     const check = k.check[k.pending ? "pending" : "active"] || { undeclared: [], dynamic: [] };
     const uses = v.uses || {};
-    const declared = [...(uses.ha || []), ...(uses.hab || []).map((c) => "hab " + c)];
+    const declared = [...(uses.ha || []), ...(uses.hab || []).map((c) => "hab " + c),
+                      ...(uses.plugins || []).map((t) => "plugin " + t)];
     td.append(det, el("div", "uses: " + (declared.join(", ") || "nothing declared"), "muted mono"));
     if (check.undeclared.length) td.append(el("div", "⚠ calls not in uses: " + check.undeclared.join(", "), "badge warn"));
     if (check.dynamic.length) td.append(el("div", "⚠ calls through a variable (not checked): " + check.dynamic.join(", "), "badge warn"));

@@ -87,6 +87,7 @@ session. When a session has expired, a call with its `session_id` returns
 | `` $`cmd ${x}` `` | Run `sh -c` in `/sandbox`; values are quoted. `.text()`, `.lines()`, `.json()`, `.nothrow()`, `.timeout(ms)`; a failing command throws `ShellError` |
 | `file(p)`, `write(p, s)` | Read (`.text()`, `.json()`, `.lines()`, `.exists()`) and write files; relative paths are under `/sandbox` |
 | `share.list(dir)`, `share.import(path, dest)`, `share.export(path)` | Home Assistant's `/share` (see [Files and /share](#files-and-share)) |
+| `plugins.<server>.<tool>(args)` | MCP servers Home Assistant connects to, if the app allows this person any (see [Plugins](#plugins)); `plugins.tools()` lists them, `plugins.call(name, args)` takes a full name. Undefined otherwise |
 | `skills.list()`, `skills.<name>(args)` | The speaker's saved skills (see [Skills](#skills)); only approved ones run |
 | `sleep(ms)`, `log(...)`, `require(name)` | Waiting, logging, Node's built-in modules |
 
@@ -229,8 +230,8 @@ are ignored while `skill_workflow` is off.
 
 ### What a skill uses
 
-Each proposal lists what it calls (`uses`): Home Assistant tools, and hab
-commands for administrators. The panel shows the list, and warns about calls
+Each proposal lists what it calls (`uses`): Home Assistant tools, plugin
+tools, and hab commands for administrators. The panel shows the list, and warns about calls
 in the code that the list leaves out, or that go through a variable and
 cannot be read. The list helps you review; it is **not** a permission. An
 approved skill always runs with the rights of the person whose script runs
@@ -242,6 +243,38 @@ conversations, and requests that anyone could have written, so it can be
 misled like any model; that is why nothing runs before an administrator
 approves it. Requests, proposals, reviews, approvals and uses are in the
 audit log (`skill.*`).
+
+## Plugins
+
+Home Assistant's **Model Context Protocol** integration connects to other MCP
+servers (a memory store, a web service, …), and Home Assistant's MCP Server
+offers each one's tools to the app. List the ones scripts may use in
+`plugins`:
+
+```yaml
+plugins:
+  - name: Memory          # the integration entry's title in Settings → Devices & services
+    access: all           # all = every Home Assistant user, admin = administrators only
+```
+
+Scripts then call `plugins.memory.search({query: "…"})` (the tool
+`memory__search`); for a server name that is not a JavaScript name, write
+`plugins["multi-service-mcp"].find_places(args)`. `plugins.tools()`
+lists the tools the speaker may use; with none, `plugins` is undefined.
+
+- The app calls the servers through Home Assistant, so their credentials
+  stay in Home Assistant and the sandbox needs no network.
+- Calls with no user (a voice satellite, a client outside Home Assistant)
+  never get plugins. `access: admin` plugins are checked on every call.
+- A plugin's tools run with no Home Assistant user behind them: the server
+  sees the same caller for everyone. Only list servers whose tools every
+  allowed person may use, including tools that write (`memory__save`).
+- Plugin answers go back to the model; a server that returns text written
+  by others can carry instructions. Every call is in the audit log
+  (`plugin.call`) and counts toward the 50 calls per run.
+- An entry that is not loaded, whose title matches several entries, or that
+  is this app itself is left out with a warning in the log. The log's
+  `[plugins]` line at startup shows which are available.
 
 ## Files and /share
 
@@ -310,6 +343,7 @@ hosts.
 | `hab_deny` | empty | `hab` commands refused even if `hab_allow` matches |
 | `skill_workflow` | `false` | Propose skills from finished sessions through an AI Task (see [Skills](#skills)) |
 | `skill_ai_task_entity` | empty | AI Task entity for the review; empty = Home Assistant's preferred one |
+| `plugins` | empty | MCP servers scripts may call, each with `access: all` or `admin` (see [Plugins](#plugins)) |
 
 ## Security model
 

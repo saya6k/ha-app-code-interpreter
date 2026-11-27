@@ -457,7 +457,15 @@ class FakeHA:
     async def is_admin(self, user_id):
         return user_id in self.admins
 
+    async def mcp_servers(self):
+        return [{"entry_id": "M1", "title": "Memory", "state": "loaded"},
+                {"entry_id": "S1", "title": "Secrets", "state": "loaded"}]
+
     async def tools(self, api):
+        if api == "mcp-M1":
+            return [{"name": "memory__search", "read_only": True, "destructive": False, "description": "find", "input_schema": {}}]
+        if api == "mcp-S1":
+            return [{"name": "secrets__read", "read_only": True, "destructive": False, "description": "", "input_schema": {}}]
         if api == "assist":
             return [{"name": "intent__HassTurnOff", "read_only": False, "destructive": True, "description": "", "input_schema": {}}]
         return [{"name": "trace__get_trace", "read_only": True, "destructive": False, "description": "", "input_schema": {}},
@@ -489,7 +497,7 @@ def ha_call(svc, sid, user, **args):
 def test_ha_call_assist_and_audit(tmp_path):
     svc, created = make_ha(tmp_path)
     sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
-    assert created[0].last_ctx == {"admin": False}
+    assert created[0].last_ctx == {"admin": False, "plugins": False}
     r = ha_call(svc, sid, "bob", api="assist", name="intent__HassTurnOff", args={"name": "Kitchen"})
     assert json.loads(r["result"]) == {"ok": True}
     r = ha_call(svc, sid, "bob", api="assist", name="intent__HassTurnOff", args={"name": "boom"})
@@ -505,7 +513,7 @@ def test_ha_call_assist_and_audit(tmp_path):
 def test_ha_admin_is_for_admins_and_read_only_tools(tmp_path):
     svc, created = make_ha(tmp_path)
     sid = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
-    assert created[0].last_ctx == {"admin": True}
+    assert created[0].last_ctx == {"admin": True, "plugins": False}
     listed = json.loads(asyncio.run(svc.run_code('call ha.list {"api": "homeassistant"}', session_id=sid, user_id="alice"))["result"])
     assert [t["name"] for t in listed] == ["trace__get_trace"]
     assert json.loads(ha_call(svc, sid, "alice", api="homeassistant", name="trace__get_trace")["result"]) == {"ok": True}
@@ -791,3 +799,53 @@ def test_skill_requests_are_refused_when_off_unknown_or_malformed(tmp_path):
     assert off["outcome"] == "denied" and off["detail"]["reason"] == "skill_workflow is off"
     ev = [(e["event"], e["outcome"]) for e in events(tmp_path / "b") if e["event"] in ("skill.requested", "stdin")]
     assert ev == [("skill.requested", "error"), ("skill.requested", "error"), ("stdin", "error"), ("stdin", "error")]
+
+
+def plugin_service(tmp_path):
+    svc, created = make(tmp_path, {"plugins": [{"name": "memory", "access": "all"}, {"name": "Secrets", "access": "admin"},
+                                               {"name": "bad", "access": "everyone"}, {"access": "all"}]})
+    svc.ha = FakeHA()
+    svc.plugins.ha = svc.ha
+    return svc, created
+
+
+def test_plugin_options_drop_invalid_entries(tmp_path):
+    svc, _ = plugin_service(tmp_path)
+    assert [(p.name, p.access) for p in svc.options.plugins] == [("memory", "all"), ("Secrets", "admin")]
+
+
+def test_plugins_by_access_and_audited(tmp_path):
+    svc, created = plugin_service(tmp_path)
+    bob = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert created[0].last_ctx == {"admin": False, "plugins": True}
+    listed = json.loads(asyncio.run(svc.run_code("call plugins.list {}", session_id=bob, user_id="bob"))["result"])
+    assert [(t["name"], t["plugin"]) for t in listed] == [("memory__search", "memory")]
+    r = asyncio.run(svc.run_code('call plugins.call {"name": "memory__search", "args": {"q": "x"}}', session_id=bob, user_id="bob"))
+    assert json.loads(r["result"]) == {"ok": True} and svc.ha.calls[-1] == ("mcp-M1", "memory__search", {"q": "x"})
+    # an admin-only plugin's tool sent straight over RPC by someone else
+    r = asyncio.run(svc.run_code('call plugins.call {"name": "secrets__read"}', session_id=bob, user_id="bob"))
+    assert r["error"].startswith("UnknownTool: ")
+    alice = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
+    r = asyncio.run(svc.run_code('call plugins.call {"name": "secrets__read"}', session_id=alice, user_id="alice"))
+    assert json.loads(r["result"]) == {"ok": True} and svc.ha.calls[-1][0] == "mcp-S1"
+    ev = [e for e in events(tmp_path) if e["event"] == "plugin.call"]
+    assert [(e["detail"]["plugin"], e["detail"]["tool"], e["detail"]["user_id"]) for e in ev] == [
+        ("memory", "memory__search", "bob"), ("Secrets", "secrets__read", "alice")]
+
+
+def test_no_plugins_without_a_user(tmp_path):
+    svc, created = plugin_service(tmp_path)
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    assert created[0].last_ctx == {"admin": False, "plugins": False}
+    r = asyncio.run(svc.run_code('call plugins.call {"name": "memory__search"}', session_id=sid))
+    assert r["error"].startswith("NoUser: ")
+
+
+def test_a_request_offers_the_users_plugin_tools(tmp_path):
+    svc, _ = plugin_service(tmp_path)
+    svc.ha = FakeAITask({"save": False, "reason": "no"})
+    svc.plugins.ha = svc.ha
+    svc.reviewer = SkillReviewer(svc.skills, svc.ha, svc.audit, enabled=True, entity_id=None, plugins=svc.plugins)
+    request(svc, json.dumps({"type": "skill.request", "user": "bob", "request": "remember"}))
+    ((instructions, _),) = svc.ha.asked
+    assert "plugin.memory__search" in instructions and "secrets__read" not in instructions

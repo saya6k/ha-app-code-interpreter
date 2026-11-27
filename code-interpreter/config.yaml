@@ -45,6 +45,7 @@ options:
   hab_deny: []
   skill_workflow: false
   skill_ai_task_entity: ""
+  plugins: []
 schema:
   idle_timeout_minutes: int(1,1440)
   max_sessions: int(1,10)
@@ -60,3 +61,6 @@ schema:
     - str?
   skill_workflow: bool
   skill_ai_task_entity: str?
+  plugins:
+    - name: str
+      access: list(all|admin)

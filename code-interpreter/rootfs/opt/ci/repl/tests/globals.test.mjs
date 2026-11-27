@@ -8,7 +8,7 @@ import test from "node:test";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sbx-"));
 process.env.CI_SANDBOX_DIR = dir;
 const g = {};
-const { install, quote, ShellError } = await import("../globals.mjs");
+const { install, installPlugins, quote, ShellError } = await import("../globals.mjs");
 install(g);
 const { $, file, write } = g;
 
@@ -69,4 +69,24 @@ test("write creates parents and file() reads relative to the sandbox", async () 
   assert.equal(await file("nope").exists(), false);
   assert.equal(file("x").name, path.join(dir, "x"));
   await assert.rejects(write("o", { a: 1 }), TypeError);
+});
+
+test("plugins map <server>.<tool> to the full tool name, and are undefined when off", async () => {
+  const sent = [];
+  const rpc = async (op, args) => (sent.push([op, args]), "ok");
+  const target = {};
+  installPlugins(target, rpc, true);
+  await target.plugins.memory.search({ q: 1 });
+  await target.plugins["multi-service-mcp"].find_places();
+  await target.plugins.call("memory__save", { v: 2 });
+  await target.plugins.tools();
+  assert.deepEqual(sent, [
+    ["plugins.call", { name: "memory__search", args: { q: 1 } }],
+    ["plugins.call", { name: "multi-service-mcp__find_places", args: {} }],
+    ["plugins.call", { name: "memory__save", args: { v: 2 } }],
+    ["plugins.list", {}],
+  ]);
+  assert.equal(target.plugins.then, undefined); // awaiting the namespace does not call a tool
+  installPlugins(target, rpc, false);
+  assert.equal(target.plugins, undefined);
 });
