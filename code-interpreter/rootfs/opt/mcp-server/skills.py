@@ -80,8 +80,9 @@ _TOOL = re.compile(r"\bha" + _DOT + r"([A-Za-z_]\w*)" + _DOT + r"([A-Za-z_]\w*)\
 _CALL = re.compile(r"\bha" + _DOT + "(admin" + _DOT + r")?call\s*\(\s*(?:" + _LIT + ")?")
 _HAB = re.compile(r"\bha" + _DOT + "admin" + _DOT + r"hab\s*\(\s*(\[[^\]]*\])?")
 _WORD = re.compile(_LIT)
-_PLUGIN = re.compile(r"\bplugins(?:\.([A-Za-z_$][\w$]*)|\[\s*" + _LIT + r"\s*\])\.([A-Za-z_$][\w$]*)\s*\(")
-_PLUGIN_CALL = re.compile(r"\bplugins\.call\s*\(\s*(?:" + _LIT + ")?")
+_PLUGIN = re.compile(r"\bplugins(?:" + _DOT + r"([A-Za-z_$][\w$]*)|\??\.?\[\s*" + _LIT + r"\s*\])" + _DOT
+                     + r"([A-Za-z_$][\w$]*)\s*\(")
+_PLUGIN_CALL = re.compile(r"\bplugins" + _DOT + r"call\s*\(\s*(?:" + _LIT + ")?")
 
 
 def manifest_check(code: str, uses: dict | None) -> dict:

@@ -113,3 +113,7 @@ def test_manifest_check_covers_plugin_tools():
     assert manifest_check(code, {"plugins": ["memory__search"]}) == {
         "undeclared": ["plugin memory__save", "plugin multi-service-mcp__find_places"], "dynamic": []}
     assert manifest_check("plugins.call(name, {})", {})["dynamic"] == ["plugins.call"]
+    # optional chaining, as the tool description writes plugins?.<server>.<tool>
+    chained = 'await plugins?.memory.search({}); await plugins?.["multi-service-mcp"]?.find_places({}); plugins?.call("x__y")'
+    assert manifest_check(chained, {})["undeclared"] == [
+        "plugin memory__search", "plugin multi-service-mcp__find_places", "plugin x__y"]
