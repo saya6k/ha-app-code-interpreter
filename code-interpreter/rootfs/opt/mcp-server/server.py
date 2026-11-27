@@ -1,6 +1,8 @@
 """Code Interpreter MCP server — streamable HTTP for Home Assistant's MCP client.
 
-Tool signatures and descriptions only; the logic lives in service.py.
+The one tool's signature and description only; the logic lives in service.py.
+Sessions need no tools of their own: run_code continues the speaker's latest
+one, idle ones expire, and administrators list and close them in the panel.
 """
 
 import asyncio
@@ -67,7 +69,9 @@ async def run_code(
     """Run JavaScript (Node 26) in a sandbox that can also reach Home Assistant.
 
     One call runs a whole script: read state, filter it in code, act, and
-    return only what is needed. Top-level await works; const/let/function/
+    return only what is needed. When the user asks for a skill (a reusable
+    routine), call skills.request(text) with what it should do: nothing else
+    creates one. Top-level await works; const/let/function/
     class declared at the top level stay defined for later calls. Omit
     session_id to continue your latest session (`resumed: true`; pass
     reset: true for a clean one); session_not_found means that session's
@@ -120,18 +124,6 @@ async def run_code(
     worker thread, no network unless the app's allowlist permits a host.
     """
     return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset, user_id=caller(ctx)))
-
-
-@mcp.tool()
-async def list_sessions(ctx: Context) -> dict:
-    """List your active sandbox sessions and how long until each expires when idle."""
-    return svc.list_sessions(user_id=caller(ctx))
-
-
-@mcp.tool()
-async def close_session(session_id: str, ctx: Context) -> dict:
-    """Close a sandbox session now, discarding its variables and files."""
-    return await svc.close_session(session_id, user_id=caller(ctx))
 
 
 async def prune_audit() -> None:
