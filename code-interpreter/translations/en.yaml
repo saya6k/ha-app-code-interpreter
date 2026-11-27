@@ -13,7 +13,7 @@ configuration:
   memory_limit_mb:
     name: Memory limit (MB)
     description: >-
-      Address-space limit per sandbox (minimum 768). It counts reserved
+      Address-space limit per sandbox (minimum 1024). It counts reserved
       memory, so real use is lower. Code that goes beyond it gets a
       MemoryError.
   network_allowlist:

@@ -48,27 +48,31 @@ svc = Service(options, audit=Audit(retention_days=options.audit_retention_days))
 async def run_code(
     code: str, ctx: Context, session_id: str | None = None, timeout_s: int = DEFAULT_TIMEOUT_S, reset: bool = False
 ) -> dict:
-    """Run Python code in a sandbox. Variables persist across calls with the same session_id.
+    """Run JavaScript (Node 26) in a sandbox. Variables persist across calls with the same session_id.
 
     Omit session_id to start a new session and pass the returned session_id on
     follow-up calls. If a call returns session_not_found, the old variables and
     files are gone: start again without session_id. The last expression's value
     is returned as `result`, and files the call created or changed under
-    /sandbox as `new_files`. Files live under /sandbox (256 MB); /tmp is
+    /sandbox as `new_files`. Top-level await works; const/let/function/class
+    declared at the top level stay defined for later calls. Files live under /sandbox (256 MB); /tmp is
     scratch (64 MB). Use import_from_share / export_to_share to move files
     between /sandbox and Home Assistant's /share.
 
-    Preinstalled: numpy, pandas, scipy, statsmodels, scikit-learn, sympy,
-    networkx, matplotlib (Agg; Korean labels work by default), seaborn, openpyxl,
-    xlsxwriter, pyarrow, pillow, lxml, beautifulsoup4, python-docx, fpdf2,
-    pyyaml, tabulate. There is no /proc (psutil does not work) and no network
-    unless the app's allowlist permits a host.
+    For analysis, write a Python script and run it with run_command
+    (python3). Preinstalled for Python: numpy, pandas, scipy, statsmodels,
+    scikit-learn, sympy, networkx, matplotlib (Agg; Korean labels work by
+    default), seaborn, openpyxl, xlsxwriter, pyarrow, pillow, lxml,
+    beautifulsoup4, python-docx, fpdf2, pyyaml, tabulate. No npm packages.
+    There is no /proc (process.memoryUsage() and psutil do not work), at most
+    one worker thread, and no network unless the app's allowlist permits a host.
 
     Home Assistant ends any tool call after 30 s, so keep timeout_s at its
-    default (25) or lower there: work that needs more than ~25 s (large pip
-    installs, long training) cannot finish in one call. Split it into
+    default (25) or lower there: work that needs more than ~25 s (long
+    training) cannot finish in one call. Split it into
     shorter steps; variables survive between calls. A timed-out cell is
-    interrupted with its variables kept. Other clients may allow up to 600.
+    interrupted with its variables kept (a loop after an await cannot be
+    interrupted: the REPL restarts, files stay). Other clients may allow up to 600.
     """
     return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset))
 

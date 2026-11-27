@@ -50,7 +50,7 @@ def exec_prefix(policy: SandboxPolicy, uid: int) -> list[str]:
 
 def sandbox_env(policy: SandboxPolicy) -> dict[str, str]:
     env = {
-        "PATH": "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin",
+        "PATH": "/opt/node/bin:/opt/venv/bin:/usr/local/bin:/usr/bin:/bin",
         "HOME": "/sandbox",  # pip --user and dotfiles persist for the session
         "PIP_NO_CACHE_DIR": "1",  # a wheel cache would eat the /sandbox quota
         "CI_IN_SANDBOX": "1",  # lets launch.py use kill(-1) safely
@@ -64,10 +64,14 @@ def sandbox_env(policy: SandboxPolicy) -> dict[str, str]:
         # without cgroups.
         "OPENBLAS_NUM_THREADS": str(BLAS_THREADS),
         "OMP_NUM_THREADS": str(BLAS_THREADS),
+        # V8 sizes its heap from the machine, not RLIMIT_AS: past the limit
+        # it would abort instead of throwing. Half leaves room for buffers.
+        "NODE_OPTIONS": f"--max-old-space-size={policy.memory_mb // 2}",
     }
     if policy.allowlist:
         url = f"http://127.0.0.1:{PROXY_PORT}"
         env.update(HTTP_PROXY=url, HTTPS_PROXY=url, http_proxy=url, https_proxy=url, NO_PROXY="")
+        env["NODE_USE_ENV_PROXY"] = "1"  # fetch() ignores HTTP(S)_PROXY without it
     return env
 
 

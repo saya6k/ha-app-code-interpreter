@@ -32,7 +32,10 @@ from seccomp import compile_filter
 
 BASE_DIR = Path("/var/cache/code-interpreter")
 PY = "/opt/venv/bin/python3"
-SANDBOX_CMD = [PY, "/opt/ci/launch.py", PY, "-u", "/opt/ci/repl/server.py"]
+NODE = "/opt/node/bin/node"
+# The vm loader the REPL uses for import() is marked experimental: without
+# the flag its warning would land in the first cell's stderr.
+SANDBOX_CMD = [PY, "/opt/ci/launch.py", NODE, "--disable-warning=ExperimentalWarning", "/opt/ci/repl/server.mjs"]
 STDERR_TAIL = 4096
 KERNEL_DIED_TAIL = 2000
 READY_TIMEOUT_S = 30.0
@@ -386,7 +389,8 @@ class Sandbox:
 
     async def run_code(self, code: str, timeout_s: float, reset: bool = False) -> dict:
         if reset:
-            await self._with_restart(lambda c: c.reset())
+            # Node has no safe way to empty globalThis: a fresh REPL does it.
+            await self._restart_repl()
         return await self._with_restart(lambda c: c.run(code, timeout_s))
 
     async def run_command(self, command: str, timeout_s: float) -> dict:

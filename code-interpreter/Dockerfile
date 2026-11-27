@@ -6,6 +6,30 @@ ARG BUILD_FROM=ghcr.io/home-assistant/base:3.23
 # from manylinux wheels on both arches.
 ARG SANDBOX_FROM=ghcr.io/home-assistant/base-debian:trixie
 
+# ---- Node ---------------------------------------------------------------------
+# Only bin/node from the official tarball, pinned by checksum. A stage of its
+# own, so the download tools do not end up in the sandbox rootfs.
+FROM ${SANDBOX_FROM} AS node
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG NODE_VERSION=26.13.1
+RUN case "$(uname -m)" in \
+      aarch64) arch=arm64 sha=89e1853138db51e8b82d3e98ba9c0d3f2956a28e5e55ea1b7e12d25aae92d5dd ;; \
+      x86_64) arch=x64 sha=5c063e46bab0fbc1c17cc445d7ff129cbdcd0471be6ed83b6ab864f8143bc864 ;; \
+      *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.xz" \
+ && echo "${sha}  /tmp/node.tar.xz" | sha256sum -c - \
+ && mkdir -p /opt/node/bin \
+ && tar -xJf /tmp/node.tar.xz -C /opt/node/bin --strip-components=2 "node-v${NODE_VERSION}-linux-${arch}/bin/node" \
+ && tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1 "node-v${NODE_VERSION}-linux-${arch}/LICENSE" \
+ && rm /tmp/node.tar.xz
+
 # ---- Sandbox rootfs ---------------------------------------------------------
 # Never run as a container: the app copies this filesystem to
 # /opt/sandbox-root and bubblewrap mounts it read-only as each session's /.
@@ -15,7 +39,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      python3 python3-venv fonts-dejavu-core fonts-nanum \
+      python3 python3-venv fonts-dejavu-core fonts-nanum libatomic1 \
  && rm -rf /var/lib/apt/lists/* \
  && python3 -m venv /opt/venv
 
@@ -36,6 +60,9 @@ RUN /opt/venv/bin/pip install --only-binary=:all: -r /tmp/requirements-sandbox.t
 # run in a session. Removing them in a later layer still shrinks the image:
 # the app stage copies this stage's filesystem, not its layers.
 RUN find /opt/venv/lib -type d -name tests -prune -exec rm -rf {} +
+
+# Node for the REPL (node stage above); no npm: nothing is installed into a session.
+COPY --from=node /opt/node /opt/node
 
 # Mount points: the rootfs is read-only inside bubblewrap, so bind targets
 # must already exist.

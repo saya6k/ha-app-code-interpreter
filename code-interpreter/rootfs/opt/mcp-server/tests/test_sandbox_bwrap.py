@@ -6,6 +6,7 @@
 import asyncio
 import contextlib
 import os
+import shlex
 import shutil
 import tempfile
 from pathlib import Path
@@ -73,6 +74,26 @@ def code(h, s, src, timeout=60):
     return h.do(s.run_code(src, timeout_s=timeout))
 
 
+PY_RUNNER = """import ast, sys
+t = ast.parse(sys.stdin.read())
+last = t.body.pop() if t.body and isinstance(t.body[-1], ast.Expr) else None
+g = {"__name__": "__main__"}
+exec(compile(t, "<py>", "exec"), g)
+if last is not None:
+    print(repr(eval(compile(ast.Expression(last.value), "<py>", "eval"), g)))
+"""
+
+
+def py(h, s, src, timeout=60):
+    """Python through run_command, as the sandbox runs its analysis stack:
+    the repr of the last expression as result, the exception's name as error."""
+    r = h.do(s.run_command(f"python3 -c {shlex.quote(PY_RUNNER)} <<'__PY__'\n{src}\n__PY__", timeout_s=timeout))
+    out = r["stdout"].strip().splitlines()
+    err = r["stderr"].strip().splitlines()
+    error = None if r["exit_code"] == 0 else (err[-1].split(":")[0] if err else str(r["error"]))
+    return {"result": out[-1] if out else None, "error": error, "stderr": r["stderr"]}
+
+
 def test_variables_persist_and_last_expression_is_returned(h, sbx):
     assert code(h, sbx, "x = 21")["error"] is None
     r = code(h, sbx, "x * 2")
@@ -80,7 +101,7 @@ def test_variables_persist_and_last_expression_is_returned(h, sbx):
 
 
 def test_identity_capabilities_env_and_network(h, sbx):
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 import ctypes, os, socket
 class H(ctypes.Structure): _fields_=[('v',ctypes.c_uint32),('pid',ctypes.c_int)]
 class D(ctypes.Structure): _fields_=[('e',ctypes.c_uint32),('p',ctypes.c_uint32),('i',ctypes.c_uint32)]
@@ -99,7 +120,7 @@ h=H(0x20080522,0); d=(D*2)(); assert ctypes.CDLL(None).capget(ctypes.byref(h),d)
 
 
 def test_filesystem_rw_only_in_sandbox_and_tmp(h, sbx):
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 import os
 ok = []
 for p in ('/sandbox/a.txt', '/tmp/b.txt', '/usr/c.txt', '/opt/ci/d.txt', '/run/ci/e.txt'):
@@ -113,7 +134,7 @@ ok
 
 
 def test_seccomp_blocks_nested_userns_but_threads_and_processes_work(h, sbx):
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 import os, ctypes, errno, threading, subprocess, sys, multiprocessing as m
 # The REPL is multithreaded, where unshare(CLONE_NEWUSER) fails with EINVAL
 # regardless of seccomp; only a single-threaded child shows the filter.
@@ -132,13 +153,15 @@ with m.Pool(2) as p: pool = p.map(abs, [-1, -2])
 
 
 def test_memory_limit_raises_memoryerror(h, sbx):
-    r = code(h, sbx, "b = bytearray(3 * 1024**3)")
+    r = py(h, sbx, "b = bytearray(3 * 1024**3)")
     assert r["error"] == "MemoryError"
+    r = code(h, sbx, "Buffer.alloc(3 * 1024 ** 3).length")
+    assert r["error"] == "RangeError" and r["kernel_restarted"] is False
     assert code(h, sbx, "1")["result"] == "1"
 
 
 def test_fork_flood_is_stopped(h, sbx):
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 import subprocess
 ps = []
 try:
@@ -156,7 +179,7 @@ n
 
 
 def test_analysis_stack_with_threads_under_nproc_limit(h, sbx):
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 from sklearn.ensemble import RandomForestClassifier as R
 from sklearn.datasets import make_classification as m
 import numpy as np, matplotlib.pyplot as plt
@@ -166,12 +189,12 @@ plt.plot([1, 2]); plt.title('한글'); plt.savefig('/sandbox/p.png')
 'ok'
 """, timeout=120)
     assert r["result"] == "'ok'", r
-    assert int(code(h, sbx, "import os; os.path.getsize('/sandbox/p.png')")["result"]) > 0
+    assert int(py(h, sbx, "import os; os.path.getsize('/sandbox/p.png')")["result"]) > 0
 
 
 def test_every_preinstalled_package_imports(h, sbx):
     # The image deletes the packages' tests/ directories; nothing may need them.
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 import importlib
 mods = ('numpy pandas scipy.stats statsmodels.api sklearn.linear_model sympy networkx '
         'matplotlib.pyplot seaborn openpyxl xlsxwriter pyarrow.parquet PIL.Image lxml.etree '
@@ -182,7 +205,7 @@ mods = ('numpy pandas scipy.stats statsmodels.api sklearn.linear_model sympy net
 
 
 def test_pdf_text_and_tables(h, sbx):
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 from fpdf import FPDF
 pdf = FPDF(); pdf.add_page(); pdf.set_font('helvetica', size=12)
 pdf.cell(text='Error codes'); pdf.ln(10)
@@ -202,23 +225,28 @@ with pdfplumber.open('/sandbox/m.pdf') as p:
 
 def test_timeout_interrupt_keeps_variables(h, sbx):
     code(h, sbx, "keep = 7")
-    r = code(h, sbx, "while True: pass", timeout=1)
+    r = code(h, sbx, "while (true) {}", timeout=1)
     assert r["error"] == "TimeoutError" and r["kernel_restarted"] is False
     assert code(h, sbx, "keep")["result"] == "7"
 
 
+# A loop after an await runs outside the interruptible script: only a restart ends it.
+STUCK = "await null; while (true) {}"
+READ_KEPT = "require('fs').readFileSync('/sandbox/kept.txt', 'utf8')"
+
+
 def test_stuck_kernel_is_restarted_keeping_files(h, sbx):
-    code(h, sbx, "lost = 1; open('/sandbox/kept.txt', 'w').write('y')")
-    r = code(h, sbx, "import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nwhile True: pass", timeout=1)
+    code(h, sbx, "lost = 1; require('fs').writeFileSync('/sandbox/kept.txt', 'y')")
+    r = code(h, sbx, STUCK, timeout=1)
     assert r["error"] == "TimeoutError" and r["kernel_restarted"] is True
-    assert code(h, sbx, "lost")["error"] == "NameError"
-    assert code(h, sbx, "open('/sandbox/kept.txt').read()")["result"] == "'y'"
+    assert code(h, sbx, "lost")["error"] == "ReferenceError"
+    assert code(h, sbx, READ_KEPT)["result"] == "y"
 
 
 def test_restart_survives_a_cancelled_caller(h, sbx):
     """HA cuts the call (cancel) while the stuck kernel's restart is running:
     the restart must still finish, so the next call finds a working REPL."""
-    code(h, sbx, "open('/sandbox/kept.txt', 'w').write('y')")
+    code(h, sbx, "require('fs').writeFileSync('/sandbox/kept.txt', 'y')")
 
     async def go():
         task = None
@@ -229,19 +257,21 @@ def test_restart_survives_a_cancelled_caller(h, sbx):
             return await run_locked(work)
 
         sbx._run_locked = cancel_inside
-        task = asyncio.ensure_future(sbx.run_code(
-            "import signal\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nwhile True: pass", timeout_s=1))
+        task = asyncio.ensure_future(sbx.run_code(STUCK, timeout_s=1))
         with pytest.raises(asyncio.CancelledError):
             await task
         sbx._run_locked = run_locked
-        return await sbx.run_code("open('/sandbox/kept.txt').read()", timeout_s=30)
+        return await sbx.run_code(READ_KEPT, timeout_s=30)
 
     r = h.do(go())
-    assert r["result"] == "'y'" and r["kernel_restarted"] is False
+    assert r["result"] == "y" and r["kernel_restarted"] is False
+
+
+KILL_REPL = "process.kill(process.pid, 'SIGKILL')"
 
 
 def test_crash_restarts_kernel(h, sbx):
-    r = code(h, sbx, "import os; os._exit(3)")
+    r = code(h, sbx, KILL_REPL)
     assert r["error"] == "KernelDied" and r["kernel_restarted"] is True
     assert code(h, sbx, "2")["result"] == "2"
 
@@ -249,11 +279,11 @@ def test_crash_restarts_kernel(h, sbx):
 def test_reset_clears_variables(h, sbx):
     code(h, sbx, "gone = 1")
     h.do(sbx.run_code("", timeout_s=10, reset=True))
-    assert code(h, sbx, "gone")["error"] == "NameError"
+    assert code(h, sbx, "gone")["error"] == "ReferenceError"
 
 
 def test_run_command_shares_files_and_reports_exit(h, sbx):
-    code(h, sbx, "open('/sandbox/f.txt', 'w').write('hi')")
+    code(h, sbx, "require('fs').writeFileSync('/sandbox/f.txt', 'hi')")
     r = h.do(sbx.run_command("cat f.txt; echo err >&2; exit 3", timeout_s=30))
     assert (r["stdout"], r["stderr"], r["exit_code"], r["error"]) == ("hi", "err\n", 3, None)
 
@@ -264,10 +294,13 @@ def test_run_command_timeout_and_output_cap(h, sbx):
     assert len(r["stdout"]) == 16000 and r["truncated"] is True
 
 
+SLEEPER = "require('child_process').spawn('sleep', ['300'], {stdio: 'ignore'}).unref()"
+
+
 def test_destroy_leaves_no_process_or_directory(h):
     s = h.create()
-    code(h, s, "import subprocess; subprocess.Popen(['sleep', '300'])")
-    assert procs_of(UID)
+    code(h, s, SLEEPER)
+    assert "sleep" in [n for _, n, _ in procs_of(UID, states=True)]
     h.do(s.destroy())
     assert procs_of(UID) == [], procs_of(UID, states=True)
     assert not s.dir.exists()
@@ -312,12 +345,12 @@ except OSError:
 
 
 def test_no_allowlist_means_no_network_at_all(h, sbx):
-    r = code(h, sbx, PROBE.format(gw=gateway()))
+    r = py(h, sbx, PROBE.format(gw=gateway()))
     assert r["error"] is None, r["stderr"]
     ip, gw80, gw8099, dns, has_sock, has_env = eval(r["result"])
     assert "open" not in (ip, gw80, gw8099)
     assert dns == "failed" and has_sock is False and has_env is False
-    r = code(h, sbx, "import socket\ntry:\n socket.create_connection(('127.0.0.1', 3128), 2); e = None\nexcept OSError as x: e = type(x).__name__\ne")
+    r = py(h, sbx, "import socket\ntry:\n socket.create_connection(('127.0.0.1', 3128), 2); e = None\nexcept OSError as x: e = type(x).__name__\ne")
     assert r["result"] == "'ConnectionRefusedError'"
 
 
@@ -336,12 +369,12 @@ def net():
 
 def test_allowlist_reaches_only_listed_hosts_through_the_proxy(net):
     h, s, events = net
-    r = code(h, s, PROBE.format(gw=gateway()))
+    r = py(h, s, PROBE.format(gw=gateway()))
     ip, gw80, gw8099, dns, has_sock, has_env = eval(r["result"])
     assert "open" not in (ip, gw80, gw8099)
     assert dns == "failed" and has_sock is True and has_env is True
 
-    r = code(h, s, """
+    r = py(h, s, """
 import urllib.request, urllib.error
 def get(url):
     try:
@@ -354,6 +387,11 @@ def get(url):
     pypi, example = eval(r["result"])
     assert pypi == 200
     assert "403" in example
+    # fetch() in the REPL goes through the same proxy (NODE_USE_ENV_PROXY).
+    r = code(h, s, "(await fetch('https://pypi.org/simple/requests/')).status")
+    assert r["result"] == "200", r
+    r = code(h, s, "await fetch('https://example.com/')")
+    assert r["error"] == "TypeError"
 
     # A keep-alive upstream holds the tunnel for up to DRAIN_AFTER_CLIENT_EOF_S
     # after the client is done; the log entry is written when it closes.
@@ -394,7 +432,7 @@ def test_destroy_during_running_cell_leaves_nothing(h):
     s = h.create()
 
     async def race():
-        cell = asyncio.ensure_future(s.run_code("import time; time.sleep(60)", timeout_s=60))
+        cell = asyncio.ensure_future(s.run_code("await new Promise((r) => setTimeout(r, 60000))", timeout_s=60))
         await asyncio.sleep(1)
         await s.destroy()
         return await cell
@@ -425,7 +463,7 @@ def test_cancelled_run_command_is_killed(h, sbx):
 # ---- one sandbox per session (review findings 4, 5) -------------------------
 
 def test_sandbox_dir_is_capped_and_never_touches_the_app_disk(h, sbx):
-    r = code(h, sbx, """
+    r = py(h, sbx, """
 import errno
 written, err = 0, None
 try:
@@ -440,31 +478,31 @@ except OSError as e:
     written, err = eval(r["result"])
     assert err == "ENOSPC" and written <= 256
     assert sorted(p.name for p in sbx.dir.iterdir()) == ["proxy"]  # nothing else on disk
-    code(h, sbx, "import glob, os; [os.remove(p) for p in glob.glob('/sandbox/big*')]")
-    assert code(h, sbx, "open('/sandbox/ok', 'w').write('fine')")["error"] is None
+    py(h, sbx, "import glob, os; [os.remove(p) for p in glob.glob('/sandbox/big*')]")
+    assert py(h, sbx, "open('/sandbox/ok', 'w').write('fine')")["error"] is None
 
 
 def test_commands_and_code_share_tmp_home_and_sandbox(h, sbx):
     r = h.do(sbx.run_command("echo cmd > /tmp/t; echo home > $HOME/h; pwd", timeout_s=30))
     assert r["stdout"] == "/sandbox\n"
-    r = code(h, sbx, "import os; (open('/tmp/t').read(), open(os.path.expanduser('~/h')).read())")
-    assert eval(r["result"]) == ("cmd\n", "home\n")
+    r = code(h, sbx, "const fs = require('fs'); [fs.readFileSync('/tmp/t', 'utf8'), fs.readFileSync(require('os').homedir() + '/h', 'utf8')]")
+    assert r["result"] == '["cmd\\n","home\\n"]'
 
 
 def test_restart_keeps_files_and_ends_stray_processes(h, sbx):
-    code(h, sbx, "import subprocess; open('/sandbox/f', 'w').write('kept'); subprocess.Popen(['sleep', '300'])")
+    code(h, sbx, "require('fs').writeFileSync('/sandbox/f', 'kept'); " + SLEEPER)
     assert "sleep" in [n for _, n, _ in procs_of(UID, states=True)]
-    r = code(h, sbx, "import os; os._exit(1)")
+    r = code(h, sbx, KILL_REPL)
     assert r["kernel_restarted"] is True
     h.do(asyncio.sleep(0.3))
     assert "sleep" not in [n for _, n, _ in procs_of(UID, states=True)]
-    assert code(h, sbx, "open('/sandbox/f').read()")["result"] == "'kept'"
+    assert code(h, sbx, "require('fs').readFileSync('/sandbox/f', 'utf8')")["result"] == "kept"
 
 
 def test_sandbox_killed_from_inside_is_reported_and_files_are_gone(h, sbx):
     """kill(-1) from user code takes the agent down, so bwrap and the whole
     sandbox end. The app must say so instead of pretending a restart worked."""
-    code(h, sbx, "import os, signal; os.kill(-1, signal.SIGKILL)")  # its reply may still get out
+    code(h, sbx, "process.kill(-1, 'SIGKILL')")  # its reply may still get out
     h.do(asyncio.sleep(0.5))  # bwrap tears the sandbox down once the agent is gone
     assert procs_of(UID) == []
     with pytest.raises(SandboxError, match="files are lost"):
@@ -478,13 +516,13 @@ def test_large_binary_round_trip_through_the_agent(h, sbx):
     assert h.do(sbx.write_file("/sandbox/d/blob.bin", data, 20 << 20)) == {"path": "/sandbox/d/blob.bin", "size": len(data)}
     got, size = h.do(sbx.read_file("d/blob.bin", 21 << 20))
     assert size == len(data) and got == data
-    r = code(h, sbx, "import hashlib; hashlib.sha256(open('/sandbox/d/blob.bin','rb').read()).hexdigest()")
+    r = code(h, sbx, "require('crypto').createHash('sha256').update(require('fs').readFileSync('/sandbox/d/blob.bin')).digest('hex')")
     import hashlib
-    assert r["result"] == repr(hashlib.sha256(data).hexdigest())
+    assert r["result"] == hashlib.sha256(data).hexdigest()
 
 
 def test_file_ops_stay_inside_sandbox(h, sbx):
-    code(h, sbx, "import os; os.symlink('/etc/passwd', '/sandbox/pw'); os.symlink('/tmp', '/sandbox/t')")
+    code(h, sbx, "const fs = require('fs'); fs.symlinkSync('/etc/passwd', '/sandbox/pw'); fs.symlinkSync('/tmp', '/sandbox/t')")
     for path in ("/etc/passwd", "/sandbox/../etc/passwd", "pw", "t/x"):
         with pytest.raises(FileOpError, match="outside /sandbox"):
             h.do(sbx.read_file(path, 100))
@@ -495,10 +533,10 @@ def test_file_ops_stay_inside_sandbox(h, sbx):
 
 
 def test_listing_sees_code_output_and_survives_restart(h, sbx):
-    code(h, sbx, "open('/sandbox/out.csv', 'w').write('a\\n1\\n')")
+    code(h, sbx, "require('fs').writeFileSync('/sandbox/out.csv', 'a\\n1\\n')")
     names = [e["path"] for e in h.do(sbx.list_files())["entries"]]
     assert "/sandbox/out.csv" in names
-    code(h, sbx, "import os; os._exit(1)")
+    code(h, sbx, KILL_REPL)
     names = [e["path"] for e in h.do(sbx.list_files())["entries"]]
     assert "/sandbox/out.csv" in names
 
@@ -517,7 +555,7 @@ def test_fifo_in_sandbox_is_refused_without_hanging(h, sbx):
 
 
 def test_huge_listing_does_not_kill_the_agent(h, sbx):
-    code(h, sbx, """
+    py(h, sbx, """
 import os
 d = '/sandbox/' + 'd' * 100
 os.makedirs(d)
@@ -526,7 +564,7 @@ for i in range(3000):
 """, timeout=120)
     listing = h.do(sbx.list_files("/sandbox", recursive=True))
     assert listing["truncated"] is True and listing["entries"]
-    assert code(h, sbx, "'alive'")["result"] == "'alive'"  # agent and files survived
+    assert code(h, sbx, "'alive'")["result"] == "alive"  # agent and files survived
 
 
 def test_cancelled_file_op_does_not_leak_its_reply(h, sbx):
@@ -562,7 +600,7 @@ def test_destroy_during_file_op_raises_cleanly(h):
 
 
 def test_kernel_death_reports_the_sandbox_stderr(h, sbx):
-    r = code(h, sbx, "import os; os.write(2, b'native lib: fatal error\\n'); os.abort()")
+    r = code(h, sbx, "require('fs').writeSync(2, 'native lib: fatal error\\n'); process.abort()")
     assert r["error"] == "KernelDied" and r["kernel_restarted"] is True
     assert "native lib: fatal error" in r["stderr"]
 
@@ -571,9 +609,9 @@ def test_blas_threads_are_capped_so_the_memory_limit_holds_on_many_cores(h, sbx)
     """OpenBLAS reserves buffers per thread, and RLIMIT_AS counts reservations:
     on hosts with many cores (a 1 GB limit, an arm64 CI runner) an uncapped
     pool aborts the REPL. The sandbox caps it, whatever the core count."""
-    r = code(h, sbx, "import os; (os.environ.get('OPENBLAS_NUM_THREADS'), os.environ.get('OMP_NUM_THREADS'))")
+    r = py(h, sbx, "import os; (os.environ.get('OPENBLAS_NUM_THREADS'), os.environ.get('OMP_NUM_THREADS'))")
     assert r["result"] == "('2', '2')"
-    r = code(h, sbx, "import numpy as np; from threadpoolctl import threadpool_info; "
+    r = py(h, sbx, "import numpy as np; from threadpoolctl import threadpool_info; "
                      "max(i['num_threads'] for i in threadpool_info())")
     assert r["result"] == "2", r
 

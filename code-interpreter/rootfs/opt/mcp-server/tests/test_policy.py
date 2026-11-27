@@ -46,6 +46,8 @@ def test_env_without_allowlist_has_no_proxy():
     assert env["HOME"] == "/sandbox" and env["MPLBACKEND"] == "Agg"
     assert env["CI_IN_SANDBOX"] == "1"
     assert env["OPENBLAS_NUM_THREADS"] == env["OMP_NUM_THREADS"] == "2"
+    assert env["PATH"].startswith("/opt/node/bin:")
+    assert env["NODE_OPTIONS"] == "--max-old-space-size=1024"  # half of the 2048 default
     assert not any("PROXY" in k.upper() for k in env)
 
 
@@ -53,6 +55,7 @@ def test_env_with_allowlist_points_at_loopback_forwarder():
     env = sandbox_env(SandboxPolicy(allowlist=("pypi.org",)))
     assert env["HTTPS_PROXY"] == env["https_proxy"] == "http://127.0.0.1:3128"
     assert env["NO_PROXY"] == ""
+    assert env["NODE_USE_ENV_PROXY"] == "1"
 
 
 def test_exec_prefix_carries_limits_and_uid():

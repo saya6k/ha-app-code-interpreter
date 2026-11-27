@@ -38,7 +38,7 @@ options:
 schema:
   idle_timeout_minutes: int(1,1440)
   max_sessions: int(1,10)
-  memory_limit_mb: int(768,8192)
+  memory_limit_mb: int(1024,8192)
   network_allowlist:
     - str?
   max_file_mb: int(1,500)
