@@ -25,11 +25,19 @@ if ! bashio::supervisor.ping 2>/dev/null; then
     exit 0
 fi
 
-if bashio::discovery "mcp" "{\"url\": \"http://$(hostname):8099/mcp\"}" > /dev/null; then
+# The MCP server writes its token before it listens; Home Assistant sends it
+# back as a bearer token on every request (2026.12+).
+token=$(cat /data/mcp_token 2>/dev/null || true)
+if [ -z "${token}" ]; then
+    # Without it Home Assistant would store no token and every call would be refused.
+    bashio::log.warning "MCP server did not start; not announcing. Restart the app."
+    exit 0
+fi
+if bashio::discovery "mcp" "{\"url\": \"http://$(hostname):8099/mcp\", \"token\": \"${token}\"}" > /dev/null; then
     bashio::log.info "Announced MCP endpoint to Home Assistant."
 else
     bashio::log.warning "Supervisor discovery announce failed (non-fatal)."
-    bashio::log.warning "Add the endpoint manually if it does not appear: http://$(hostname):8099/mcp"
+    bashio::log.warning "Restart the app to announce it again; Home Assistant must find it through discovery."
 fi
 
 exit 0
