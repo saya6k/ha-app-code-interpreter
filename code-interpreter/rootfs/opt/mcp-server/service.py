@@ -43,7 +43,8 @@ ARGS_AUDIT_CAP = 4096
 SELF_CHECK_UID = UID_BASE - 1  # outside the session slots
 NOT_FOUND_HINT = (
     "This session expired or was closed; its variables and files are gone. "
-    "Call again without session_id to start a new session."
+    "Call again without session_id: you continue your latest open session if there is one "
+    "(check which variables it has), otherwise a new one starts."
 )
 
 
@@ -125,6 +126,7 @@ class _CellCalls:
         self.user_id = user_id
         self.deadline = deadline
         self.ha_calls = 0
+        self.pool = service.ha.pool()  # Home Assistant connections for this run
 
     def _fail(self, event: str, e: Exception, **detail) -> RpcError:
         audit = self.service.audit
@@ -243,7 +245,7 @@ class _CellCalls:
         t0 = time.monotonic()
         svc._ha_inflight[self.user_id] = svc._ha_inflight.get(self.user_id, 0) + 1
         try:
-            value = await svc.ha.call(api, name, tool_args, max(1.0, self.deadline - time.monotonic()))
+            value = await self.pool.call(api, name, tool_args, max(1.0, self.deadline - time.monotonic()))
         except (HaToolError, HaUnavailable) as e:
             svc.audit.record("ha.call", s.sid, "error", **detail, ms=_ms(t0), error=type(e).__name__, message=str(e))
             raise RpcError(type(e).__name__, str(e)) from None
@@ -365,7 +367,10 @@ class Service:
             limit = _clamp(timeout_s)
             calls = _CellCalls(self, s, user_id, deadline=time.monotonic() + limit)
             admin = await self.ha.is_admin(user_id)  # ha.admin exists in the cell only for admins
-            r = await s.run_code(code, limit, reset, rpc=calls, ctx={"admin": admin})
+            try:
+                r = await s.run_code(code, limit, reset, rpc=calls, ctx={"admin": admin})
+            finally:
+                await calls.pool.close()
             after = await snapshot(s)
             changed = sorted(p for p, meta in after.items() if before.get(p) != meta)
             r["new_files"] = changed[:NEW_FILES_CAP]
@@ -377,6 +382,15 @@ class Service:
             )
             return r
 
+        # Without session_id, a known user continues their latest session, as
+        # Claude Code keeps one REPL per conversation: agents rarely pass the
+        # id back. Callers with no user (a satellite) always get a new one,
+        # so anonymous conversations never share variables.
+        resumed = session_id is None and user_id is not None and (latest := self.manager.latest(user_id)) is not None
+        if resumed:
+            out = await self._call(latest, run, "code.exec", owner=user_id, **code_detail(code))
+            if out.get("error") != "session_not_found":  # closed in between: start a new one below
+                return {**out, "resumed": True}
         return await self._call(session_id, run, "code.exec", owner=user_id, **code_detail(code))
 
     async def _import(self, s, share_path: str, dest: str | None) -> dict:
