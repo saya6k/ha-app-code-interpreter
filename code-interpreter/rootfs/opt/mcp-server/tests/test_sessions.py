@@ -364,3 +364,19 @@ def test_plain_create_failure_keeps_the_uid():
             assert b.uid == tried[0]
 
     run(go())
+
+
+def test_a_session_is_only_found_by_its_owner():
+    async def go():
+        mgr, _ = make()
+        async with mgr.acquire(None, owner="alice") as s:
+            sid = s.id
+            assert s.owner == "alice"
+        async with mgr.acquire(sid, owner="alice") as s:
+            assert s.id == sid
+        for other in ("bob", None):
+            with pytest.raises(SessionNotFound):
+                async with mgr.acquire(sid, owner=other):
+                    pass
+
+    run(go())

@@ -19,6 +19,7 @@ from typing import Awaitable, Callable
 
 import egress
 import sharefs
+from hamcp import ADMIN, APIS, ASSIST, HaToolError, HaUnavailable, HomeAssistant
 from audit import Audit, code_detail, sha256
 from policy import SandboxPolicy
 from replclient import RpcError
@@ -38,6 +39,8 @@ MIB = 1 << 20
 DEFAULT_EXPORT_DIR = "/share/code-interpreter"
 TEXT_LIMIT = 16000  # chars returned by read_file
 NEW_FILES_CAP = 20
+HA_CALLS_PER_CELL = 50  # a runaway loop must not flip every light in the house
+ARGS_AUDIT_CAP = 4096
 SELF_CHECK_UID = UID_BASE - 1  # outside the session slots
 NOT_FOUND_HINT = (
     "This session expired or was closed; its variables and files are gone. "
@@ -129,9 +132,12 @@ class _CellCalls:
     §3.4). Every argument comes from sandbox code: paths are checked by
     sharefs and the agent, exactly as for the MCP tools."""
 
-    def __init__(self, service: "Service", sandbox) -> None:
+    def __init__(self, service: "Service", sandbox, user_id: str | None = None, deadline: float = 0.0) -> None:
         self.service = service
         self.sandbox = sandbox
+        self.user_id = user_id
+        self.deadline = deadline
+        self.ha_calls = 0
 
     def _fail(self, event: str, e: Exception, **detail) -> RpcError:
         audit = self.service.audit
@@ -165,8 +171,64 @@ class _CellCalls:
                 return await svc._export(s, path)
             except (ShareError, FileOpError) as e:
                 raise self._fail("file.export", e, path=path) from None
+        if op in ("ha.list", "ha.call"):
+            return await self._ha(op, args)
         self.rejected(f"unknown call {op!r}")
         raise RpcError("RpcRejected", f"unknown call {op!r}")
+
+    def _deny(self, kind: str, name: str, message: str) -> RpcError:
+        self.service.audit.record("policy.violation", self.sandbox.sid, "denied", kind=kind, message=message,
+                                  user_id=self.user_id)
+        return RpcError(name, message)
+
+    async def _allowed_tools(self, api: str) -> list[dict]:
+        """What this caller may see of `api`, asked again on every call: admin
+        rights can change mid-session."""
+        svc = self.service
+        if api not in APIS:
+            raise self._deny("rpc", "RpcRejected", f"unknown API {api!r}")
+        if api == ADMIN and not await svc.ha.is_admin(self.user_id):
+            raise self._deny("admin", "AdminOnly", "ha.admin is only for Home Assistant administrators")
+        try:
+            tools = await svc.ha.tools(api)
+        except HaUnavailable as e:
+            raise RpcError("HaUnavailable", str(e)) from None
+        # The Home Assistant API is not bounded by exposure: admins get its
+        # read-only tools only (call_action and every config change stay out).
+        return [t for t in tools if t["read_only"]] if api == ADMIN else tools
+
+    async def _ha(self, op: str, args: dict):
+        svc, s = self.service, self.sandbox
+        api = str(args.get("api", ASSIST))
+        tools = await self._allowed_tools(api)
+        if op == "ha.list":
+            return tools
+        name = str(args.get("name", ""))
+        tool_args = args.get("args") or {}
+        if not isinstance(tool_args, dict):
+            raise RpcError("TypeError", "tool arguments must be an object")
+        tool = next((t for t in tools if t["name"] == name), None)
+        if tool is None:
+            if api == ADMIN:
+                raise self._deny("admin", "NotAllowed", f"{name!r} is not one of the read-only tools ha.admin offers")
+            raise RpcError("UnknownTool", f"Home Assistant has no tool {name!r} (see await ha.tools())")
+        self.ha_calls += 1
+        if self.ha_calls > HA_CALLS_PER_CELL:
+            raise self._deny("rate", "RateLimited", f"more than {HA_CALLS_PER_CELL} Home Assistant calls in one run")
+        raw = json.dumps(tool_args, sort_keys=True)
+        detail = dict(api=api, tool=name, args=raw[:ARGS_AUDIT_CAP], args_sha256=sha256(raw.encode()),
+                      read_only=tool["read_only"], destructive=tool["destructive"], user_id=self.user_id)
+        t0 = time.monotonic()
+        svc._ha_inflight[self.user_id] = svc._ha_inflight.get(self.user_id, 0) + 1
+        try:
+            value = await svc.ha.call(api, name, tool_args, max(1.0, self.deadline - time.monotonic()))
+        except (HaToolError, HaUnavailable) as e:
+            svc.audit.record("ha.call", s.sid, "error", **detail, ms=_ms(t0), error=type(e).__name__, message=str(e))
+            raise RpcError(type(e).__name__, str(e)) from None
+        finally:
+            svc._ha_inflight[self.user_id] -= 1
+        svc.audit.record("ha.call", s.sid, **detail, ms=_ms(t0), result_chars=len(json.dumps(value, default=str)))
+        return value
 
 
 class Service:
@@ -178,8 +240,14 @@ class Service:
         base_dir: Path = BASE_DIR,
         share_root: Path = sharefs.SHARE,
         audit: Audit | None = None,
+        ha: HomeAssistant | None = None,
     ) -> None:
         self.options = options
+        self.ha = ha or HomeAssistant()
+        # Home Assistant calls in flight per user: a run_code arriving while
+        # one waits is that call coming back to us (a tool or script that asks
+        # the conversation agent again). Refused, so it cannot recurse.
+        self._ha_inflight: dict[str | None, int] = {}
         self.share_root = share_root
         self.base_dir = base_dir
         self._create = create_sandbox
@@ -214,7 +282,7 @@ class Service:
             self.audit.record("policy.violation", sid, "denied", kind="egress",
                               host=entry.get("host"), port=entry.get("port"), reason=entry["reason"])
 
-    async def _call(self, session_id: str | None, fn, event: str, **detail) -> dict:
+    async def _call(self, session_id: str | None, fn, event: str, *, owner: str | None = None, **detail) -> dict:
         """Run fn(sandbox) in a session; on failure audit `event` as an error."""
         def failed(sid, error: str, message: str, kind: str | None = None) -> None:
             self.audit.record(event, sid, "error", **detail, error=error, message=message)
@@ -222,7 +290,7 @@ class Service:
                 self.audit.record("policy.violation", sid, "denied", kind=kind, during=event, message=message)
 
         try:
-            async with self.manager.acquire(session_id) as session:
+            async with self.manager.acquire(session_id, owner) as session:
                 try:
                     out = await fn(session.sandbox)
                 except SandboxError as e:
@@ -250,8 +318,16 @@ class Service:
         return self.options.max_file_mb * MIB
 
     async def run_code(
-        self, code: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S, reset: bool = False
+        self, code: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S, reset: bool = False,
+        user_id: str | None = None,
     ) -> dict:
+        if user_id and self._ha_inflight.get(user_id):
+            self.audit.record("policy.violation", session_id, "denied", kind="nested", user_id=user_id,
+                              message="run_code while this user's Home Assistant call is in flight")
+            return {"error": "nested_call", "detail": (
+                "A Home Assistant tool called during your run_code asked the conversation agent again; "
+                "the nested run_code is refused so it cannot recurse.")}
+
         async def snapshot(s) -> dict:
             # new_files is a convenience: a listing problem must never cost
             # the call itself (or its result, once the code has run).
@@ -263,7 +339,10 @@ class Service:
         async def run(s):
             t0 = time.monotonic()
             before = await snapshot(s)
-            r = await s.run_code(code, _clamp(timeout_s), reset, rpc=_CellCalls(self, s))
+            limit = _clamp(timeout_s)
+            calls = _CellCalls(self, s, user_id, deadline=time.monotonic() + limit)
+            admin = await self.ha.is_admin(user_id)  # ha.admin exists in the cell only for admins
+            r = await s.run_code(code, limit, reset, rpc=calls, ctx={"admin": admin})
             after = await snapshot(s)
             changed = sorted(p for p, meta in after.items() if before.get(p) != meta)
             r["new_files"] = changed[:NEW_FILES_CAP]
@@ -271,23 +350,23 @@ class Service:
                 "code.exec", s.sid, "error" if r["error"] else "ok", **code_detail(code), ms=_ms(t0),
                 error=r["error"], timeout=r["error"] == "TimeoutError", kernel_restarted=r["kernel_restarted"],
                 reset=reset, stdout_chars=len(r["stdout"]), stderr_chars=len(r["stderr"]),
-                new_files=len(changed),
+                new_files=len(changed), user_id=user_id, admin=admin, ha_calls=calls.ha_calls,
             )
             return r
 
-        return await self._call(session_id, run, "code.exec", **code_detail(code))
+        return await self._call(session_id, run, "code.exec", owner=user_id, **code_detail(code))
 
-    async def list_files(self, session_id: str, path: str = "/sandbox") -> dict:
-        return await self._call(session_id, lambda s: s.list_files(path), "file.list", path=path)
+    async def list_files(self, session_id: str, path: str = "/sandbox", user_id: str | None = None) -> dict:
+        return await self._call(session_id, lambda s: s.list_files(path), "file.list", owner=user_id, path=path)
 
-    async def read_file(self, session_id: str, path: str) -> dict:
+    async def read_file(self, session_id: str, path: str, user_id: str | None = None) -> dict:
         async def read(s):
             data, size = await s.read_file(path, TEXT_LIMIT * 4)  # UTF-8: up to 4 bytes per char
             return _text_or_binary(path, data, size)
 
-        return await self._call(session_id, read, "file.read", path=path)
+        return await self._call(session_id, read, "file.read", owner=user_id, path=path)
 
-    async def write_file(self, session_id: str, path: str, content: str) -> dict:
+    async def write_file(self, session_id: str, path: str, content: str, user_id: str | None = None) -> dict:
         data = content.encode()
 
         async def write(s):
@@ -298,7 +377,7 @@ class Service:
             self.audit.record("file.write", s.sid, path=out["path"], size=out["size"], sha256=digest)
             return out
 
-        return await self._call(session_id, write, "file.write", path=path, size=len(data))
+        return await self._call(session_id, write, "file.write", owner=user_id, path=path, size=len(data))
 
     async def _import(self, s, share_path: str, dest: str | None) -> dict:
         # Off the event loop: up to max_file_mb of disk I/O would stall every call.
@@ -319,14 +398,19 @@ class Service:
         self.audit.record("file.export", s.sid, path=path, share_path=str(dest), size=size, sha256=digest)
         return {"share_path": str(dest), "size": size}
 
-    async def import_from_share(self, share_path: str, session_id: str | None = None, dest: str | None = None) -> dict:
+    async def import_from_share(
+        self, share_path: str, session_id: str | None = None, dest: str | None = None, user_id: str | None = None
+    ) -> dict:
         return await self._call(session_id, lambda s: self._import(s, share_path, dest), "file.import",
-                                share_path=share_path)
+                                owner=user_id, share_path=share_path)
 
-    async def export_to_share(self, session_id: str, path: str) -> dict:
-        return await self._call(session_id, lambda s: self._export(s, path), "file.export", path=path)
+    async def export_to_share(self, session_id: str, path: str, user_id: str | None = None) -> dict:
+        return await self._call(session_id, lambda s: self._export(s, path), "file.export", owner=user_id, path=path)
 
-    async def run_command(self, command: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
+    async def run_command(
+        self, command: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S,
+        user_id: str | None = None,
+    ) -> dict:
         async def cmd(s):
             t0 = time.monotonic()
             r = await s.run_command(command, _clamp(timeout_s))
@@ -335,9 +419,10 @@ class Service:
                               stdout_chars=len(r["stdout"]), stderr_chars=len(r["stderr"]))
             return r
 
-        return await self._call(session_id, cmd, "command.exec", **code_detail(command, "command"))
+        return await self._call(session_id, cmd, "command.exec", owner=user_id, **code_detail(command, "command"))
 
-    def list_sessions(self) -> dict:
+    def list_sessions(self, user_id: str | None = None, everyone: bool = False) -> dict:
+        """The caller's own sessions; everyone=True for the Ingress panel."""
         return {
             "sessions": [
                 {
@@ -347,10 +432,14 @@ class Service:
                     "expires_in_s": round(self.manager.expires_in(s)),
                 }
                 for s in self.manager.list()
+                if everyone or s.owner == user_id
             ]
         }
 
-    async def close_session(self, session_id: str) -> dict:
+    async def close_session(self, session_id: str, user_id: str | None = None, everyone: bool = False) -> dict:
+        session = next((s for s in self.manager.list() if s.id == session_id), None)
+        if session is None or not (everyone or session.owner == user_id):
+            return {"error": "session_not_found", "hint": NOT_FOUND_HINT}
         try:
             await self.manager.close(session_id)
         except SessionNotFound:

@@ -50,7 +50,7 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
     async def live_sessions(request: Request) -> Response:
         policy = svc.options.policy
         return JSONResponse({
-            **svc.list_sessions(),
+            **svc.list_sessions(everyone=True),  # the panel is admin-only
             "settings": {
                 "idle_timeout_minutes": svc.options.idle_timeout_minutes,
                 "max_sessions": svc.options.max_sessions,
@@ -64,7 +64,7 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
         if request.headers.get(CSRF_HEADER) != "code-interpreter-ui":
             return JSONResponse({"error": "missing X-Requested-With"}, status_code=403)
         sid = request.path_params["sid"]
-        result = await svc.close_session(sid)
+        result = await svc.close_session(sid, everyone=True)
         user = request.headers.get("x-remote-user-name") or request.headers.get("x-remote-user-id")
         svc.audit.record("ui.close_session", sid, "error" if "error" in result else "ok",
                          user=user, result=result.get("error", "closed"))

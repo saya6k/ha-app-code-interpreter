@@ -249,8 +249,10 @@ class ReplClient:
             if calls is not None:
                 calls.cancel()
 
-    async def run(self, code: str, timeout_s: float, rpc: RpcHandler | None = None) -> dict:
-        return await self._bounded({"op": "exec", "code": code}, timeout_s, _blank(), _CODE_KEYS, rpc)
+    async def run(self, code: str, timeout_s: float, rpc: RpcHandler | None = None, ctx: dict | None = None) -> dict:
+        """ctx: what the cell's globals depend on, e.g. {"admin": True} defines ha.admin."""
+        req = {"op": "exec", "code": code, "ctx": ctx or {}}
+        return await self._bounded(req, timeout_s, _blank(), _CODE_KEYS, rpc)
 
     async def command(self, command: str, timeout_s: float) -> dict:
         """The server enforces timeout_s itself; the client allows more than the

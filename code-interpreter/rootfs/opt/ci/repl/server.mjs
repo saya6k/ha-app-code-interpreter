@@ -20,7 +20,7 @@ import path from "node:path";
 import util from "node:util";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { install, installShare, killRunning } from "./globals.mjs";
+import { install, installHa, installShare, killRunning } from "./globals.mjs";
 import { transform } from "./transform.mjs";
 
 const OUT_LIMIT = 16000;
@@ -104,7 +104,8 @@ async function awaitMembers(value) {
   return Object.fromEntries(entries);
 }
 
-async function execute(code, cell) {
+async function execute(code, cell, ctx = {}) {
+  installHa(globalThis, (...a) => rpc(...a), Boolean(ctx.admin));
   const out = new Capped(OUT_LIMIT);
   const err = new Capped(OUT_LIMIT);
   for (const e of late.splice(0)) err.write(`[earlier cell] ${formatError(e)}\n`);
@@ -287,7 +288,7 @@ async function serve(req, cell) {
   if (req.op === "command") return runCommand(String(req.command ?? ""), Number(req.timeout_s ?? 60));
   activeRequest = req.id ?? null;
   try {
-    return await execute(String(req.code ?? ""), cell);
+    return await execute(String(req.code ?? ""), cell, req.ctx ?? {});
   } finally {
     activeRequest = null;
   }
