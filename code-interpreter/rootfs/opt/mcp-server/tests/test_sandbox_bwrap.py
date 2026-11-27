@@ -310,6 +310,9 @@ def test_shell_timeout_kills_the_command_and_keeps_its_output(h, sbx):
     r = code(h, sbx, "const o = await $('yes | head -c 100000; sleep 30', 2000).nothrow(); [o.timedOut, o.stdout.length]")
     assert r["result"] == "[true,100000]", r
 
+SLEEPER = "require('child_process').spawn('sleep', ['300'], {stdio: 'ignore'}).unref()"
+
+
 def test_destroy_leaves_no_process_or_directory(h):
     s = h.create()
     code(h, s, SLEEPER)
