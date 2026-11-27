@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import util from "node:util";
+import vm from "node:vm";
 
 const PIPE_GRACE_MS = 2000; // after exit: a detached grandchild may keep the pipes open
 const STREAM_LIMIT = 16 << 20; // per stream: enough to parse a big file in the cell, bounded by RLIMIT_AS anyway
@@ -225,6 +226,26 @@ export function installHa(target, rpc, admin) {
   const hab = (argv, { stdin } = {}) => rpc("ha.hab", { argv, ...(stdin === undefined ? {} : { stdin: String(stdin) }) });
   const adminApi = admin ? haNamespace(rpc, "homeassistant", { hab }) : undefined;
   target.ha = new Proxy(ha, { get: (base, key) => (key === "admin" ? adminApi : base[key]) });
+}
+
+// skills.list(); skills.<name>(args) runs the user's approved skill: the app
+// hands back its code each time (approvals can change), compiled here.
+export function installSkills(target, rpc) {
+  const base = { list: () => rpc("skills.list", {}) };
+  target.skills = new Proxy(base, {
+    get(b, key) {
+      if (key in b || typeof key !== "string" || key === "then" || key === "toJSON") return b[key];
+      return async (args = {}) => {
+        const { code } = await rpc("skills.get", { name: key });
+        const fn = vm.runInThisContext(`(${code})`, {
+          filename: `skill:${key}`,
+          importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+        });
+        if (typeof fn !== "function") throw new TypeError(`skill ${key} is not a function`);
+        return fn(args);
+      };
+    },
+  });
 }
 
 export function install(target) {

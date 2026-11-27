@@ -136,6 +136,23 @@ class HomeAssistant:
         async with self._session(api, timeout_s) as s:
             return unwrap(await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s)))
 
+    async def generate_data(self, task_name: str, instructions: str, structure: dict,
+                            entity_id: str | None = None, timeout_s: float = 120) -> dict:
+        """ai_task.generate_data; entity_id None = Home Assistant's preferred AI Task entity."""
+        import httpx
+
+        if not self.token:
+            raise HaUnavailable("no Supervisor token")
+        body = {"task_name": task_name, "instructions": instructions, "structure": structure}
+        if entity_id:
+            body["entity_id"] = entity_id
+        async with httpx.AsyncClient(timeout=timeout_s) as http:
+            r = await http.post(f"{self.base}/api/services/ai_task/generate_data?return_response",
+                                headers={"Authorization": f"Bearer {self.token}"}, json=body)
+        if r.status_code != 200:
+            raise HaUnavailable(f"ai_task.generate_data failed ({r.status_code}): {r.text[:200]}")
+        return (r.json().get("service_response") or {}).get("data") or {}
+
     def pool(self) -> "CallPool":
         """Connections that last one run: a cell's calls share them."""
         return CallPool(self)
@@ -173,6 +190,10 @@ class HomeAssistant:
         u = self._users[1].get(user_id)
         return bool(u and u.get("is_active") and not u.get("system_generated")
                     and ADMIN_GROUP in (u.get("group_ids") or []))
+
+    def known_users(self) -> dict[str, str]:
+        """User id -> name from the last lookup (no request of its own)."""
+        return {uid: u.get("name") or "" for uid, u in (self._users[1] if self._users else {}).items()}
 
     async def self_check(self) -> str:
         parts = []

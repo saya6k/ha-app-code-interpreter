@@ -16,6 +16,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 import auditview
+from skills import SkillError
 
 INGRESS_PORT = 8098
 INGRESS_PROXY = "172.30.32.2"  # Supervisor's Ingress gateway on the hassio network
@@ -70,6 +71,34 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
                          user=user, result=result.get("error", "closed"))
         return JSONResponse(result, status_code=404 if "error" in result else 200)
 
+    async def list_skills(request: Request) -> Response:
+        names = svc.ha.known_users()
+        out = []
+        for user in svc.skills.users():
+            for s in svc.skills.list(user):
+                out.append({"user_id": user, "user": names.get(user), **s})
+        return JSONResponse({"skills": out, "workflow": svc.options.skill_workflow})
+
+    async def skill_action(request: Request) -> Response:
+        if request.headers.get(CSRF_HEADER) != "code-interpreter-ui":
+            return JSONResponse({"error": "missing X-Requested-With"}, status_code=403)
+        user, name, action = (request.path_params[k] for k in ("user", "name", "action"))
+        by = request.headers.get("x-remote-user-name") or request.headers.get("x-remote-user-id")
+        try:
+            if action == "approve":
+                svc.skills.approve(user, name, by)
+            elif action == "reject":
+                svc.skills.reject(user, name)
+            elif action == "delete":
+                svc.skills.delete(user, name)
+            else:
+                return JSONResponse({"error": "unknown action"}, status_code=404)
+        except SkillError as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        svc.audit.record(f"skill.{action}d" if action != "reject" else "skill.rejected", None,
+                         user_id=user, name=name, by=by)
+        return JSONResponse({"ok": True})
+
     async def audit_days(request: Request) -> Response:
         return JSONResponse({"days": auditview.days(audit_dir)})
 
@@ -97,6 +126,8 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
         Route("/", index),
         Route("/api/sessions", live_sessions),
         Route("/api/sessions/{sid}/close", close_session, methods=["POST"]),
+        Route("/api/skills", list_skills),
+        Route("/api/skills/{user}/{name}/{action}", skill_action, methods=["POST"]),
         Route("/api/audit/days", audit_days),
         Route("/api/audit/sessions", audit_sessions),
         Route("/api/audit/events", audit_events),
