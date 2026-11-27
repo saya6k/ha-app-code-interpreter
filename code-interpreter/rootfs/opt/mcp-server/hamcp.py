@@ -54,6 +54,27 @@ def unwrap(result) -> Any:
     return [c.model_dump(mode="json") for c in result.content]
 
 
+LIVE_CONTEXT = "homeassistant__GetLiveContext"
+
+
+def enrich(name: str, value: Any) -> Any:
+    """GetLiveContext returns {"result": "<header>:\\n<YAML list>"}: add the
+    same entities parsed, so cells filter objects instead of matching text.
+    The text stays; anything unexpected leaves the value as it was."""
+    if name != LIVE_CONTEXT or not isinstance(value, dict) or not isinstance(value.get("result"), str):
+        return value
+    import yaml
+
+    _, sep, body = value["result"].partition("\n")
+    try:
+        entities = yaml.safe_load(body) if sep else None
+    except yaml.YAMLError:
+        return value
+    if not isinstance(entities, list) or not all(isinstance(e, dict) for e in entities):
+        return value
+    return {**value, "entities": entities}
+
+
 def describe(tool) -> dict:
     a = tool.annotations
     return {
@@ -134,7 +155,7 @@ class HomeAssistant:
         if api not in APIS:
             raise ValueError(f"unknown API {api!r}")
         async with self._session(api, timeout_s) as s:
-            return unwrap(await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s)))
+            return enrich(name, unwrap(await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s))))
 
     async def generate_data(self, task_name: str, instructions: str, structure: dict,
                             entity_id: str | None = None, timeout_s: float = 120) -> dict:
@@ -260,7 +281,7 @@ class CallPool:
         except Exception as e:  # the connection broke (HA restarted, …): the next call reopens it
             await self._drop(api)
             raise HaUnavailable(HomeAssistant._why(e)) from None
-        return unwrap(result)
+        return enrich(name, unwrap(result))
 
     async def close(self) -> None:
         for api in list(self._open):

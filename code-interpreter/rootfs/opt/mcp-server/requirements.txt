@@ -1,3 +1,5 @@
 mcp==1.26.0
 # config/auth/list (who is an administrator) is only on the websocket API.
 websockets==17.4
+# GetLiveContext answers with YAML text: parsed into entities for cells.
+PyYAML==6.0.4
