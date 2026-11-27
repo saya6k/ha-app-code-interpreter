@@ -80,6 +80,7 @@ silently continues in a fresh one.
 | `ha.tools()` | The Home Assistant tools this person may use |
 | `ha.<domain>.<tool>(args)` | Call one, e.g. `ha.intent.HassTurnOff({name: "Kitchen light"})` or `ha.homeassistant.GetLiveContext()`; `ha.call("light__HassLightSet", args)` takes the full name |
 | `ha.admin` | Administrators only: read-only Home Assistant tools (see below) |
+| `ha.admin.hab(argv, {stdin})` | Administrators only: the Home Assistant Builder CLI, for example `["automation", "get", "night"]`; changes need `hab_allow` (see [Editing with hab](#editing-with-hab)) |
 | `` $`cmd ${x}` `` | Run `sh -c` in `/sandbox`; values are quoted. `.text()`, `.lines()`, `.json()`, `.nothrow()`, `.timeout(ms)`; a failing command throws `ShellError` |
 | `file(p)`, `write(p, s)` | Read (`.text()`, `.json()`, `.lines()`, `.exists()`) and write files; relative paths are under `/sandbox` |
 | `share.list(dir)`, `share.import(path, dest)`, `share.export(path)` | Home Assistant's `/share` (see [Files and /share](#files-and-share)) |
@@ -130,6 +131,46 @@ only asks the app to make a call.
   `session_id` is `session_not_found`.
 - Home Assistant does not pass on which satellite heard a command, so
   "turn off the light here" cannot be resolved; name the room or device.
+
+### Editing with hab
+
+`ha.admin.hab()` runs [Home Assistant Builder](https://github.com/balloob/home-assistant-build-cli)
+(`hab`) in the app for administrators. It can read and edit automations,
+scripts, scenes, dashboards, helpers, to-do lists and more, which the
+Home Assistant API above cannot.
+
+Its permissions work like Claude Code's Code Mode in `dontAsk` mode, made for
+runs that nobody can approve while they happen:
+
+- Every `hab` call is checked on its own. Commands `hab` marks as reading
+  run. Commands that change something run only if a rule in `hab_allow`
+  matches; by default the list is empty, so nothing is changed.
+- A rule is the command as typed, with `*` for any rest:
+  `automation update *`, `script create *`, `dashboard *`. A rule in
+  `hab_deny` wins over `hab_allow`.
+- Some commands no rule can allow: accounts and users, apps, backups,
+  updates, the host, network, ESPHome, integrations, running actions
+  directly (`action call`, `automation run`, `script run`,
+  `scene activate`, `event fire`) and `assist` (it would call the agent
+  again).
+- `-f`/`--file`, `--url`, `--config` and token flags are refused: data goes
+  in with `-d` or `{stdin}`.
+- Every call is audited as `ha.hab` with its arguments; refusals as
+  `policy.violation`.
+
+```yaml
+hab_allow:
+  - automation create *
+  - automation update *
+  - script update *
+hab_deny:
+  - automation update alarm_*
+```
+
+An allowed automation or script can later run any action when it triggers:
+allowing `automation update *` lets the agent decide what your automations
+do. Allow only what you want the agent to change, and read the `ha.hab`
+entries in the audit log.
 
 A script can do in one call what took the agent many: turning off every
 light in a loop, for example. That is the point, but it also means a
@@ -200,6 +241,8 @@ hosts.
 | `max_file_mb` | `20` | Largest file for `share.import` and `share.export` |
 | `export_dir` | `/share/code-interpreter` | Where `share.export` puts files; must be under `/share` |
 | `audit_retention_days` | `30` | Days of audit log to keep |
+| `hab_allow` | empty | `hab` commands that may change Home Assistant (see [Editing with hab](#editing-with-hab)) |
+| `hab_deny` | empty | `hab` commands refused even if `hab_allow` matches |
 
 ## Security model
 
@@ -260,6 +303,9 @@ record also shows as a one-line `[audit]` summary in the app log.
 - **`ha.admin` is undefined for an administrator:** the Model Context
   Protocol integration was added by hand instead of from discovery, or the
   user is not in the Administrators group.
+- **`NotAllowed` from `ha.admin.hab()`:** the command changes Home
+  Assistant and no `hab_allow` rule matches it, or it is one no rule can
+  allow; the message says which.
 - **`nested_call`:** a Home Assistant tool called by a script asked the
   conversation agent again. Avoid exposing such scripts to Assist.
 - **`Timeout when calling tool`:** the call ran into Home Assistant's 30 s
@@ -280,4 +326,5 @@ The app's source is at
 The sandbox bundles bubblewrap (LGPL-2.0-or-later), Node.js (MIT, with its
 bundled components under their own licenses; see `/opt/node/LICENSE` in the
 sandbox), acorn (MIT) and the Python packages listed above under their own
-open-source licenses. The icon and logo were made for this app.
+open-source licenses. The app includes Home Assistant Builder (`hab`), whose
+README states the Apache 2.0 license. The icon and logo were made for this app.

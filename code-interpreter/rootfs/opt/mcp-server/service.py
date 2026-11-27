@@ -18,6 +18,7 @@ from typing import Awaitable, Callable
 
 import egress
 import sharefs
+from hab import Hab, HabRefused, Rules
 from hamcp import ADMIN, APIS, ASSIST, HaToolError, HaUnavailable, HomeAssistant
 from audit import Audit, code_detail, sha256
 from policy import SandboxPolicy
@@ -54,6 +55,7 @@ class Options:
     max_file_mb: int = 20
     export_dir: Path = Path(DEFAULT_EXPORT_DIR)
     audit_retention_days: int = 30
+    hab_rules: Rules = field(default_factory=Rules)
 
 
 def load_options(path: Path = OPTIONS_PATH) -> Options:
@@ -85,6 +87,10 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
         max_file_mb=int(raw.get("max_file_mb", 20)),
         export_dir=export_dir,
         audit_retention_days=int(raw.get("audit_retention_days", 30)),
+        hab_rules=Rules(
+            allow=tuple(r.strip() for r in raw.get("hab_allow") or [] if r and r.strip()),
+            deny=tuple(r.strip() for r in raw.get("hab_deny") or [] if r and r.strip()),
+        ),
     )
 
 
@@ -154,6 +160,8 @@ class _CellCalls:
                 raise self._fail("file.export", e, path=path) from None
         if op in ("ha.list", "ha.call"):
             return await self._ha(op, args)
+        if op == "ha.hab":
+            return await self._hab(args)
         self.rejected(f"unknown call {op!r}")
         raise RpcError("RpcRejected", f"unknown call {op!r}")
 
@@ -161,6 +169,39 @@ class _CellCalls:
         self.service.audit.record("policy.violation", self.sandbox.sid, "denied", kind=kind, message=message,
                                   user_id=self.user_id)
         return RpcError(name, message)
+
+    async def _hab(self, args: dict):
+        svc, s = self.service, self.sandbox
+        if not await svc.ha.is_admin(self.user_id):
+            raise self._deny("admin", "AdminOnly", "ha.admin is only for Home Assistant administrators")
+        argv, stdin = args.get("argv"), args.get("stdin")
+        if stdin is not None and not isinstance(stdin, str):
+            raise RpcError("TypeError", "stdin must be a string")
+        try:
+            path, effect = await svc.hab.check(argv if isinstance(argv, list) else [])
+        except HabRefused as e:
+            raise self._deny(e.kind, "NotAllowed", str(e)) from None
+        except (OSError, ValueError, KeyError) as e:  # hab missing or its index unreadable
+            raise RpcError("HabUnavailable", f"{type(e).__name__}: {e}") from None
+        self.ha_calls += 1
+        if self.ha_calls > HA_CALLS_PER_CELL:
+            raise self._deny("rate", "RateLimited", f"more than {HA_CALLS_PER_CELL} Home Assistant calls in one run")
+        raw = json.dumps(argv)
+        detail = dict(command=path, side_effect=effect, argv=raw[:ARGS_AUDIT_CAP], argv_sha256=sha256(raw.encode()),
+                      stdin_chars=len(stdin or ""), user_id=self.user_id)
+        t0 = time.monotonic()
+        svc._ha_inflight[self.user_id] = svc._ha_inflight.get(self.user_id, 0) + 1
+        try:
+            out = await svc.hab.call(argv, stdin, max(1.0, self.deadline - time.monotonic()))
+        except (OSError, TimeoutError) as e:
+            svc.audit.record("ha.hab", s.sid, "error", **detail, ms=_ms(t0), error=type(e).__name__)
+            raise RpcError("HabUnavailable", f"{type(e).__name__}: {e}") from None
+        finally:
+            svc._ha_inflight[self.user_id] -= 1
+        ok = out.get("success") is not False
+        svc.audit.record("ha.hab", s.sid, "ok" if ok else "error", **detail, ms=_ms(t0),
+                         exit_code=out.get("exit_code"), output_chars=len(json.dumps(out, default=str)))
+        return out
 
     async def _allowed_tools(self, api: str) -> list[dict]:
         """What this caller may see of `api`, asked again on every call: admin
@@ -225,6 +266,7 @@ class Service:
     ) -> None:
         self.options = options
         self.ha = ha or HomeAssistant()
+        self.hab = Hab(options.hab_rules)
         # Home Assistant calls in flight per user: a run_code arriving while
         # one waits is that call coming back to us (a tool or script that asks
         # the conversation agent again). Refused, so it cannot recurse.

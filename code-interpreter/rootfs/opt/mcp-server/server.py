@@ -77,6 +77,10 @@ async def run_code(
       ha.call(name, args)                      the same by full name, e.g. "light__HassLightSet"
       ha.admin?                                administrators only: read-only tools (logs, history,
                                                traces, configuration); undefined for everyone else
+      ha.admin.hab(argv, {stdin?})             administrators: Home Assistant Builder CLI, e.g.
+                                               ["automation", "get", "id"]; returns hab's JSON envelope.
+                                               Reads run; changes only if the app's hab_allow rules
+                                               allow them (see hab schema --index for commands)
       $`cmd ${x}`                              sh -c in /sandbox, values quoted; .text() .lines()
                                                .json() .nothrow() .timeout(ms); non-zero exit throws
       file(p).text()/json()/lines()/exists(), write(p, s), sleep(ms), log(...), require(builtin)
@@ -140,6 +144,12 @@ async def main() -> None:
     else:
         log.info("[mcp-server] sandbox self-check ok")
     log.info("[hamcp] %s", await svc.ha.self_check())
+    try:
+        n = len(await svc.hab.index())
+        rules = svc.options.hab_rules
+        log.info("[hab] %d commands; %d allow and %d deny rules", n, len(rules.allow), len(rules.deny))
+    except Exception as e:  # noqa: BLE001 - ha.admin.hab() then answers HabUnavailable
+        log.error("[hab] unavailable: %s", e)
     reaper = asyncio.create_task(svc.run_reaper())
     pruner = asyncio.create_task(prune_audit())
     ui = _EmbeddedServer(uvicorn.Config(

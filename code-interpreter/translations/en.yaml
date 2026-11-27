@@ -36,6 +36,16 @@ configuration:
     name: Audit log retention (days)
     description: >-
       Days of audit log (/data/audit) to keep.
+  hab_allow:
+    name: hab commands that may change Home Assistant
+    description: >-
+      For administrators' ha.admin.hab(): commands as typed, * for any rest,
+      e.g. "automation update *". Reading commands always run. Empty =
+      nothing is changed.
+  hab_deny:
+    name: hab commands to refuse
+    description: >-
+      Refused even when hab_allow matches, e.g. "automation update alarm_*".
 network:
   8099/tcp: >-
     MCP endpoint (streamable HTTP at /mcp). Leave unset — Home Assistant
