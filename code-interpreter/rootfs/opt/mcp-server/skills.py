@@ -290,7 +290,7 @@ class SkillReviewer:
         self.entity_id = entity_id
         self.plugins = plugins
         self._history: dict[str, list[dict]] = {}
-        self._writing: set[str] = set()  # users whose requested skill is being written
+        self._writing: set[str] = set()  # users whose skills.request() is being written
         self._tasks: set[asyncio.Task] = set()
 
     def record(self, sid: str, code: str, error: str | None, ha_calls: int) -> None:
@@ -394,10 +394,18 @@ class SkillReviewer:
             raise SkillError("your last skill request is still being written; try again in a minute")
         self._writing.add(user_id)  # before the task starts, so a second call right away is refused too
         self.audit.record("skill.requested", sid, user_id=user_id, request=text[:REQUEST_CAP], via="conversation")
-        self._spawn(self._write(user_id, text, sid))
+        self._spawn(self._holding(user_id, self._write(user_id, text, sid)))
+
+    async def _holding(self, user_id: str, work) -> None:
+        """Run `work`, then free the user's turn however it ends. Only
+        skills.request() takes turns: an administrator's stdin request never
+        frees someone else's."""
+        try:
+            await work
+        finally:
+            self._writing.discard(user_id)
 
     async def _write(self, user_id: str, text: str, sid: str | None) -> None:
-        self._writing.add(user_id)
         try:
             admin = await self.ha.is_admin(user_id)
             tools = await self._tools(admin)
@@ -414,8 +422,6 @@ class SkillReviewer:
         except (HaUnavailable, SkillError, OSError, ValueError) as e:
             self.audit.record("skill.review", sid, "error", user_id=user_id, error=type(e).__name__, message=str(e)[:300])
             log.warning("[skills] request for %s failed: %s", user_id, e)
-        finally:
-            self._writing.discard(user_id)
 
     async def _tools(self, admin: bool) -> list[dict]:
         """What the user's cells could call: Assist tools, and for

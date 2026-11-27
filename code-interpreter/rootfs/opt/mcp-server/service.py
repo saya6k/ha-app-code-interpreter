@@ -207,6 +207,10 @@ class _CellCalls:
                     raise RpcError("TypeError", "skills.request(text) takes what the skill should do, as a string")
                 if not svc.reviewer.enabled:
                     raise RpcError("SkillsOff", "skill requests are off (the app's skill_workflow option)")
+                # Each asks the AI Task: counted with the run's Home Assistant calls, so a loop cannot run up its bill.
+                self.ha_calls += 1
+                if self.ha_calls > HA_CALLS_PER_CELL:
+                    raise self._deny("rate", "RateLimited", f"more than {HA_CALLS_PER_CELL} Home Assistant calls in one run")
                 svc.reviewer.ask(self.user_id, text, s.sid)
                 return {"requested": True, "note": (
                     "The skill is being written in the background. It waits for an administrator's approval "

@@ -40,7 +40,7 @@ class FakeHA:
 
     async def tools(self, api):
         if api not in TOOLS:
-            raise hamcp.HaUnavailable(f"Home Assistant has no API {api} for this MCP server (404)")
+            raise hamcp.HaUnavailable(f"Home Assistant has no API {api} (404)")
         return TOOLS[api]
 
 

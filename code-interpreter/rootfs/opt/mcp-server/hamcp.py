@@ -160,7 +160,7 @@ class HomeAssistant:
                 raise inner from None
             failed = next((s for s in reversed(statuses) if s >= 400), None)
             if failed == 404 and api not in APIS:
-                raise HaUnavailable(f"Home Assistant has no API {api} for this MCP server (404)") from None
+                raise HaUnavailable(f"Home Assistant has no API {api} (404)") from None
             raise HaUnavailable(self._why(inner, failed)) from None
 
     @staticmethod

@@ -895,3 +895,55 @@ def test_skill_requests_need_a_user_the_workflow_and_one_at_a_time(tmp_path):
     osid = asyncio.run(off.run_code("1 + 1", user_id="bob"))["session_id"]
     assert ask(off, osid, "bob")["error"].startswith("SkillsOff: ")
     assert off.ha.asked == []
+
+
+def test_a_finished_or_failed_request_frees_the_users_turn(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(svc, sid, "bob")["error"] is None
+    asyncio.run(svc.reviewer.wait())
+    assert ask(svc, sid, "bob")["error"] is None  # the first one is done
+
+    async def down(*a, **kw):
+        raise hamcp.HaUnavailable("ai_task.generate_data: ConnectError: refused")
+
+    asyncio.run(svc.reviewer.wait())
+    svc.ha.generate_data = down
+    assert ask(svc, sid, "bob")["error"] is None
+    asyncio.run(svc.reviewer.wait())
+    assert svc.reviewer._writing == set()
+    assert ask(svc, sid, "bob")["error"] is None  # a failed one too
+
+
+def test_a_stdin_request_does_not_free_a_conversation_requests_turn(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    gate = asyncio.Event()
+    real = svc.ha.generate_data
+
+    async def slow_for_the_conversation(task_name, instructions, *a, **kw):
+        if instructions.endswith("Request:\nslow"):
+            await gate.wait()
+        return await real(task_name, instructions, *a, **kw)
+
+    svc.ha.generate_data = slow_for_the_conversation
+
+    async def go():
+        sid = (await svc.run_code("1 + 1", user_id="bob"))["session_id"]
+        first = await svc.run_code('call skills.request {"request": "slow"}', session_id=sid, user_id="bob")
+        svc.handle_stdin(json.dumps({"type": "skill.request", "user": "bob", "request": "quick"}))  # finishes at once
+        for _ in range(20):
+            await asyncio.sleep(0)
+        second = await svc.run_code('call skills.request {"request": "c"}', session_id=sid, user_id="bob")
+        gate.set()
+        await svc.reviewer.wait()
+        return first, second
+
+    first, second = asyncio.run(go())
+    assert first["error"] is None and second["error"].startswith("SkillError: ")
+
+
+def test_skill_requests_count_toward_the_runs_call_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "HA_CALLS_PER_CELL", 0)
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(svc, sid, "bob")["error"].startswith("RateLimited: ")
