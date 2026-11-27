@@ -5,6 +5,7 @@ import json
 import pytest
 from pathlib import Path
 
+import hamcp
 import replclient
 import service
 from audit import Audit
@@ -19,7 +20,8 @@ class FakeSandbox:
         self.files = {}
         self.destroyed = False
 
-    async def run_code(self, code, timeout_s, reset=False, rpc=None):
+    async def run_code(self, code, timeout_s, reset=False, rpc=None, ctx=None):
+        self.last_ctx = ctx
         self.last_timeout = timeout_s
         if code.startswith("call "):  # call <op> <json args>: what the cell's share.* would send
             op, args = code[5:].split(" ", 1)
@@ -483,3 +485,106 @@ def test_cell_share_errors_reach_the_cell_and_the_audit(tmp_path):
     assert r["error"] == "RpcRejected: unknown call 'nope.op'"
     kinds = [e["detail"].get("kind") for e in events(tmp_path) if e["event"] == "policy.violation"]
     assert kinds.count("traversal") == 2 and "rpc" in kinds
+
+
+class FakeHA:
+    def __init__(self, admins=("alice",)):
+        self.admins = set(admins)
+        self.calls = []
+
+    async def is_admin(self, user_id):
+        return user_id in self.admins
+
+    async def tools(self, api):
+        if api == "assist":
+            return [{"name": "intent__HassTurnOff", "read_only": False, "destructive": True, "description": "", "input_schema": {}}]
+        return [{"name": "trace__get_trace", "read_only": True, "destructive": False, "description": "", "input_schema": {}},
+                {"name": "homeassistant__call_action", "read_only": False, "destructive": True, "description": "", "input_schema": {}}]
+
+    async def call(self, api, name, args, timeout_s):
+        self.calls.append((api, name, args))
+        if name == "intent__HassTurnOff" and args.get("name") == "boom":
+            raise hamcp.HaToolError("no such device")
+        return {"ok": True}
+
+
+def make_ha(tmp_path, **kw):
+    svc, created = make(tmp_path)
+    svc.ha = FakeHA(**kw)
+    return svc, created
+
+
+def ha_call(svc, sid, user, **args):
+    return asyncio.run(svc.run_code(f"call ha.call {json.dumps(args)}", session_id=sid, user_id=user))
+
+
+def test_ha_call_assist_and_audit(tmp_path):
+    svc, created = make_ha(tmp_path)
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert created[0].last_ctx == {"admin": False}
+    r = ha_call(svc, sid, "bob", api="assist", name="intent__HassTurnOff", args={"name": "Kitchen"})
+    assert json.loads(r["result"]) == {"ok": True}
+    r = ha_call(svc, sid, "bob", api="assist", name="intent__HassTurnOff", args={"name": "boom"})
+    assert r["error"] == "HaToolError: no such device"
+    r = ha_call(svc, sid, "bob", api="assist", name="nope__x")
+    assert r["error"].startswith("UnknownTool: ")
+    ev = [e for e in events(tmp_path) if e["event"] == "ha.call"]
+    assert [e["outcome"] for e in ev] == ["ok", "error"]
+    assert ev[0]["detail"]["tool"] == "intent__HassTurnOff" and ev[0]["detail"]["user_id"] == "bob"
+    assert ev[0]["detail"]["args"] == '{"name": "Kitchen"}'
+
+
+def test_ha_admin_is_for_admins_and_read_only_tools(tmp_path):
+    svc, created = make_ha(tmp_path)
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
+    assert created[0].last_ctx == {"admin": True}
+    listed = json.loads(asyncio.run(svc.run_code('call ha.list {"api": "homeassistant"}', session_id=sid, user_id="alice"))["result"])
+    assert [t["name"] for t in listed] == ["trace__get_trace"]
+    assert json.loads(ha_call(svc, sid, "alice", api="homeassistant", name="trace__get_trace")["result"]) == {"ok": True}
+    r = ha_call(svc, sid, "alice", api="homeassistant", name="homeassistant__call_action", args={"action": "homeassistant.restart"})
+    assert r["error"].startswith("NotAllowed: ")
+    other = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    r = ha_call(svc, other, "bob", api="homeassistant", name="trace__get_trace")
+    assert r["error"].startswith("AdminOnly: ")
+    r = ha_call(svc, other, "bob", api="everything", name="x")
+    assert r["error"].startswith("RpcRejected: ")
+    assert ("homeassistant", "homeassistant__call_action", {"action": "homeassistant.restart"}) not in svc.ha.calls
+    kinds = [e["detail"]["kind"] for e in events(tmp_path) if e["event"] == "policy.violation"]
+    assert kinds.count("admin") == 2 and "rpc" in kinds
+
+
+def test_ha_calls_per_run_are_capped(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "HA_CALLS_PER_CELL", 2)
+    svc, _ = make_ha(tmp_path)
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+
+    async def three():
+        calls = service._CellCalls(svc, svc.manager._sessions[sid].sandbox, None, deadline=1e12)
+        out = []
+        for _ in range(3):
+            try:
+                out.append(await calls.call("ha.call", {"api": "assist", "name": "intent__HassTurnOff", "args": {}}))
+            except replclient.RpcError as e:
+                out.append(e.name)
+        return out
+
+    assert asyncio.run(three()) == [{"ok": True}, {"ok": True}, "RateLimited"]
+
+
+def test_sessions_belong_to_their_user(tmp_path):
+    svc, _ = make_ha(tmp_path)
+    sid = asyncio.run(svc.run_code("set x=1", user_id="alice"))["session_id"]
+    assert asyncio.run(svc.run_code("x", session_id=sid, user_id="bob"))["error"] == "session_not_found"
+    assert asyncio.run(svc.run_code("x", session_id=sid))["error"] == "session_not_found"
+    assert asyncio.run(svc.run_code("x", session_id=sid, user_id="alice"))["result"] == "1"
+    assert [s["session_id"] for s in svc.list_sessions(user_id="alice")["sessions"]] == [sid]
+    assert svc.list_sessions(user_id="bob")["sessions"] == []
+    assert asyncio.run(svc.close_session(sid, user_id="bob"))["error"] == "session_not_found"
+
+
+def test_run_code_while_the_users_ha_call_is_in_flight_is_refused(tmp_path):
+    svc, _ = make_ha(tmp_path)
+    svc._ha_inflight["alice"] = 1
+    assert asyncio.run(svc.run_code("1 + 1", user_id="alice"))["error"] == "nested_call"
+    assert asyncio.run(svc.run_code("1 + 1", user_id="bob"))["result"] == "2"
+    assert any(e["detail"].get("kind") == "nested" for e in events(tmp_path) if e["event"] == "policy.violation")

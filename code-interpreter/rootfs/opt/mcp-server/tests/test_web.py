@@ -23,10 +23,12 @@ class FakeService:
         self.audit = audit
         self.open = {"abc": {"session_id": "abc", "created": 1.0, "last_used": 2.0, "expires_in_s": 90}}
 
-    def list_sessions(self):
+    def list_sessions(self, everyone=False):
+        assert everyone  # the panel shows every user's sessions
         return {"sessions": list(self.open.values())}
 
-    async def close_session(self, sid):
+    async def close_session(self, sid, everyone=False):
+        assert everyone
         if self.open.pop(sid, None) is None:
             return {"error": "session_not_found", "hint": "gone"}
         return {"closed": sid}

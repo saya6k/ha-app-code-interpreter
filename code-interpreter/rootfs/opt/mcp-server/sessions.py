@@ -28,6 +28,9 @@ class Session:
     sandbox: Any
     created: float
     last_used: float
+    # Home Assistant user the session belongs to (None: no user, e.g. a
+    # satellite's pipeline or a client outside HA). Others never see it.
+    owner: str | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -59,13 +62,14 @@ class SessionManager:
         return max(0.0, session.last_used + self._idle - self._clock())
 
     @contextlib.asynccontextmanager
-    async def acquire(self, session_id: str | None) -> AsyncIterator[Session]:
-        """Get (or create, if session_id is None) a session and hold its lock."""
+    async def acquire(self, session_id: str | None, owner: str | None = None) -> AsyncIterator[Session]:
+        """Get (or create, if session_id is None) `owner`'s session and hold its lock.
+        Another owner's session is reported as not found, not as forbidden."""
         if session_id is None:
-            session = await self._create()
+            session = await self._create(owner)
         else:
             session = self._sessions.get(session_id)
-            if session is None:
+            if session is None or session.owner != owner:
                 raise SessionNotFound(session_id)
         async with session.lock:
             if self._sessions.get(session.id) is not session:
@@ -100,7 +104,7 @@ class SessionManager:
             except Exception:  # keep the reaper alive
                 log.exception("[mcp-server] reaper failed")
 
-    async def _create(self) -> Session:
+    async def _create(self, owner: str | None = None) -> Session:
         async with self._create_lock:
             while len(self._sessions) >= self._max:
                 idle = [s for s in self._sessions.values() if not s.lock.locked()]
@@ -119,7 +123,7 @@ class SessionManager:
                     log.warning("[mcp-server] create failed sid=%s uid=%d retired", sid, uid)
                 raise
             now = self._clock()
-            session = Session(sid, uid, sandbox, created=now, last_used=now)
+            session = Session(sid, uid, sandbox, created=now, last_used=now, owner=owner)
             self._sessions[sid] = session
             return session
 

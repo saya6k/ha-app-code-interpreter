@@ -282,6 +282,28 @@ def test_call_tagged_with_another_request_is_refused(repl):
     assert r["result"] == "done" and calls.seen == [] and calls.refused == ["call from another request"]
 
 
+def test_ha_proxy_maps_domain_and_tool_to_a_call(repl):
+    calls = FakeCalls()
+    r = run_with(repl, "(await ha.intent.HassTurnOff({name: 'Kitchen'})).args", calls)
+    assert r["result"] == '{"api":"assist","name":"intent__HassTurnOff","args":{"name":"Kitchen"}}'
+    r = run_with(repl, "[(await ha.tools()).op, (await ha.call('x__y')).args.name]", calls)
+    assert r["result"] == '["ha.list","x__y"]'
+
+
+def test_ha_admin_exists_only_in_an_admins_cell(repl):
+    calls = FakeCalls()
+    r = repl.do(repl.client.run("typeof ha.admin", timeout_s=10, rpc=calls))
+    assert r["result"] == "undefined"
+    r = repl.do(repl.client.run("(await ha.admin.trace.get_trace({})).args.api", timeout_s=10, rpc=calls,
+                                ctx={"admin": True}))
+    assert r["result"] == "homeassistant"
+    assert repl.do(repl.client.run("typeof ha.admin", timeout_s=10, rpc=calls))["result"] == "undefined"
+
+
+def test_ha_namespaces_are_not_thenables(repl):
+    assert repl("const d = await ha.intent; typeof d.HassTurnOn")["result"] == "function"
+
+
 def test_calls_without_a_handler_are_refused(repl):
     r = repl("await share.list().catch((e) => e.name)")
     assert r["result"] == "RpcRejected"

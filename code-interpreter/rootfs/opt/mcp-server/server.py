@@ -22,6 +22,18 @@ mcp = FastMCP("Code Interpreter", host="0.0.0.0", port=8099, stateless_http=True
 HEARTBEAT_S = 2.0
 
 
+META_USER_ID = "io.home-assistant/user_id"
+
+
+def caller(ctx: Context) -> str | None:
+    """The Home Assistant user in the conversation. Home Assistant's MCP client
+    sends it only to servers it found through Supervisor discovery (this app);
+    any other client, or a pipeline with no user, is anonymous."""
+    meta = ctx.request_context.meta
+    user = (getattr(meta, "model_extra", None) or {}).get(META_USER_ID) if meta else None
+    return user if isinstance(user, str) and user else None
+
+
 async def with_heartbeat(ctx: Context, coro):
     """Run a tool body while sending a log notification every HEARTBEAT_S on
     the request's SSE stream. Home Assistant's MCP client reads with httpx's
@@ -62,6 +74,14 @@ async def run_code(
     write(p, s), sleep(ms), log(...), require for Node built-ins, and for
     Home Assistant's /share: await share.list(dir?), share.import(share_path,
     dest?), share.export(path) (to /share/code-interpreter/<session>/).
+    Home Assistant itself: await ha.tools() lists the tools for entities
+    exposed to Assist; call one as ha.<domain>.<tool>(args), e.g.
+    await ha.intent.HassTurnOff({name: 'Kitchen light'}) or
+    await ha.homeassistant.GetLiveContext(), or ha.call('<domain>__<tool>',
+    args). Filter state in code and return only what you need. Name rooms
+    and devices explicitly ("here" is not known). For administrators only,
+    ha.admin offers read-only tools (logs, history, traces, configuration):
+    check await ha.admin?.tools(). At most 50 Home Assistant calls per run.
     Files live under /sandbox (256 MB); /tmp is
     scratch (64 MB). Use import_from_share / export_to_share to move files
     between /sandbox and Home Assistant's /share.
@@ -81,7 +101,7 @@ async def run_code(
     interrupted with its variables kept (a loop after an await cannot be
     interrupted: the REPL restarts, files stay). Other clients may allow up to 600.
     """
-    return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset))
+    return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset, user_id=caller(ctx)))
 
 
 @mcp.tool()
@@ -94,29 +114,29 @@ async def run_command(
     Returns stdout, stderr and exit_code. Same time limit as run_code: keep
     timeout_s at 25 or lower under Home Assistant (it ends calls at 30 s).
     """
-    return await with_heartbeat(ctx, svc.run_command(command, session_id, timeout_s))
+    return await with_heartbeat(ctx, svc.run_command(command, session_id, timeout_s, user_id=caller(ctx)))
 
 
 @mcp.tool()
-async def list_files(session_id: str, path: str = "/sandbox") -> dict:
+async def list_files(session_id: str, ctx: Context, path: str = "/sandbox") -> dict:
     """List files in a session's /sandbox (name, type, size)."""
-    return await svc.list_files(session_id, path)
+    return await svc.list_files(session_id, path, user_id=caller(ctx))
 
 
 @mcp.tool()
-async def read_file(session_id: str, path: str) -> dict:
+async def read_file(session_id: str, path: str, ctx: Context) -> dict:
     """Read a text file from /sandbox (up to 16000 characters).
 
     For binary files only the size and MIME type are returned; use
     export_to_share to hand them to the user.
     """
-    return await svc.read_file(session_id, path)
+    return await svc.read_file(session_id, path, user_id=caller(ctx))
 
 
 @mcp.tool()
-async def write_file(session_id: str, path: str, content: str) -> dict:
+async def write_file(session_id: str, path: str, content: str, ctx: Context) -> dict:
     """Write a text file into /sandbox (parent directories are created)."""
-    return await svc.write_file(session_id, path, content)
+    return await svc.write_file(session_id, path, content, user_id=caller(ctx))
 
 
 @mcp.tool()
@@ -128,7 +148,7 @@ async def import_from_share(
     share_path is relative to /share (e.g. "energy.csv"). Omit session_id to
     start a new session. dest defaults to the file name in /sandbox.
     """
-    return await with_heartbeat(ctx, svc.import_from_share(share_path, session_id, dest))
+    return await with_heartbeat(ctx, svc.import_from_share(share_path, session_id, dest, user_id=caller(ctx)))
 
 
 @mcp.tool()
@@ -138,19 +158,19 @@ async def export_to_share(session_id: str, path: str, ctx: Context) -> dict:
     Returns share_path, under /share/code-interpreter/<session_id>/. Tell the
     user that path.
     """
-    return await with_heartbeat(ctx, svc.export_to_share(session_id, path))
+    return await with_heartbeat(ctx, svc.export_to_share(session_id, path, user_id=caller(ctx)))
 
 
 @mcp.tool()
-async def list_sessions() -> dict:
-    """List active sandbox sessions and how long until each expires when idle."""
-    return svc.list_sessions()
+async def list_sessions(ctx: Context) -> dict:
+    """List your active sandbox sessions and how long until each expires when idle."""
+    return svc.list_sessions(user_id=caller(ctx))
 
 
 @mcp.tool()
-async def close_session(session_id: str) -> dict:
+async def close_session(session_id: str, ctx: Context) -> dict:
     """Close a sandbox session now, discarding its variables and files."""
-    return await svc.close_session(session_id)
+    return await svc.close_session(session_id, user_id=caller(ctx))
 
 
 async def prune_audit() -> None:
@@ -176,6 +196,7 @@ async def main() -> None:
         log.error("[mcp-server] sandbox self-check FAILED: %s", problem)
     else:
         log.info("[mcp-server] sandbox self-check ok")
+    log.info("[hamcp] %s", await svc.ha.self_check())
     reaper = asyncio.create_task(svc.run_reaper())
     pruner = asyncio.create_task(prune_audit())
     ui = _EmbeddedServer(uvicorn.Config(

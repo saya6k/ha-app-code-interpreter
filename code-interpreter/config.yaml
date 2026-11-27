@@ -16,6 +16,9 @@ ingress: true
 ingress_port: 8098
 panel_icon: mdi:language-python
 panel_title: Code Interpreter
+# /core/api/mcp/<api> and the websocket API through the Supervisor proxy:
+# the app calls Home Assistant's MCP Server for the cells (ha.*).
+homeassistant_api: true
 map:
   - share:rw
 discovery:

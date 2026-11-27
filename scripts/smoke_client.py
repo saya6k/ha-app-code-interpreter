@@ -221,6 +221,9 @@ async def main(idle_wait_s: int, mode: str) -> int:
             res = json.loads(r["result"]) if r.get("result") else {}
             check("cell share.list/import/export", res.get("listed") is True and res.get("got") == "/sandbox/via-cell.csv"
                   and res.get("out") == f"/share/code-interpreter/{sid}/via-cell.csv" and res.get("refused") == "ShareError", r)
+            r = payload(await call("run_code", session_id=sid, code=(
+                "[await ha.tools().catch((e) => e.name), typeof ha.admin]")))
+            check("ha.* without Home Assistant: HaUnavailable, no ha.admin", r.get("result") == '["HaUnavailable","undefined"]', r)
             r = payload(await call("import_from_share", share_path="../etc/passwd", session_id=sid))
             check("import outside /share refused", r.get("error") == "share_error", r)
             r = payload(await call("read_file", session_id=sid, path="/etc/passwd"))

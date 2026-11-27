@@ -190,6 +190,35 @@ export function installShare(target, rpc) {
   };
 }
 
+// ha.<domain>.<tool>(args) calls Home Assistant's tool "<domain>__<tool>" (the
+// names its MCP Server gives, e.g. intent__HassTurnOn); ha.call(name, args)
+// takes a full name, ha.tools() lists them. The app decides what each call
+// may reach; nothing here is a check.
+function haNamespace(rpc, api) {
+  const call = (name, args = {}) => rpc("ha.call", { api, name: String(name), args });
+  const tools = () => rpc("ha.list", { api });
+  const domains = new Map();
+  const notThenable = (key) => typeof key !== "string" || key === "then" || key === "toJSON";
+  return new Proxy({ call, tools }, {
+    get(base, key) {
+      if (key in base || notThenable(key)) return base[key];
+      if (!domains.has(key)) {
+        domains.set(key, new Proxy({}, {
+          get: (_, tool) => (notThenable(tool) ? undefined : (args) => call(`${key}__${tool}`, args)),
+        }));
+      }
+      return domains.get(key);
+    },
+  });
+}
+
+export function installHa(target, rpc, admin) {
+  const ha = haNamespace(rpc, "assist");
+  // Defined only in an administrator's cells: `ha.admin?.tools()` tells.
+  const adminApi = admin ? haNamespace(rpc, "homeassistant") : undefined;
+  target.ha = new Proxy(ha, { get: (base, key) => (key === "admin" ? adminApi : base[key]) });
+}
+
 export function install(target) {
   Object.assign(target, { $, file, write, sleep, log, ShellError });
 }
