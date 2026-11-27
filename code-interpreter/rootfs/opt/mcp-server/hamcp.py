@@ -136,6 +136,10 @@ class HomeAssistant:
         async with self._session(api, timeout_s) as s:
             return unwrap(await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s)))
 
+    def pool(self) -> "CallPool":
+        """Connections that last one run: a cell's calls share them."""
+        return CallPool(self)
+
     async def _fetch_users(self) -> list[dict]:
         import websockets
 
@@ -178,3 +182,62 @@ class HomeAssistant:
             except HaUnavailable as e:
                 parts.append(f"{api}: {e}")
         return ", ".join(parts)
+
+
+class CallPool:
+    """One MCP session per API for the length of a run, instead of one per call
+    (each new session costs an initialize round trip: ~100 ms a call on a
+    Raspberry Pi). The SDK's session lives in an anyio task group that must be
+    left by the task that entered it, so a keeper task holds each session
+    open until close()."""
+
+    OPEN_TIMEOUT_S = 15.0
+
+    def __init__(self, ha: HomeAssistant) -> None:
+        self.ha = ha
+        self._open: dict[str, tuple[asyncio.Future, asyncio.Event, asyncio.Task]] = {}
+        self._lock = asyncio.Lock()
+
+    async def _keeper(self, api: str, ready: asyncio.Future, stop: asyncio.Event) -> None:
+        try:
+            async with self.ha._session(api, self.OPEN_TIMEOUT_S) as s:
+                ready.set_result(s)
+                await stop.wait()
+        except BaseException as e:  # noqa: BLE001 - handed to whoever waits for the session
+            if not ready.done():
+                ready.set_exception(e if isinstance(e, Exception) else HaUnavailable(str(e)))
+
+    async def _get(self, api: str):
+        async with self._lock:
+            if api not in self._open:
+                ready = asyncio.get_running_loop().create_future()
+                stop = asyncio.Event()
+                self._open[api] = (ready, stop, asyncio.ensure_future(self._keeper(api, ready, stop)))
+            ready = self._open[api][0]
+        try:
+            return await asyncio.shield(ready)
+        except Exception:
+            await self._drop(api)
+            raise
+
+    async def _drop(self, api: str) -> None:
+        entry = self._open.pop(api, None)
+        if entry:
+            entry[1].set()
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.wait_for(entry[2], 5)
+
+    async def call(self, api: str, name: str, args: dict, timeout_s: float) -> Any:
+        if api not in APIS:
+            raise ValueError(f"unknown API {api!r}")
+        s = await self._get(api)
+        try:
+            result = await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s))
+        except Exception as e:  # the connection broke (HA restarted, …): the next call reopens it
+            await self._drop(api)
+            raise HaUnavailable(HomeAssistant._why(e)) from None
+        return unwrap(result)
+
+    async def close(self) -> None:
+        for api in list(self._open):
+            await self._drop(api)

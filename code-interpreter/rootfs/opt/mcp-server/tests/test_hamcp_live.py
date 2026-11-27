@@ -80,3 +80,51 @@ def test_caller_reads_the_user_from_request_meta():
     assert server.caller(SimpleNamespace(request_context=SimpleNamespace(meta=None))) is None
     odd = RequestParams.Meta.model_validate({"io.home-assistant/user_id": 5})
     assert server.caller(SimpleNamespace(request_context=SimpleNamespace(meta=odd))) is None
+
+
+def test_a_pool_reuses_one_session_for_many_calls(base):
+    ha = HomeAssistant(token="t", base=base)
+    opened = []
+    real = ha._session
+
+    def counting(api, timeout_s):
+        opened.append(api)
+        return real(api, timeout_s)
+
+    ha._session = counting
+
+    async def go():
+        pool = ha.pool()
+        try:
+            t0 = time.monotonic()
+            many = await asyncio.gather(*(pool.call("assist", "intent__HassTurnOff", {"name": f"L{i}"}, 10) for i in range(10)))
+            pooled = time.monotonic() - t0
+            with pytest.raises(HaToolError, match="boom"):
+                await pool.call("assist", "intent__HassTurnOff", {"name": "boom"}, 10)
+            after_error = await pool.call("assist", "homeassistant__GetLiveContext", {}, 10)
+        finally:
+            await pool.close()
+        t0 = time.monotonic()
+        for i in range(10):
+            await ha.call("assist", "intent__HassTurnOff", {"name": f"L{i}"}, 10)
+        separate = time.monotonic() - t0
+        return many, after_error, pooled, separate
+
+    many, after_error, pooled, separate = asyncio.run(go())
+    assert len(many) == 10 and "lights are on" in str(after_error)
+    assert opened.count("assist") == 1 + 10  # one pooled session, then one per separate call
+    assert pooled < separate, (pooled, separate)
+
+
+def test_a_pool_reports_a_missing_api_and_leaves_no_task(base):
+    ha = HomeAssistant(token="t", base=base)
+
+    async def go():
+        pool = ha.pool()
+        with pytest.raises(HaUnavailable, match="Model Context Protocol Server integration"):
+            await pool.call("homeassistant", "trace__list_traces", {}, 10)
+        await pool.close()
+        await asyncio.sleep(0.1)
+        return [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+
+    assert asyncio.run(go()) == []
