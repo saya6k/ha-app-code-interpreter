@@ -15,6 +15,8 @@ ENTRIES = [
 TOOLS = {
     "mcp-M1": [{"name": "memory__search", "read_only": True}, {"name": "memory__save", "read_only": False}],
     "mcp-C1": [{"name": "code_interpreter__run_code", "read_only": False}],
+    "wardrowbe__W9": [{"name": "wardrowbe__suggest_outfit", "read_only": False}],
+    "bundle__B1": [{"name": "light__HassTurnOn", "read_only": False}, {"name": "code-interpreter__run_code", "read_only": False}],
 }
 
 
@@ -37,6 +39,8 @@ class FakeHA:
         return ENTRIES
 
     async def tools(self, api):
+        if api not in TOOLS:
+            raise hamcp.HaUnavailable(f"Home Assistant has no API {api} (404)")
         return TOOLS[api]
 
 
@@ -86,3 +90,24 @@ def test_resolution_is_cached_and_nothing_configured_asks_nothing():
 def test_describe_reports_unavailable_home_assistant():
     p = plugins(Plugin("Memory", "all"), ha=FakeHA(down=True))
     assert asyncio.run(p.describe()).startswith("unavailable")
+
+
+def test_a_plugin_can_name_an_llm_api_directly():
+    ha = FakeHA()
+    p = plugins(Plugin("Wardrowbe", "all", api="wardrowbe__W9"), ha=ha)
+    assert asyncio.run(p.resolve()) == [(Plugin("Wardrowbe", "all", "wardrowbe__W9"), "wardrowbe__W9")]
+    assert ha.listed == 0  # no MCP client entries needed
+    assert [t["name"] for t in asyncio.run(p.tools(admin=False))] == ["wardrowbe__suggest_outfit"]
+
+
+@pytest.mark.parametrize("api,problem", [("bundle__B1", "this app itself"), ("nope__N1", "404")])
+def test_named_apis_that_bundle_this_app_or_do_not_exist_are_left_out(api, problem):
+    p = plugins(Plugin("x", "all", api=api))
+    assert asyncio.run(p.resolve()) == [] and problem in p.problems[0]
+
+
+@pytest.mark.parametrize("api,ok", [("wardrowbe__W9", True), ("mcp-M1", True), ("assist", False),
+                                    ("homeassistant", False), ("a/b", False), ("", False)])
+def test_plugins_never_name_the_ha_apis(api, ok):
+    from plugins import valid_api
+    assert valid_api(api) is ok

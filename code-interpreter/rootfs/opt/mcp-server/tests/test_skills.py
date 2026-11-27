@@ -33,7 +33,7 @@ def test_skills_are_per_user(tmp_path):
     assert st.list("u2") == [] and st.get("u2", "a") is None and st.users() == ["u1"]
 
 
-@pytest.mark.parametrize("name", ["", "Bad", "1x", "../x", "a" * 41, "a-b", "list"])
+@pytest.mark.parametrize("name", ["", "Bad", "1x", "../x", "a" * 41, "a-b", "list", "request"])
 def test_invalid_names_are_refused(tmp_path, name):
     with pytest.raises(SkillError):
         SkillStore(tmp_path).propose("u1", name, "", "", CODE, {})

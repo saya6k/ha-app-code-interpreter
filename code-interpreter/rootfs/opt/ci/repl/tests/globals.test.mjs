@@ -8,7 +8,7 @@ import test from "node:test";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sbx-"));
 process.env.CI_SANDBOX_DIR = dir;
 const g = {};
-const { install, installPlugins, quote, ShellError } = await import("../globals.mjs");
+const { install, installPlugins, installSkills, quote, ShellError } = await import("../globals.mjs");
 install(g);
 const { $, file, write } = g;
 
@@ -89,4 +89,12 @@ test("plugins map <server>.<tool> to the full tool name, and are undefined when 
   assert.equal(target.plugins.then, undefined); // awaiting the namespace does not call a tool
   installPlugins(target, rpc, false);
   assert.equal(target.plugins, undefined);
+});
+
+test("skills.request sends the text; it is not taken for a skill name", async () => {
+  const sent = [];
+  const target = {};
+  installSkills(target, async (op, args) => (sent.push([op, args]), { requested: true }));
+  assert.deepEqual(await target.skills.request("today's outfit"), { requested: true });
+  assert.deepEqual(sent, [["skills.request", { request: "today's outfit" }]]);
 });

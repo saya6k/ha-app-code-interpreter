@@ -28,13 +28,15 @@ ASSIST, ADMIN = "assist", "homeassistant"
 APIS = (ASSIST, ADMIN)
 CACHE_S = 60.0
 ADMIN_GROUP = "system-admin"
-# The API the MCP client integration registers for each server it reaches
-# ("mcp-" + config entry id): plugins (SPEC-code-mode §3.12).
-PLUGIN_API = re.compile(r"^mcp-[0-9A-Za-z]+$")
+# An LLM API id as Home Assistant's MCP Server serves it (/api/mcp/<id>), for
+# plugins (SPEC-code-mode §3.12): "mcp-<entry id>" for each MCP server the MCP
+# client integration reaches, "<domain>__<entry id>" or the like for other
+# integrations' APIs. Which ones a cell may use is decided by plugins.py.
+API_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 
 
 def check_api(api: str) -> None:
-    if api not in APIS and not PLUGIN_API.match(api):
+    if api not in APIS and not API_ID.match(api):
         raise ValueError(f"unknown API {api!r}")
 
 
@@ -86,7 +88,7 @@ def unwrap_plugin(value: Any) -> Any:
 
 def _value(api: str, name: str, result) -> Any:
     value = unwrap(result)
-    return unwrap_plugin(value) if PLUGIN_API.match(api) else enrich(name, value)
+    return enrich(name, value) if api in APIS else unwrap_plugin(value)
 
 
 LIVE_CONTEXT = "homeassistant__GetLiveContext"
@@ -157,8 +159,8 @@ class HomeAssistant:
             if isinstance(inner, HaToolError):  # raised by unwrap() inside the session's task group
                 raise inner from None
             failed = next((s for s in reversed(statuses) if s >= 400), None)
-            if failed == 404 and PLUGIN_API.match(api):
-                raise HaUnavailable(f"Home Assistant has no API {api} for this MCP server (404)") from None
+            if failed == 404 and api not in APIS:
+                raise HaUnavailable(f"Home Assistant has no API {api} (404)") from None
             raise HaUnavailable(self._why(inner, failed)) from None
 
     @staticmethod

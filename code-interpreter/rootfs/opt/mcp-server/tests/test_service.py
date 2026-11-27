@@ -850,3 +850,100 @@ def test_a_request_offers_the_users_plugin_tools(tmp_path):
     request(svc, json.dumps({"type": "skill.request", "user": "bob", "request": "remember"}))
     ((instructions, _),) = svc.ha.asked
     assert "plugin.memory__search" in instructions and "secrets__read" not in instructions
+
+
+def test_plugin_options_take_an_api_id_but_never_the_ha_apis(tmp_path):
+    svc, _ = make(tmp_path, {"plugins": [{"name": "Wardrowbe", "access": "admin", "api": "wardrowbe__W9"},
+                                         {"name": "sneaky", "access": "all", "api": "homeassistant"},
+                                         {"name": "path", "access": "all", "api": "../x"}]})
+    assert [(p.name, p.api) for p in svc.options.plugins] == [("Wardrowbe", "wardrowbe__W9")]
+
+
+def ask(svc, sid, user, text="today's outfit"):
+    return asyncio.run(svc.run_code(f"call skills.request {json.dumps({'request': text})}", session_id=sid, user_id=user))
+
+
+def test_a_skill_asked_for_in_a_conversation_becomes_pending_for_the_speaker(tmp_path):
+    answer = {"save": True, "name": "todays_outfit", "description": "d", "params": "{}",
+              "code": "async () => plugins.wardrowbe.suggest_outfit({})", "reason": "asked",
+              "uses": '{"plugins": ["wardrowbe__suggest_outfit"]}'}
+    svc, _ = skill_service(tmp_path, answer)
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    r = ask(svc, sid, "bob")
+    assert json.loads(r["result"])["requested"] is True
+    asyncio.run(svc.reviewer.wait())
+    ((instructions, _),) = svc.ha.asked
+    assert "today's outfit" in instructions
+    pending = svc.skills.get("bob", "todays_outfit")["pending"]
+    assert pending["source"]["request"] == "today's outfit" and pending["source"]["session_id"] == sid
+    assert svc.skills.get("bob", "todays_outfit")["active"] is None  # nothing runs before approval
+    (ev,) = [e for e in events(tmp_path) if e["event"] == "skill.requested"]
+    assert ev["session_id"] == sid and ev["detail"]["via"] == "conversation" and ev["detail"]["user_id"] == "bob"
+
+
+def test_skill_requests_need_a_user_the_workflow_and_one_at_a_time(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    anon = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    assert ask(svc, anon, None)["error"].startswith("NoUser: ")
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(svc, sid, "bob", "  ")["error"].startswith("TypeError: ")
+    svc.reviewer._writing.add("bob")  # a request of bob's is being written
+    assert ask(svc, sid, "bob")["error"].startswith("SkillError: ")
+    svc.reviewer._writing.clear()
+    (tmp_path / "off").mkdir()
+    off, _ = skill_service(tmp_path / "off", {}, skill_workflow=False)
+    osid = asyncio.run(off.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(off, osid, "bob")["error"].startswith("SkillsOff: ")
+    assert off.ha.asked == []
+
+
+def test_a_finished_or_failed_request_frees_the_users_turn(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(svc, sid, "bob")["error"] is None
+    asyncio.run(svc.reviewer.wait())
+    assert ask(svc, sid, "bob")["error"] is None  # the first one is done
+
+    async def down(*a, **kw):
+        raise hamcp.HaUnavailable("ai_task.generate_data: ConnectError: refused")
+
+    asyncio.run(svc.reviewer.wait())
+    svc.ha.generate_data = down
+    assert ask(svc, sid, "bob")["error"] is None
+    asyncio.run(svc.reviewer.wait())
+    assert svc.reviewer._writing == set()
+    assert ask(svc, sid, "bob")["error"] is None  # a failed one too
+
+
+def test_a_stdin_request_does_not_free_a_conversation_requests_turn(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    gate = asyncio.Event()
+    real = svc.ha.generate_data
+
+    async def slow_for_the_conversation(task_name, instructions, *a, **kw):
+        if instructions.endswith("Request:\nslow"):
+            await gate.wait()
+        return await real(task_name, instructions, *a, **kw)
+
+    svc.ha.generate_data = slow_for_the_conversation
+
+    async def go():
+        sid = (await svc.run_code("1 + 1", user_id="bob"))["session_id"]
+        first = await svc.run_code('call skills.request {"request": "slow"}', session_id=sid, user_id="bob")
+        svc.handle_stdin(json.dumps({"type": "skill.request", "user": "bob", "request": "quick"}))  # finishes at once
+        for _ in range(20):
+            await asyncio.sleep(0)
+        second = await svc.run_code('call skills.request {"request": "c"}', session_id=sid, user_id="bob")
+        gate.set()
+        await svc.reviewer.wait()
+        return first, second
+
+    first, second = asyncio.run(go())
+    assert first["error"] is None and second["error"].startswith("SkillError: ")
+
+
+def test_skill_requests_count_toward_the_runs_call_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(service, "HA_CALLS_PER_CELL", 0)
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert ask(svc, sid, "bob")["error"].startswith("RateLimited: ")

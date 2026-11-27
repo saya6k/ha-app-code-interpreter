@@ -23,7 +23,7 @@ log = logging.getLogger("mcp-server")
 
 ROOT = Path("/data/skills")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
-RESERVED = frozenset({"list"})  # skills.list() is the listing, so a skill by that name could never run
+RESERVED = frozenset({"list", "request"})  # skills.list() and skills.request(): a skill by those names could never run
 USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CODE_CAP = 8192
 TEXT_CAP = 500
@@ -290,6 +290,7 @@ class SkillReviewer:
         self.entity_id = entity_id
         self.plugins = plugins
         self._history: dict[str, list[dict]] = {}
+        self._writing: set[str] = set()  # users whose skills.request() is being written
         self._tasks: set[asyncio.Task] = set()
 
     def record(self, sid: str, code: str, error: str | None, ha_calls: int) -> None:
@@ -384,6 +385,27 @@ class SkillReviewer:
             log.warning("[skills] request for %r refused: %s", who, e)
             return
         self.audit.record("skill.requested", None, **detail, user_id=user_id)
+        await self._write(user_id, text, None)
+
+    def ask(self, user_id: str, text: str, sid: str) -> None:
+        """A skill the speaker asked for in a conversation (skills.request()
+        in a cell): written in the background, pending like any proposal."""
+        if user_id in self._writing:
+            raise SkillError("your last skill request is still being written; try again in a minute")
+        self._writing.add(user_id)  # before the task starts, so a second call right away is refused too
+        self.audit.record("skill.requested", sid, user_id=user_id, request=text[:REQUEST_CAP], via="conversation")
+        self._spawn(self._holding(user_id, self._write(user_id, text, sid)))
+
+    async def _holding(self, user_id: str, work) -> None:
+        """Run `work`, then free the user's turn however it ends. Only
+        skills.request() takes turns: an administrator's stdin request never
+        frees someone else's."""
+        try:
+            await work
+        finally:
+            self._writing.discard(user_id)
+
+    async def _write(self, user_id: str, text: str, sid: str | None) -> None:
         try:
             admin = await self.ha.is_admin(user_id)
             tools = await self._tools(admin)
@@ -396,9 +418,9 @@ class SkillReviewer:
                 "Code Interpreter skill request", request_instructions(text, self._existing(user_id), tools, admin),
                 REVIEW_STRUCTURE, entity_id=self.entity_id,
             )
-            await self._propose(user_id, None, data, {"request": text[:REQUEST_CAP]})
+            await self._propose(user_id, sid, data, {"request": text[:REQUEST_CAP], **({"session_id": sid} if sid else {})})
         except (HaUnavailable, SkillError, OSError, ValueError) as e:
-            self.audit.record("skill.review", None, "error", user_id=user_id, error=type(e).__name__, message=str(e)[:300])
+            self.audit.record("skill.review", sid, "error", user_id=user_id, error=type(e).__name__, message=str(e)[:300])
             log.warning("[skills] request for %s failed: %s", user_id, e)
 
     async def _tools(self, admin: bool) -> list[dict]:

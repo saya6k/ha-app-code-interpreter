@@ -245,7 +245,11 @@ export function installPlugins(target, rpc, enabled) {
 // skills.list(); skills.<name>(args) runs the user's approved skill: the app
 // hands back its code each time (approvals can change), compiled here.
 export function installSkills(target, rpc) {
-  const base = { list: () => rpc("skills.list", {}) };
+  const base = {
+    list: () => rpc("skills.list", {}),
+    // Ask for a new skill; it waits for an administrator's approval.
+    request: (text) => rpc("skills.request", { request: String(text) }),
+  };
   target.skills = new Proxy(base, {
     get(b, key) {
       if (key in b || typeof key !== "string" || key === "then" || key === "toJSON") return b[key];
