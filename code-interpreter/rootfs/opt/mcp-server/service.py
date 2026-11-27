@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import mimetypes
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -37,7 +36,6 @@ MAX_TIMEOUT_S = 600
 DEFAULT_TIMEOUT_S = 25
 MIB = 1 << 20
 DEFAULT_EXPORT_DIR = "/share/code-interpreter"
-TEXT_LIMIT = 16000  # chars returned by read_file
 NEW_FILES_CAP = 20
 HA_CALLS_PER_CELL = 50  # a runaway loop must not flip every light in the house
 ARGS_AUDIT_CAP = 4096
@@ -104,23 +102,6 @@ def _snapshot(listing: dict) -> dict[str, tuple]:
         for e in listing["entries"]
         if e["type"] == "file" and not any(part.startswith(".") for part in e["path"].split("/"))
     }
-
-
-def _text_or_binary(path: str, data: bytes, size: int) -> dict:
-    """Text if it decodes as UTF-8 (a multi-byte char cut at the limit is fine)."""
-    cut = len(data) < size
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError as e:
-        if cut and e.start >= len(data) - 3:
-            text = data[: e.start].decode("utf-8", errors="strict")
-        else:
-            text = None
-    if text is None or "\x00" in text:
-        return {"path": path, "size": size, "binary": True,
-                "mime": mimetypes.guess_type(path)[0] or "application/octet-stream"}
-    truncated = cut or len(text) > TEXT_LIMIT
-    return {"path": path, "size": size, "content": text[:TEXT_LIMIT], "truncated": truncated}
 
 
 def _clamp(timeout_s: float) -> float:
@@ -349,35 +330,12 @@ class Service:
             self.audit.record(
                 "code.exec", s.sid, "error" if r["error"] else "ok", **code_detail(code), ms=_ms(t0),
                 error=r["error"], timeout=r["error"] == "TimeoutError", kernel_restarted=r["kernel_restarted"],
-                reset=reset, stdout_chars=len(r["stdout"]), stderr_chars=len(r["stderr"]),
+                reset=reset, logs_chars=len(r["logs"]),
                 new_files=len(changed), user_id=user_id, admin=admin, ha_calls=calls.ha_calls,
             )
             return r
 
         return await self._call(session_id, run, "code.exec", owner=user_id, **code_detail(code))
-
-    async def list_files(self, session_id: str, path: str = "/sandbox", user_id: str | None = None) -> dict:
-        return await self._call(session_id, lambda s: s.list_files(path), "file.list", owner=user_id, path=path)
-
-    async def read_file(self, session_id: str, path: str, user_id: str | None = None) -> dict:
-        async def read(s):
-            data, size = await s.read_file(path, TEXT_LIMIT * 4)  # UTF-8: up to 4 bytes per char
-            return _text_or_binary(path, data, size)
-
-        return await self._call(session_id, read, "file.read", owner=user_id, path=path)
-
-    async def write_file(self, session_id: str, path: str, content: str, user_id: str | None = None) -> dict:
-        data = content.encode()
-
-        async def write(s):
-            if len(data) > self.max_bytes:
-                raise FileOpError(f"content is larger than max_file_mb ({self.options.max_file_mb} MB)", "size")
-            out = await s.write_file(path, data, self.max_bytes)
-            digest = await asyncio.to_thread(sha256, data)  # hashlib drops the GIL: up to max_file_mb off the loop
-            self.audit.record("file.write", s.sid, path=out["path"], size=out["size"], sha256=digest)
-            return out
-
-        return await self._call(session_id, write, "file.write", owner=user_id, path=path, size=len(data))
 
     async def _import(self, s, share_path: str, dest: str | None) -> dict:
         # Off the event loop: up to max_file_mb of disk I/O would stall every call.
@@ -397,29 +355,6 @@ class Service:
         digest = await asyncio.to_thread(sha256, data)
         self.audit.record("file.export", s.sid, path=path, share_path=str(dest), size=size, sha256=digest)
         return {"share_path": str(dest), "size": size}
-
-    async def import_from_share(
-        self, share_path: str, session_id: str | None = None, dest: str | None = None, user_id: str | None = None
-    ) -> dict:
-        return await self._call(session_id, lambda s: self._import(s, share_path, dest), "file.import",
-                                owner=user_id, share_path=share_path)
-
-    async def export_to_share(self, session_id: str, path: str, user_id: str | None = None) -> dict:
-        return await self._call(session_id, lambda s: self._export(s, path), "file.export", owner=user_id, path=path)
-
-    async def run_command(
-        self, command: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S,
-        user_id: str | None = None,
-    ) -> dict:
-        async def cmd(s):
-            t0 = time.monotonic()
-            r = await s.run_command(command, _clamp(timeout_s))
-            self.audit.record("command.exec", s.sid, "error" if r["error"] else "ok", **code_detail(command, "command"),
-                              ms=_ms(t0), exit_code=r["exit_code"], error=r["error"],
-                              stdout_chars=len(r["stdout"]), stderr_chars=len(r["stderr"]))
-            return r
-
-        return await self._call(session_id, cmd, "command.exec", owner=user_id, **code_detail(command, "command"))
 
     def list_sessions(self, user_id: str | None = None, everyone: bool = False) -> dict:
         """The caller's own sessions; everyone=True for the Ingress panel."""

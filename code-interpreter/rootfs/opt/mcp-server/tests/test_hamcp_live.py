@@ -12,7 +12,6 @@ import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.types import RequestParams, ToolAnnotations
 
-import hamcp
 from hamcp import HaToolError, HaUnavailable, HomeAssistant
 
 

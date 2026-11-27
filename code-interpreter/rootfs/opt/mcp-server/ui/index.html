@@ -66,7 +66,7 @@
       <button id="refresh">Refresh</button>
     </div>
     <div class="scroll"><table>
-      <thead><tr><th>Session</th><th>Started</th><th>Ended</th><th>Code</th><th>Cmds</th>
+      <thead><tr><th>Session</th><th>Started</th><th>Ended</th><th>Code</th><th>HA</th>
         <th>Files</th><th>Net ✓/✗</th><th>Errors</th><th>Violations</th></tr></thead>
       <tbody id="sessions"></tbody>
     </table></div>
@@ -78,7 +78,7 @@
       <label>Type <select id="event-type">
         <option value="">all</option>
         <option>session.create</option><option>session.destroy</option>
-        <option>code.exec</option><option>command.exec</option>
+        <option>code.exec</option><option>ha.call</option><option>share.list</option><option>command.exec</option>
         <option>file.import</option><option>file.export</option><option>file.write</option>
         <option>file.read</option><option>file.list</option>
         <option>net.connect</option><option>policy.violation</option><option>ui.close_session</option>
@@ -173,7 +173,7 @@ async function loadSessions() {
     const tr = el("tr", undefined, "click" + (s.session_id === selected ? " selected" : ""));
     const ended = s.ended ? `${time(s.ended)} (${s.end_reason || "?"})` : "open";
     tr.append(el("td", s.session_id, "mono"), el("td", time(s.started)), el("td", ended),
-              el("td", s.code_runs), el("td", s.commands), el("td", s.files),
+              el("td", s.code_runs), el("td", s.ha_calls ?? 0), el("td", s.files),
               el("td", `${s.net_allowed} / ${s.net_denied}`),
               el("td", s.errors, s.errors ? "bad" : ""), el("td", s.violations, s.violations ? "bad" : ""));
     tr.onclick = () => {
@@ -188,7 +188,9 @@ async function loadSessions() {
 function summary(e) {
   const d = e.detail || {};
   switch (e.event) {
-    case "code.exec": return `${d.ms ?? "?"} ms${d.error ? " · " + d.error : ""}${d.kernel_restarted ? " · kernel restarted" : ""} · out ${d.stdout_chars ?? 0}/${d.stderr_chars ?? 0} chars`;
+    case "code.exec": return `${d.ms ?? "?"} ms${d.error ? " · " + d.error : ""}${d.kernel_restarted ? " · kernel restarted" : ""} · logs ${d.logs_chars ?? d.stdout_chars ?? 0} chars${d.ha_calls ? " · " + d.ha_calls + " HA calls" : ""}`;
+    case "ha.call": return `${d.api === "homeassistant" ? "admin · " : ""}${d.tool} ${d.args ?? ""} · ${d.ms ?? "?"} ms${d.error ? " · " + d.error : ""}`;
+    case "share.list": return `${d.path} · ${d.entries} entries`;
     case "command.exec": return `exit ${d.exit_code ?? "—"} · ${d.ms ?? "?"} ms${d.error ? " · " + d.error : ""}`;
     case "net.connect": return `${d.host}:${d.port}${d.reason ? " · " + d.reason : ""} · ↑${d.bytes_up} ↓${d.bytes_down} B`;
     case "policy.violation": return `${d.kind}${d.host ? " · " + d.host : ""}${d.message ? " · " + d.message : ""}`;

@@ -13,8 +13,9 @@ configuration:
   memory_limit_mb:
     name: 메모리 한도(MB)
     description: >-
-      샌드박스마다 적용되는 주소 공간 한도(최소 1024). 예약된 메모리까지
-      세므로 실제 사용량은 이보다 적습니다. 넘으면 MemoryError가 납니다.
+      샌드박스 프로세스마다 적용되는 주소 공간 한도(최소 1024). 예약된
+      메모리까지 세므로 실제 사용량은 이보다 적습니다. 넘으면 MemoryError
+      (Python)나 RangeError(JavaScript)가 납니다.
   network_allowlist:
     name: 네트워크 허용 목록
     description: >-
@@ -25,12 +26,11 @@ configuration:
   max_file_mb:
     name: 최대 파일 크기(MB)
     description: >-
-      /share에서 가져오기, /share로 내보내기, write_file에 허용하는 최대
-      파일 크기.
+      share.import와 share.export에 허용하는 최대 파일 크기.
   export_dir:
     name: 내보내기 폴더
     description: >-
-      export_to_share가 파일을 놓는 곳(세션마다 하위 폴더). /share 아래여야
+      share.export가 파일을 놓는 곳(세션마다 하위 폴더). /share 아래여야
       합니다.
   audit_retention_days:
     name: 감사 로그 보관 기간(일)

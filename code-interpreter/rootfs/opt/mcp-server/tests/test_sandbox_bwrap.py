@@ -5,6 +5,7 @@
 
 import asyncio
 import contextlib
+import json
 import os
 import shlex
 import shutil
@@ -84,13 +85,23 @@ if last is not None:
 """
 
 
+def sh(h, s, command, timeout=60):
+    """A shell command through the cell's $, as the model runs one."""
+    r = h.do(s.run_code(
+        f"const o = await $({json.dumps(command)}).nothrow(); "
+        "JSON.stringify({stdout: o.stdout, stderr: o.stderr, exit_code: o.exitCode, timed_out: o.timedOut})",
+        timeout_s=timeout))
+    assert r["error"] is None, r
+    return json.loads(r["result"])
+
+
 def py(h, s, src, timeout=60):
-    """Python through run_command, as the sandbox runs its analysis stack:
+    """Python through $ in a cell, as the sandbox runs its analysis stack:
     the repr of the last expression as result, the exception's name as error."""
-    r = h.do(s.run_command(f"python3 -c {shlex.quote(PY_RUNNER)} <<'__PY__'\n{src}\n__PY__", timeout_s=timeout))
+    r = sh(h, s, f"python3 -c {shlex.quote(PY_RUNNER)} <<'__PY__'\n{src}\n__PY__", timeout)
     out = r["stdout"].strip().splitlines()
     err = r["stderr"].strip().splitlines()
-    error = None if r["exit_code"] == 0 else (err[-1].split(":")[0] if err else str(r["error"]))
+    error = None if r["exit_code"] == 0 else (err[-1].split(":")[0] if err else f"exit {r['exit_code']}")
     return {"result": out[-1] if out else None, "error": error, "stderr": r["stderr"]}
 
 
@@ -289,17 +300,15 @@ def test_reset_clears_variables(h, sbx):
     assert code(h, sbx, "gone")["error"] == "ReferenceError"
 
 
-def test_run_command_shares_files_and_reports_exit(h, sbx):
+def test_shell_shares_files_and_reports_exit(h, sbx):
     code(h, sbx, "require('fs').writeFileSync('/sandbox/f.txt', 'hi')")
-    r = h.do(sbx.run_command("cat f.txt; echo err >&2; exit 3", timeout_s=30))
-    assert (r["stdout"], r["stderr"], r["exit_code"], r["error"]) == ("hi", "err\n", 3, None)
+    r = sh(h, sbx, "cat f.txt; echo err >&2; exit 3")
+    assert (r["stdout"], r["stderr"], r["exit_code"]) == ("hi", "err\n", 3)
 
 
-def test_run_command_timeout_and_output_cap(h, sbx):
-    r = h.do(sbx.run_command("yes | head -c 100000; sleep 30", timeout_s=2))
-    assert r["error"] == "TimeoutError"
-    assert len(r["stdout"]) == 16000 and r["truncated"] is True
-
+def test_shell_timeout_kills_the_command_and_keeps_its_output(h, sbx):
+    r = code(h, sbx, "const o = await $('yes | head -c 100000; sleep 30', 2000).nothrow(); [o.timedOut, o.stdout.length]")
+    assert r["result"] == "[true,100000]", r
 
 SLEEPER = "require('child_process').spawn('sleep', ['300'], {stdio: 'ignore'}).unref()"
 
@@ -415,7 +424,7 @@ def get(url):
 
 def test_pip_download_through_the_proxy(net):
     h, s, _ = net
-    r = h.do(s.run_command("pip download -q --no-deps -d /tmp/dl requests && ls /tmp/dl", timeout_s=120))
+    r = sh(h, s, "pip download -q --no-deps -d /tmp/dl requests && ls /tmp/dl", timeout=120)
     assert r["exit_code"] == 0, r["stderr"]
     assert r["stdout"].startswith("requests-")
 
@@ -451,9 +460,9 @@ def test_destroy_during_running_cell_leaves_nothing(h):
     assert not s.dir.exists()
 
 
-def test_cancelled_run_command_is_killed(h, sbx):
+def test_cancelled_cell_kills_its_shell_command(h, sbx):
     async def go():
-        task = asyncio.ensure_future(sbx.run_command("sleep 300", timeout_s=600))
+        task = asyncio.ensure_future(sbx.run_code("await $`sleep 300`", timeout_s=600))
         await asyncio.sleep(1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -490,7 +499,7 @@ except OSError as e:
 
 
 def test_commands_and_code_share_tmp_home_and_sandbox(h, sbx):
-    r = h.do(sbx.run_command("echo cmd > /tmp/t; echo home > $HOME/h; pwd", timeout_s=30))
+    r = sh(h, sbx, "echo cmd > /tmp/t; echo home > $HOME/h; pwd")
     assert r["stdout"] == "/sandbox\n"
     r = code(h, sbx, "const fs = require('fs'); [fs.readFileSync('/tmp/t', 'utf8'), fs.readFileSync(require('os').homedir() + '/h', 'utf8')]")
     assert r["result"] == '["cmd\\n","home\\n"]'
@@ -551,7 +560,7 @@ def test_listing_sees_code_output_and_survives_restart(h, sbx):
 # ---- review fixes (00fd254^..HEAD) -----------------------------------------
 
 def test_fifo_in_sandbox_is_refused_without_hanging(h, sbx):
-    h.do(sbx.run_command("mkfifo /sandbox/p", timeout_s=10))
+    sh(h, sbx, "mkfifo /sandbox/p")
 
     async def go():
         return await asyncio.wait_for(sbx.read_file("/sandbox/p", 100), 10)
@@ -606,10 +615,10 @@ def test_destroy_during_file_op_raises_cleanly(h):
     assert procs_of(UID) == []
 
 
-def test_kernel_death_reports_the_sandbox_stderr(h, sbx):
+def test_kernel_death_reports_the_sandbox_stderr_in_logs(h, sbx):
     r = code(h, sbx, "require('fs').writeSync(2, 'native lib: fatal error\\n'); process.abort()")
     assert r["error"] == "KernelDied" and r["kernel_restarted"] is True
-    assert "native lib: fatal error" in r["stderr"]
+    assert "native lib: fatal error" in r["logs"]
 
 
 def test_blas_threads_are_capped_so_the_memory_limit_holds_on_many_cores(h, sbx):

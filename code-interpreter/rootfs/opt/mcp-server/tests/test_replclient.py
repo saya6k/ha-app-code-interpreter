@@ -99,7 +99,7 @@ def repl():
 def test_variables_persist_between_calls(repl):
     assert repl("const x = 1")["error"] is None
     r = repl("console.log(x)")
-    assert r["stdout"] == "1\n"
+    assert r["logs"] == "1\n"
     assert r["restart_required"] is False
 
 
@@ -125,20 +125,19 @@ def test_exception_reports_name_and_stack_and_keeps_state(repl):
     repl("const z = 5")
     r = repl("null.x")
     assert r["error"] == "TypeError"
-    assert "TypeError" in r["stderr"] and "<cell-" in r["stderr"]
-    assert "server.mjs" not in r["stderr"] and "transform.mjs" not in r["stderr"]
+    assert "TypeError" in r["message"] and "<cell-" in r["message"]
+    assert "server.mjs" not in r["message"] and "transform.mjs" not in r["message"]
     assert repl("z")["result"] == "5"
 
 
 def test_syntax_error_is_reported(repl):
     r = repl("const = 1")
-    assert r["error"] == "SyntaxError" and "(1:6)" in r["stderr"]
+    assert r["error"] == "SyntaxError" and "(1:6)" in r["message"]
 
 
-def test_stderr_is_captured_separately(repl):
-    r = repl("console.log('out'); console.error('err')")
-    assert r["stdout"] == "out\n"
-    assert r["stderr"] == "err\n"
+def test_logs_keep_order_and_mark_stderr(repl):
+    r = repl("console.log('out'); console.error('err\\nmore'); console.log('again')")
+    assert r["logs"] == "out\n[stderr] err\n[stderr] more\nagain\n"
 
 
 def test_timeout_interrupts_a_sync_loop_and_keeps_variables(repl):
@@ -173,15 +172,15 @@ def test_server_death_requires_restart(repl):
     assert repl("1")["result"] == "1"
 
 
-def test_stdout_is_truncated(repl):
+def test_logs_are_truncated(repl):
     r = repl("console.log('a'.repeat(20000))")
-    assert len(r["stdout"]) == 16000
+    assert len(r["logs"]) == 16000
     assert r["truncated"] is True
 
 
 def test_result_is_capped(repl):
-    r = repl("'b'.repeat(10000)")
-    assert len(r["result"]) == 4000
+    r = repl("'b'.repeat(20000)")
+    assert len(r["result"]) == 16000
     assert r["truncated"] is True
 
 
@@ -202,7 +201,7 @@ def test_error_from_abandoned_async_work_is_reported_with_the_next_cell(repl):
     repl("setTimeout(() => { throw new RangeError('later') }, 10); 1")
     repl.do(asyncio.sleep(0.2))
     r = repl("2")
-    assert r["result"] == "2" and "RangeError: later" in r["stderr"]
+    assert r["result"] == "2" and "RangeError: later" in r["logs"]
 
 
 def test_require_reaches_node_builtins(repl):
@@ -220,11 +219,11 @@ def test_promises_in_a_returned_object_are_awaited(repl):
 
 def test_failing_command_is_a_shell_error(repl):
     r = repl("await $`exit 5`")
-    assert r["error"] == "ShellError" and "exit code 5" in r["stderr"]
+    assert r["error"] == "ShellError" and "exit code 5" in r["message"]
 
 
-def test_log_writes_to_stdout(repl):
-    assert repl("log('a', 1, {b: 2})")["stdout"] == "a 1 { b: 2 }\n"
+def test_log_writes_to_logs(repl):
+    assert repl("log('a', 1, {b: 2})")["logs"] == "a 1 { b: 2 }\n"
 
 
 class FakeCalls:
@@ -349,41 +348,19 @@ def test_forged_oversized_reply_is_rejected_as_kernel_death(repl):
 
 def test_forged_reply_without_the_request_id_is_ignored(repl):
     code = (
-        "const b = Buffer.from(JSON.stringify({stdout: 'forged', result: '1'}));\n"
+        "const b = Buffer.from(JSON.stringify({logs: 'forged', result: '1'}));\n"
         "const h = Buffer.alloc(4); h.writeUInt32BE(b.length);\n"
         "require('fs').writeSync(Number(process.env.REPL_FD), Buffer.concat([h, b]));\n"
         "'real'"
     )
     r = repl(code)
-    assert r["result"] == "real" and r["stdout"] == ""
+    assert r["result"] == "real" and r["logs"] == ""
 
 
 def test_merge_keeps_only_known_fields():
-    out = replclient._merge({"error": None}, {"stdout": "x", "restart_required": False, "evil": 1},
+    out = replclient._merge({"error": None}, {"logs": "x", "restart_required": False, "evil": 1},
                             replclient._CODE_KEYS)
-    assert out == {"error": None, "stdout": "x"}
-
-
-def test_command_runs_with_exit_code_and_stderr(repl):
-    r = repl.do(repl.client.command("echo out; echo err >&2; exit 4", timeout_s=10))
-    assert (r["stdout"], r["stderr"], r["exit_code"], r["error"]) == ("out\n", "err\n", 4, None)
-    assert "result" not in r
-
-
-def test_command_timeout_kills_its_process_group(repl):
-    r = repl.do(repl.client.command("sleep 30 & sleep 30", timeout_s=1))
-    assert r["error"] == "TimeoutError" and r["exit_code"] is None and not r["restart_required"]
-    assert repl("1")["result"] == "1"
-
-
-def test_command_output_is_capped(repl):
-    r = repl.do(repl.client.command("yes | head -c 100000", timeout_s=10))
-    assert len(r["stdout"]) == 16000 and r["truncated"] is True
-
-
-def test_command_killed_by_signal_maps_to_128_plus_signal(repl):
-    r = repl.do(repl.client.command("kill -TERM $$", timeout_s=10))
-    assert r["exit_code"] == 128 + signal.SIGTERM and r["error"] is None
+    assert out == {"error": None, "logs": "x"}
 
 
 def test_cancelled_request_does_not_leak_its_reply_into_the_next(repl):
@@ -399,13 +376,3 @@ def test_cancelled_request_does_not_leak_its_reply_into_the_next(repl):
     assert repl.do(go())["result"] == "next"
 
 
-def test_command_runs_in_sandbox_dir_even_after_chdir(repl):
-    repl("process.chdir('/')")
-    r = repl.do(repl.client.command("pwd", timeout_s=10))
-    assert os.path.realpath(r["stdout"].strip()) == os.path.realpath(repl.sandbox_dir)
-
-
-def test_command_with_detached_grandchild_is_not_a_timeout(repl):
-    # The grandchild keeps the pipes open; the command itself exits at once.
-    r = repl.do(repl.client.command("(sleep 30 &) ; echo done", timeout_s=2))
-    assert r["error"] is None and r["exit_code"] == 0 and r["stdout"].startswith("done")

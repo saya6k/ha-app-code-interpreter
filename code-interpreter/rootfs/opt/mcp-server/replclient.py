@@ -17,10 +17,9 @@ import struct
 from typing import Any, Protocol
 
 GRACE_S = 5.0
-COMMAND_MARGIN_S = 5.0  # > server-side READER_GRACE_S (2 s) plus scheduling slack
 # Sandbox code can write to its end of the channel directly; never let a
 # forged length header make the app allocate without bound. Legit replies are
-# capped at 2 x 16000 chars of output plus a 4000-char result.
+# capped at 16000 chars of logs, a 16000-char result and an error message.
 MAX_MSG = 1 << 20
 
 
@@ -77,8 +76,7 @@ class _Channel:
             self.sock.close()
 
 
-_CODE_KEYS = ("stdout", "stderr", "result", "error", "truncated")
-_COMMAND_KEYS = ("stdout", "stderr", "exit_code", "error", "truncated")
+_CODE_KEYS = ("logs", "result", "error", "message", "truncated")
 
 
 def _merge(out: dict, reply: dict, keys: tuple[str, ...]) -> dict:
@@ -89,10 +87,8 @@ def _merge(out: dict, reply: dict, keys: tuple[str, ...]) -> dict:
     return out
 
 
-def _blank(command: bool = False) -> dict:
-    out = {"stdout": "", "stderr": "", "error": None, "truncated": False, "restart_required": False}
-    out.update({"exit_code": None} if command else {"result": None})
-    return out
+def _blank() -> dict:
+    return {"logs": "", "result": None, "error": None, "message": None, "truncated": False, "restart_required": False}
 
 
 RPC_CONCURRENCY = 4  # calls a cell can have in flight at once
@@ -253,9 +249,3 @@ class ReplClient:
         """ctx: what the cell's globals depend on, e.g. {"admin": True} defines ha.admin."""
         req = {"op": "exec", "code": code, "ctx": ctx or {}}
         return await self._bounded(req, timeout_s, _blank(), _CODE_KEYS, rpc)
-
-    async def command(self, command: str, timeout_s: float) -> dict:
-        """The server enforces timeout_s itself; the client allows more than the
-        server can add on top (its output readers get up to 2 s after exit)."""
-        req = {"op": "command", "command": command, "timeout_s": timeout_s}
-        return await self._bounded(req, timeout_s + COMMAND_MARGIN_S, _blank(command=True), _COMMAND_KEYS)

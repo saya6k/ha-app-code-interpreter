@@ -2,7 +2,6 @@ import asyncio
 import dataclasses
 import json
 
-import pytest
 from pathlib import Path
 
 import hamcp
@@ -30,7 +29,7 @@ class FakeSandbox:
                 error = None
             except replclient.RpcError as e:
                 result, error = None, f"{e.name}: {e}"
-            return {"stdout": "", "stderr": "", "result": result, "error": error,
+            return {"logs": "", "result": result, "error": error, "message": None,
                     "truncated": False, "kernel_restarted": False}
         if reset:
             self.vars.clear()
@@ -41,10 +40,10 @@ class FakeSandbox:
         if code.startswith("set "):
             k, v = code[4:].split("=")
             self.vars[k] = v
-            return {"stdout": "", "stderr": "", "result": None, "error": None,
+            return {"logs": "", "result": None, "error": None, "message": None,
                     "truncated": False, "kernel_restarted": False}
         result = "2" if code == "1 + 1" else self.vars.get(code)
-        return {"stdout": "", "stderr": "", "result": result, "error": None,
+        return {"logs": "", "result": result, "error": None, "message": None,
                 "truncated": False, "kernel_restarted": False}
 
     async def list_files(self, path="/sandbox", recursive=False, skip_dot=False):
@@ -65,9 +64,6 @@ class FakeSandbox:
         p = path if path.startswith("/sandbox/") else "/sandbox/" + path
         self.files[p] = data
         return {"path": p, "size": len(data)}
-
-    async def run_command(self, command, timeout_s):
-        return {"stdout": command, "stderr": "", "exit_code": 0, "error": None, "truncated": False}
 
     async def destroy(self):
         self.destroyed = True
@@ -155,12 +151,10 @@ def test_timeout_is_clamped(tmp_path):
     run(go())
 
 
-def test_run_command_list_and_close(tmp_path):
+def test_list_and_close(tmp_path):
     async def go():
         svc, created = make(tmp_path)
-        r = await svc.run_command("echo hi")
-        sid = r["session_id"]
-        assert r["stdout"] == "echo hi"
+        sid = (await svc.run_code("1 + 1"))["session_id"]
         listed = svc.list_sessions()
         assert [s["session_id"] for s in listed["sessions"]] == [sid]
         assert 0 < listed["sessions"][0]["expires_in_s"] <= 20 * 60
@@ -239,62 +233,22 @@ def test_run_code_reports_new_and_changed_files_but_not_dotfiles(tmp_path):
     run(go())
 
 
-def test_import_read_write_export_round_trip(tmp_path):
-    async def go():
-        svc, created = make(tmp_path)
-        (tmp_path / "share" / "energy.csv").write_text("kwh\n1\n2\n")
-        r = await svc.import_from_share("energy.csv")
-        sid = r["session_id"]
-        assert r["path"] == "/sandbox/energy.csv" and r["size"] == 8
-        r = await svc.read_file(sid, "/sandbox/energy.csv")
-        assert r["content"] == "kwh\n1\n2\n" and r["truncated"] is False
-        await svc.write_file(sid, "out.txt", "result")
-        r = await svc.export_to_share(sid, "/sandbox/out.txt")
-        exported = Path(r["share_path"])
-        assert exported == tmp_path / "share" / "code-interpreter" / sid / "out.txt"
-        assert exported.read_text() == "result"
-
-    run(go())
+def test_import_export_round_trip_through_a_cell(tmp_path):
+    svc, created = make(tmp_path)
+    (tmp_path / "share" / "energy.csv").write_text("kwh\n1\n2\n")
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    r = json.loads(call(svc, sid, "share.import", share_path="energy.csv")["result"])
+    assert r == {"path": "/sandbox/energy.csv", "size": 8}
+    assert created[0].files["/sandbox/energy.csv"] == b"kwh\n1\n2\n"
+    created[0].files["/sandbox/out.txt"] = b"result"
+    r = json.loads(call(svc, sid, "share.export", path="/sandbox/out.txt")["result"])
+    exported = Path(r["share_path"])
+    assert exported == tmp_path / "share" / "code-interpreter" / sid / "out.txt"
+    assert exported.read_text() == "result"
 
 
-def test_import_refuses_paths_outside_share(tmp_path):
-    async def go():
-        svc, _ = make(tmp_path)
-        (tmp_path / "secret").write_text("x")
-        r = await svc.import_from_share("../secret")
-        assert r["error"] == "share_error" and "outside /share" in r["detail"]
-
-    run(go())
 
 
-def test_read_file_binary_and_missing(tmp_path):
-    async def go():
-        svc, created = make(tmp_path)
-        r = await svc.run_code("1")
-        sid = r["session_id"]
-        created[0].files["/sandbox/p.png"] = b"\x89PNG\x00\x01"
-        r = await svc.read_file(sid, "/sandbox/p.png")
-        assert r["binary"] is True and r["mime"] == "image/png" and "content" not in r
-        r = await svc.read_file(sid, "/sandbox/none.txt")
-        assert r["error"] == "file_error"
-
-    run(go())
-
-
-def test_read_file_truncates_long_text_and_handles_cut_multibyte():
-    data = ("가" * 20000).encode()  # 3 bytes each
-    r = service._text_or_binary("/sandbox/k.txt", data[:64000], len(data))
-    assert r["truncated"] is True and len(r["content"]) == 16000 and set(r["content"]) == {"가"}
-
-
-def test_write_file_over_limit(tmp_path):
-    async def go():
-        svc, _ = make(tmp_path, {"max_file_mb": 1})
-        r = await svc.run_code("1")
-        r = await svc.write_file(r["session_id"], "big.txt", "x" * (2 << 20))
-        assert r["error"] == "file_error" and "max_file_mb" in r["detail"]
-
-    run(go())
 
 
 def events(tmp_path):
@@ -308,36 +262,31 @@ def test_audit_session_lifecycle_and_code_without_output(tmp_path):
     async def go():
         svc, _ = make(tmp_path)
         r = await svc.run_code("set a=secret-output")
-        await svc.run_command("echo hi", session_id=r["session_id"])
         await svc.close_session(r["session_id"])
         return r["session_id"]
 
     sid = run(go())
     ev = events(tmp_path)
-    assert [e["event"] for e in ev] == ["session.create", "code.exec", "command.exec", "session.destroy"]
+    assert [e["event"] for e in ev] == ["session.create", "code.exec", "session.destroy"]
     assert all(e["session_id"] == sid for e in ev)
     code_ev = ev[1]["detail"]
     assert code_ev["code"] == "set a=secret-output" and len(code_ev["sha256"]) == 64
-    assert {"ms", "stdout_chars", "stderr_chars", "kernel_restarted", "timeout"} <= code_ev.keys()
-    assert "stdout" not in code_ev and "result" not in code_ev  # output is never stored
-    assert ev[2]["detail"]["command"] == "echo hi" and ev[2]["detail"]["exit_code"] == 0
-    assert ev[3]["detail"]["reason"] == "close"
+    assert {"ms", "logs_chars", "kernel_restarted", "timeout"} <= code_ev.keys()
+    assert "logs" not in code_ev and "result" not in code_ev  # output is never stored
+    assert ev[2]["detail"]["reason"] == "close"
 
 
 def test_audit_file_events_and_traversal_violation(tmp_path):
-    async def go():
-        svc, _ = make(tmp_path)
-        (tmp_path / "share" / "in.csv").write_text("1")
-        r = await svc.import_from_share("in.csv")
-        sid = r["session_id"]
-        await svc.write_file(sid, "o.txt", "data")
-        await svc.export_to_share(sid, "/sandbox/o.txt")
-        await svc.import_from_share("../etc/passwd", session_id=sid)
-
-    run(go())
+    svc, created = make(tmp_path)
+    (tmp_path / "share" / "in.csv").write_text("1")
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    call(svc, sid, "share.import", share_path="in.csv")
+    created[0].files["/sandbox/o.txt"] = b"data"
+    call(svc, sid, "share.export", path="/sandbox/o.txt")
+    call(svc, sid, "share.import", share_path="../etc/passwd")
     ev = events(tmp_path)
     kinds = [(e["event"], e["outcome"]) for e in ev]
-    assert ("file.import", "ok") in kinds and ("file.write", "ok") in kinds and ("file.export", "ok") in kinds
+    assert ("file.import", "ok") in kinds and ("file.export", "ok") in kinds
     assert ("file.import", "error") in kinds
     viol = [e for e in ev if e["event"] == "policy.violation"]
     assert viol and viol[0]["detail"]["kind"] == "traversal"
@@ -380,33 +329,27 @@ def test_default_timeout_stays_under_home_assistants_30_s_cap(tmp_path):
 
 def test_policy_words_in_a_file_name_are_no_violation(tmp_path):
     """Violations come from the refusing code, never from matching message text."""
-    async def go():
-        svc, created = make(tmp_path)
-        sid = (await svc.run_code("1 + 1"))["session_id"]
-        r = await svc.read_file(sid, "/sandbox/outside_temps larger than.csv")
-        assert r["error"] == "file_error"
+    svc, created = make(tmp_path)
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    r = call(svc, sid, "share.export", path="/sandbox/outside_temps larger than.csv")
+    assert r["error"].startswith("FileOpError: ")
 
-        async def refused(path, limit):
-            raise FileOpError("ValueError: '../x' is outside /sandbox", "traversal")
+    async def refused(path, limit):
+        raise FileOpError("ValueError: '../x' is outside /sandbox", "traversal")
 
-        created[0].read_file = refused
-        await svc.read_file(sid, "../x")
-
-    run(go())
+    created[0].read_file = refused
+    call(svc, sid, "share.export", path="../x")
     viol = [e for e in events(tmp_path) if e["event"] == "policy.violation"]
-    assert [(v["detail"]["kind"], v["detail"]["during"]) for v in viol] == [("traversal", "file.read")]
+    assert [(v["detail"]["kind"], v["detail"]["during"]) for v in viol] == [("traversal", "file.export")]
 
 
 def test_size_refusals_are_size_violations(tmp_path):
-    async def go():
-        svc, _ = make(tmp_path, options={"max_file_mb": 1})
-        (tmp_path / "share" / "big.bin").write_bytes(b"x" * (service.MIB + 1))
-        r = await svc.import_from_share("big.bin")
-        assert r["error"] == "share_error"
-        r = await svc.write_file(r["session_id"], "big.txt", "x" * (service.MIB + 1))
-        assert r["error"] == "file_error"
-
-    run(go())
+    svc, created = make(tmp_path, options={"max_file_mb": 1})
+    (tmp_path / "share" / "big.bin").write_bytes(b"x" * (service.MIB + 1))
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    assert call(svc, sid, "share.import", share_path="big.bin")["error"].startswith("ShareError: ")
+    created[0].files["/sandbox/big.txt"] = b"x" * (service.MIB + 1)
+    assert call(svc, sid, "share.export", path="/sandbox/big.txt")["error"].startswith("FileOpError: ")
     kinds = [e["detail"]["kind"] for e in events(tmp_path) if e["event"] == "policy.violation"]
     assert kinds == ["size", "size"]
 
@@ -416,12 +359,12 @@ def test_sandbox_failure_after_a_concurrent_close_keeps_the_real_error(tmp_path)
         svc, created = make(tmp_path)
         sid = (await svc.run_code("1 + 1"))["session_id"]
 
-        async def closed_meanwhile(command, timeout_s):
+        async def closed_meanwhile(*args, **kwargs):
             await svc.close_session(sid)  # e.g. the Ingress Close button
             raise SandboxError("sandbox is closed")
 
-        created[0].run_command = closed_meanwhile
-        r = await svc.run_command("ls", session_id=sid)
+        created[0].run_code = closed_meanwhile
+        r = await svc.run_code("1", session_id=sid)
         assert r["error"] == "sandbox_unavailable" and "closed" in r["detail"]
 
     run(go())

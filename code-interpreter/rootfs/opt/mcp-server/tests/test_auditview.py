@@ -51,6 +51,15 @@ def test_sessions_summary_for_a_day(audit_dir):
     assert s["b"]["ended"] is None and s["b"]["events"] == 2
 
 
+def test_sessions_summary_counts_home_assistant_calls(tmp_path):
+    write(tmp_path, "20261127", [
+        ev("2026-11-27T10:00:00Z", "ha.call", "h", api="assist", tool="intent__HassTurnOff"),
+        ev("2026-11-27T10:00:01Z", "ha.call", "h", "error", api="assist", tool="x__y", error="HaToolError"),
+    ])
+    (h,) = auditview.sessions(tmp_path, "20261127")
+    assert (h["ha_calls"], h["errors"]) == (2, 1)
+
+
 def test_events_filter_by_session_and_type_newest_first(audit_dir):
     got = auditview.events(audit_dir, "20261121", session_id="a", event="code.exec")
     assert [e["detail"]["code"] for e in got["events"]] == ["1/0", "1+1"]
