@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from skills import CODE_CAP, SkillError, SkillStore, manifest_check, parse_uses
+from skills import CODE_CAP, SkillError, SkillStore, manifest_check, parse_uses, tool_summary
 
 CODE = "async ({ room }) => room"
 
@@ -117,3 +117,23 @@ def test_manifest_check_covers_plugin_tools():
     chained = 'await plugins?.memory.search({}); await plugins?.["multi-service-mcp"]?.find_places({}); plugins?.call("x__y")'
     assert manifest_check(chained, {})["undeclared"] == [
         "plugin memory__search", "plugin multi-service-mcp__find_places", "plugin x__y"]
+
+
+SUGGEST = {"name": "wardrowbe__suggest_outfit", "description": "Generate a new outfit.\nMore.", "input_schema": {
+    "type": "object", "required": ["occasion"], "properties": {
+        "occasion": {"type": "string", "enum": ["casual", "work"]},
+        "temperature_unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+        "temperature": {"type": "number", "minimum": -60},
+        "domain": {"type": "array", "items": {"type": "string", "enum": ["light"]}},
+        "percentage": {"allOf": [{"type": "integer"}, {"type": "number"}]},
+        "volume_step": {"anyOf": [{"type": "string", "enum": ["down", "up"]}, {"type": "integer"}]},
+        "is_volume_muted": {"description": "no type"}}}}
+
+
+def test_tool_summaries_give_types_allowed_values_and_required_args():
+    s = tool_summary(SUGGEST, "plugin.")
+    assert s["name"] == "plugin.wardrowbe__suggest_outfit" and s["description"] == "Generate a new outfit."
+    assert s["args"] == {"domain": "array of one of light", "is_volume_muted": "any", "occasion": "one of casual|work",
+                         "percentage": "integer or number", "temperature": "number",
+                         "temperature_unit": "one of celsius|fahrenheit", "volume_step": "one of down|up or integer"}
+    assert s["required"] == ["occasion"]
