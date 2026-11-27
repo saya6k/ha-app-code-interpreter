@@ -1,5 +1,5 @@
 #!/bin/sh
-# Local run of the assembled ha-check app on a Docker host (linux-test),
+# Local run of the assembled ha-check app with docker (on the Mac: socktainer),
 # mimicking Supervisor: seccomp=unconfined, init: true, /share and /data
 # mounted like the real app. No AppArmor here. Exits with the check's code.
 set -eu

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Sandbox integration tests inside the app image (linux-test, CI). Runs the
+# Sandbox integration tests inside the app image (local docker, CI). Runs the
 # container as Supervisor does (seccomp=unconfined, default capabilities;
 # extra docker run options from $DOCKER_RUN_EXTRA)
 # with the source tree mounted read-only. --init stands in for s6 as PID 1,
