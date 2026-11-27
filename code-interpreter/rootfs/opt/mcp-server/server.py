@@ -59,7 +59,9 @@ async def run_code(
     a returned object are awaited. Globals: $`cmd ${x}` runs sh -c in /sandbox
     (values quoted; .text() .lines() .json() .nothrow() .timeout(ms); a
     non-zero exit throws ShellError), file(p).text()/json()/lines()/exists(),
-    write(p, s), sleep(ms), log(...), require for Node built-ins.
+    write(p, s), sleep(ms), log(...), require for Node built-ins, and for
+    Home Assistant's /share: await share.list(dir?), share.import(share_path,
+    dest?), share.export(path) (to /share/code-interpreter/<session>/).
     Files live under /sandbox (256 MB); /tmp is
     scratch (64 MB). Use import_from_share / export_to_share to move files
     between /sandbox and Home Assistant's /share.

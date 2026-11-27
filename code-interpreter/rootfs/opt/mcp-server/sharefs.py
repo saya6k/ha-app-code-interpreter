@@ -54,6 +54,37 @@ def resolve_share(p: str, root: Path = SHARE) -> Path:
     return path
 
 
+LIST_CAP = 1000
+
+
+def list_share(p: str = "", root: Path = SHARE) -> dict:
+    """Names, types and sizes in a /share directory (not recursive). Entries
+    whose target resolves outside /share are left out."""
+    real_root = root.resolve()
+    rel = p[len(str(SHARE)):] if p == str(SHARE) or p.startswith(str(SHARE) + "/") else p
+    rel = rel.strip("/")
+    if not _inside((real_root / rel).resolve(), real_root):
+        raise ShareError(f"/share/{rel} points outside /share", "traversal")
+    path = (real_root / rel).resolve()
+    if not path.is_dir():
+        raise ShareError(f"/share/{rel} is not a directory")
+    entries = []
+    truncated = False
+    for e in sorted(os.scandir(path), key=lambda e: e.name):
+        target = Path(e.path).resolve()
+        if not _inside(target, real_root):
+            continue
+        if len(entries) == LIST_CAP:
+            truncated = True
+            break
+        kind = "dir" if target.is_dir() else "file" if target.is_file() else "other"
+        entry = {"name": e.name, "type": kind}
+        if kind == "file":
+            entry["size"] = target.stat().st_size
+        entries.append(entry)
+    return {"path": "/share" + (f"/{rel}" if rel else ""), "entries": entries, "truncated": truncated}
+
+
 def read_share(p: str, max_bytes: int, root: Path = SHARE) -> bytes:
     path = resolve_share(p, root)
     size = path.stat().st_size

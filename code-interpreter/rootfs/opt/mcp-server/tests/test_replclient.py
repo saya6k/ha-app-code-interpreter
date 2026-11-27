@@ -227,6 +227,66 @@ def test_log_writes_to_stdout(repl):
     assert repl("log('a', 1, {b: 2})")["stdout"] == "a 1 { b: 2 }\n"
 
 
+class FakeCalls:
+    def __init__(self) -> None:
+        self.seen, self.refused, self.inflight, self.peak = [], [], 0, 0
+
+    async def call(self, op, args):
+        self.seen.append((op, args))
+        self.inflight += 1
+        self.peak = max(self.peak, self.inflight)
+        try:
+            await asyncio.sleep(0.05)
+            if op == "share.import" and args.get("share_path") == "bad":
+                raise replclient.RpcError("ShareError", "points outside /share")
+            return {"op": op, "args": args}
+        finally:
+            self.inflight -= 1
+
+    def rejected(self, reason):
+        self.refused.append(reason)
+
+
+def run_with(repl, code, calls, timeout=10):
+    return repl.do(repl.client.run(code, timeout_s=timeout, rpc=calls))
+
+
+def test_share_calls_reach_the_app_and_return_values(repl):
+    calls = FakeCalls()
+    r = run_with(repl, "await share.list('sub')", calls)
+    assert r["result"] == '{"op":"share.list","args":{"path":"sub"}}'
+    r = run_with(repl, "(await share.import('a.csv', 'b.csv')).args", calls)
+    assert r["result"] == '{"share_path":"a.csv","dest":"b.csv"}'
+
+
+def test_app_errors_reach_the_cell_with_their_name(repl):
+    r = run_with(repl, "await share.import('bad').catch((e) => e.name + ': ' + e.message)", FakeCalls())
+    assert r["result"] == "ShareError: points outside /share"
+
+
+def test_calls_run_at_most_four_at_a_time(repl):
+    calls = FakeCalls()
+    r = run_with(repl, "(await Promise.all(Array.from({length: 10}, (_, i) => share.list(String(i))))).length", calls)
+    assert r["result"] == "10" and calls.peak == 4
+
+
+def test_call_tagged_with_another_request_is_refused(repl):
+    calls = FakeCalls()
+    code = (
+        "const b = Buffer.from(JSON.stringify({rpc: {id: 99, cell: 12345, op: 'share.list', args: {}}}));\n"
+        "const h = Buffer.alloc(4); h.writeUInt32BE(b.length);\n"
+        "require('fs').writeSync(Number(process.env.REPL_FD), Buffer.concat([h, b]));\n"
+        "await sleep(200); 'done'"
+    )
+    r = run_with(repl, code, calls)
+    assert r["result"] == "done" and calls.seen == [] and calls.refused == ["call from another request"]
+
+
+def test_calls_without_a_handler_are_refused(repl):
+    r = repl("await share.list().catch((e) => e.name)")
+    assert r["result"] == "RpcRejected"
+
+
 def test_timeout_kills_running_shell_commands(repl):
     marker = os.path.join(repl.sandbox_dir, "marker")
     r = repl("await $`sleep 2; touch marker`", timeout=0.5)

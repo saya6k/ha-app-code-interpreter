@@ -212,6 +212,15 @@ async def main(idle_wait_s: int, mode: str) -> int:
             r = payload(await call("export_to_share", session_id=sid, path="/sandbox/plot.png"))
             out = r.get("share_path", "")
             check("export_to_share", out == f"/share/code-interpreter/{sid}/plot.png" and os.path.getsize(out) > 0, r)
+            r = payload(await call("run_code", session_id=sid, code=(
+                "const listed = await share.list();\n"
+                "const got = await share.import('energy.csv', 'via-cell.csv');\n"
+                "const out = await share.export('via-cell.csv');\n"
+                "({listed: listed.entries.some((e) => e.name === 'energy.csv'), got: got.path, out: out.share_path,\n"
+                "  refused: await share.import('../etc/passwd').catch((e) => e.name)})")))
+            res = json.loads(r["result"]) if r.get("result") else {}
+            check("cell share.list/import/export", res.get("listed") is True and res.get("got") == "/sandbox/via-cell.csv"
+                  and res.get("out") == f"/share/code-interpreter/{sid}/via-cell.csv" and res.get("refused") == "ShareError", r)
             r = payload(await call("import_from_share", share_path="../etc/passwd", session_id=sid))
             check("import outside /share refused", r.get("error") == "share_error", r)
             r = payload(await call("read_file", session_id=sid, path="/etc/passwd"))

@@ -181,6 +181,15 @@ async function write(p, content) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...args) => process.stdout.write(util.format(...args) + "\n");
 
+// /share lives outside the sandbox: the app does these, and checks every path.
+export function installShare(target, rpc) {
+  target.share = {
+    list: (dir = "") => rpc("share.list", { path: String(dir) }),
+    import: (sharePath, dest) => rpc("share.import", { share_path: String(sharePath), ...(dest ? { dest: String(dest) } : {}) }),
+    export: (p) => rpc("share.export", { path: String(p) }),
+  };
+}
+
 export function install(target) {
   Object.assign(target, { $, file, write, sleep, log, ShellError });
 }

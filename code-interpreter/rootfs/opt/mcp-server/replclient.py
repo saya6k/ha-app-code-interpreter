@@ -10,9 +10,11 @@ sandbox layer's job: this client only reports restart_required.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import socket
 import struct
+from typing import Any, Protocol
 
 GRACE_S = 5.0
 COMMAND_MARGIN_S = 5.0  # > server-side READER_GRACE_S (2 s) plus scheduling slack
@@ -93,6 +95,39 @@ def _blank(command: bool = False) -> dict:
     return out
 
 
+RPC_CONCURRENCY = 4  # calls a cell can have in flight at once
+
+
+class RpcError(Exception):
+    """A call the app refused or that failed: the cell sees name and message."""
+
+    def __init__(self, name: str, message: str) -> None:
+        super().__init__(message)
+        self.name = name
+
+
+class RpcHandler(Protocol):
+    """What a running cell may ask the app for (share.*, later ha.*)."""
+
+    async def call(self, op: str, args: dict) -> Any: ...
+
+    def rejected(self, reason: str) -> None: ...
+
+
+class _Calls:
+    """The RPC calls of one request: they end with it."""
+
+    def __init__(self, rid: int, handler: RpcHandler | None) -> None:
+        self.rid = rid
+        self.handler = handler
+        self.tasks: set[asyncio.Task] = set()
+        self.slots = asyncio.Semaphore(RPC_CONCURRENCY)
+
+    def cancel(self) -> None:
+        for t in self.tasks:
+            t.cancel()
+
+
 class ReplClient:
     def __init__(self, repl: socket.socket, ctl: socket.socket, grace_s: float = GRACE_S) -> None:
         self._repl = _Channel(repl)
@@ -109,14 +144,63 @@ class ReplClient:
         await self._repl.send({**req, "id": self._next_id})
         return self._next_id
 
-    async def _reply(self, rid: int, timeout_s: float) -> dict:
-        """Next reply for request `rid`; replies to abandoned requests are skipped."""
+    async def _reply(self, rid: int, timeout_s: float, calls: _Calls | None = None) -> dict:
+        """Next reply for request `rid`; replies to abandoned requests are skipped.
+        RPC calls that arrive meanwhile are served (or refused) on the side."""
         async def matching():
-            while (msg := await self._repl.recv()).get("id") != rid:
-                pass
-            return msg
+            while True:
+                msg = await self._repl.recv()
+                if "rpc" in msg:
+                    self._serve_rpc(msg["rpc"], calls)
+                elif msg.get("id") == rid:
+                    return msg
 
         return await asyncio.wait_for(matching(), timeout_s)
+
+    def _serve_rpc(self, req, calls: _Calls | None) -> None:
+        """The sandbox controls these frames: only a well-formed call from the
+        request in flight, while it runs code, reaches the handler."""
+        call_id = req.get("id") if isinstance(req, dict) else None
+        if not isinstance(call_id, int):
+            return  # nothing to answer to
+        op, args = req.get("op"), req.get("args", {})
+        if calls is None or calls.handler is None:
+            reason = "no code is running"
+        elif req.get("cell") != calls.rid:
+            reason = "call from another request"
+        elif not isinstance(op, str) or not isinstance(args, dict):
+            reason = "malformed call"
+        else:
+            reason = None
+        if reason:
+            if calls is not None and calls.handler is not None:
+                calls.handler.rejected(reason)
+            asyncio.ensure_future(self._rpc_reply(call_id, error=("RpcRejected", reason)))
+            return
+
+        async def run() -> None:
+            async with calls.slots:
+                try:
+                    value = await calls.handler.call(op, args)
+                except RpcError as e:
+                    await self._rpc_reply(call_id, error=(e.name, str(e)))
+                except Exception as e:  # noqa: BLE001 - the cell gets an error, never the app's traceback
+                    await self._rpc_reply(call_id, error=("InternalError", f"{type(e).__name__}: {e}"))
+                else:
+                    await self._rpc_reply(call_id, value=value)
+
+        task = asyncio.ensure_future(run())
+        calls.tasks.add(task)
+        task.add_done_callback(calls.tasks.discard)
+
+    async def _rpc_reply(self, call_id: int, value: Any = None, error: tuple[str, str] | None = None) -> None:
+        msg = {"rpc_reply": call_id, "ok": error is None}
+        if error:
+            msg["error"] = {"name": error[0], "message": error[1]}
+        else:
+            msg["value"] = value
+        with contextlib.suppress(ConnectionError, OSError):  # the REPL may be gone
+            await self._repl.send(msg)
 
     async def wait_ready(self, timeout_s: float) -> None:
         try:
@@ -133,17 +217,21 @@ class ReplClient:
             return False
         return bool(resp.get("interrupted"))
 
-    async def _bounded(self, req: dict, timeout_s: float, out: dict, keys: tuple[str, ...]) -> dict:
+    async def _bounded(
+        self, req: dict, timeout_s: float, out: dict, keys: tuple[str, ...], rpc: RpcHandler | None = None
+    ) -> dict:
         """Send, wait timeout_s, then interrupt and wait grace_s, then give up."""
+        calls: _Calls | None = None
         try:
             rid = await self._send(req)
+            calls = _Calls(rid, rpc)
             try:
-                return _merge(out, await self._reply(rid, timeout_s), keys)
+                return _merge(out, await self._reply(rid, timeout_s, calls), keys)
             except TimeoutError:
                 pass
             await self.interrupt()
             try:
-                _merge(out, await self._reply(rid, self.grace_s), keys)
+                _merge(out, await self._reply(rid, self.grace_s, calls), keys)
                 out["error"] = "TimeoutError"
             except TimeoutError:
                 out.update(error="TimeoutError", restart_required=True)
@@ -157,9 +245,12 @@ class ReplClient:
             # does not queue behind it. Its late reply is skipped by id.
             await asyncio.shield(self.interrupt())
             raise
+        finally:
+            if calls is not None:
+                calls.cancel()
 
-    async def run(self, code: str, timeout_s: float) -> dict:
-        return await self._bounded({"op": "exec", "code": code}, timeout_s, _blank(), _CODE_KEYS)
+    async def run(self, code: str, timeout_s: float, rpc: RpcHandler | None = None) -> dict:
+        return await self._bounded({"op": "exec", "code": code}, timeout_s, _blank(), _CODE_KEYS, rpc)
 
     async def command(self, command: str, timeout_s: float) -> dict:
         """The server enforces timeout_s itself; the client allows more than the

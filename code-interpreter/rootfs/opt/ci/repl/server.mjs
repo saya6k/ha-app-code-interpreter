@@ -20,7 +20,7 @@ import path from "node:path";
 import util from "node:util";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { install, killRunning } from "./globals.mjs";
+import { install, installShare, killRunning } from "./globals.mjs";
 import { transform } from "./transform.mjs";
 
 const OUT_LIMIT = 16000;
@@ -51,6 +51,7 @@ class Capped {
 // Node's built-ins and the libraries preinstalled under /opt/js.
 globalThis.require = createRequire("/opt/js/");
 install(globalThis);
+installShare(globalThis, (...a) => rpc(...a));
 
 let current = null; // the running cell or command: {interrupt()}
 let late = []; // errors from abandoned async work, reported with the next cell
@@ -221,16 +222,54 @@ function send(sock, obj) {
   sock.write(Buffer.concat([head, data]));
 }
 
-async function* frames(sock) {
+function onFrames(sock, handle) {
   let buf = Buffer.alloc(0);
-  for await (const chunk of sock) {
+  sock.on("data", (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32BE(0)) {
       const n = buf.readUInt32BE(0);
-      yield JSON.parse(buf.subarray(4, 4 + n).toString());
+      let msg;
+      try {
+        msg = JSON.parse(buf.subarray(4, 4 + n).toString());
+      } catch {
+        realExit(1); // a broken channel ends the REPL; the app restarts it
+      }
       buf = buf.subarray(4 + n);
+      handle(msg);
     }
+  });
+}
+
+// Calls to the app (share.*, ha.*) ride the REPL channel: the app answers
+// them while it waits for the reply to the request that is running, and
+// refuses calls tagged with any other request.
+let conn = null;
+let activeRequest = null;
+let nextCall = 0;
+const calls = new Map();
+
+class RpcError extends Error {
+  constructor({ name, message }) {
+    super(message);
+    this.name = name;
   }
+}
+
+function rpc(op, args = {}) {
+  if (activeRequest === null) return Promise.reject(new Error(`${op}: only available while a cell runs`));
+  const id = ++nextCall;
+  return new Promise((resolve, reject) => {
+    calls.set(id, { resolve, reject });
+    send(conn, { rpc: { id, cell: activeRequest, op, args } });
+  });
+}
+
+function settleCall(msg) {
+  const call = calls.get(msg.rpc_reply);
+  if (!call) return;
+  calls.delete(msg.rpc_reply);
+  if (msg.ok) call.resolve(msg.value);
+  else call.reject(new RpcError(msg.error ?? { name: "RpcError", message: "call failed" }));
 }
 
 function startControlHelper() {
@@ -243,20 +282,44 @@ function startControlHelper() {
   fs.closeSync(fd); // the helper holds it now
 }
 
-async function main() {
-  startControlHelper();
-  const conn = channel("REPL_FD");
-  conn.on("error", () => realExit(0));
-  let cell = 0;
-  for await (const req of frames(conn)) {
-    let resp;
-    if (req.op === "ping") resp = { pid: process.pid };
-    else if (req.op === "command") resp = await runCommand(String(req.command ?? ""), Number(req.timeout_s ?? 60));
-    else resp = await execute(String(req.code ?? ""), ++cell);
-    resp.id = req.id ?? null; // after a cancelled request the app skips stale replies
-    send(conn, resp);
+async function serve(req, cell) {
+  if (req.op === "ping") return { pid: process.pid };
+  if (req.op === "command") return runCommand(String(req.command ?? ""), Number(req.timeout_s ?? 60));
+  activeRequest = req.id ?? null;
+  try {
+    return await execute(String(req.code ?? ""), cell);
+  } finally {
+    activeRequest = null;
   }
-  realExit(0); // app side closed: the session is gone
 }
 
-main().catch(() => realExit(1)); // a broken channel ends the REPL; the app restarts it
+function main() {
+  startControlHelper();
+  conn = channel("REPL_FD");
+  conn.on("error", () => realExit(0));
+  conn.on("end", () => realExit(0)); // app side closed: the session is gone
+  const queue = [];
+  let busy = false;
+  let cell = 0;
+  const pump = async () => {
+    if (busy) return;
+    busy = true;
+    while (queue.length) {
+      const req = queue.shift();
+      const resp = await serve(req, ++cell);
+      resp.id = req.id ?? null; // after a cancelled request the app skips stale replies
+      send(conn, resp);
+    }
+    busy = false;
+  };
+  onFrames(conn, (msg) => {
+    if (msg === null || typeof msg !== "object") realExit(1); // not the app talking
+    if ("rpc_reply" in msg) settleCall(msg);
+    else {
+      queue.push(msg);
+      pump().catch(() => realExit(1));
+    }
+  });
+}
+
+main();

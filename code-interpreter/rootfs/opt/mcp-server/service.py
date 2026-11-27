@@ -21,6 +21,7 @@ import egress
 import sharefs
 from audit import Audit, code_detail, sha256
 from policy import SandboxPolicy
+from replclient import RpcError
 from sandbox import BASE_DIR, FileOpError, Sandbox, SandboxError
 from sharefs import ShareError
 from sessions import UID_BASE, Session, SessionManager, SessionNotFound
@@ -123,6 +124,51 @@ def _clamp(timeout_s: float) -> float:
     return max(1, min(float(timeout_s), MAX_TIMEOUT_S))
 
 
+class _CellCalls:
+    """What a running cell may ask the app for, on its session's behalf (SPEC
+    §3.4). Every argument comes from sandbox code: paths are checked by
+    sharefs and the agent, exactly as for the MCP tools."""
+
+    def __init__(self, service: "Service", sandbox) -> None:
+        self.service = service
+        self.sandbox = sandbox
+
+    def _fail(self, event: str, e: Exception, **detail) -> RpcError:
+        audit = self.service.audit
+        audit.record(event, self.sandbox.sid, "error", **detail, error=type(e).__name__, message=str(e))
+        if getattr(e, "violation", None):
+            audit.record("policy.violation", self.sandbox.sid, "denied", kind=e.violation, during=event, message=str(e))
+        return RpcError(type(e).__name__, str(e))
+
+    def rejected(self, reason: str) -> None:
+        self.service.audit.record("policy.violation", self.sandbox.sid, "denied", kind="rpc", message=reason)
+
+    async def call(self, op: str, args: dict):
+        svc, s = self.service, self.sandbox
+        if op == "share.list":
+            path = str(args.get("path", ""))
+            try:
+                out = await asyncio.to_thread(sharefs.list_share, path, root=svc.share_root)
+            except ShareError as e:
+                raise self._fail("share.list", e, path=path) from None
+            svc.audit.record("share.list", s.sid, path=out["path"], entries=len(out["entries"]))
+            return out
+        if op == "share.import":
+            share_path, dest = str(args.get("share_path", "")), args.get("dest")
+            try:
+                return await svc._import(s, share_path, None if dest is None else str(dest))
+            except (ShareError, FileOpError) as e:
+                raise self._fail("file.import", e, share_path=share_path) from None
+        if op == "share.export":
+            path = str(args.get("path", ""))
+            try:
+                return await svc._export(s, path)
+            except (ShareError, FileOpError) as e:
+                raise self._fail("file.export", e, path=path) from None
+        self.rejected(f"unknown call {op!r}")
+        raise RpcError("RpcRejected", f"unknown call {op!r}")
+
+
 class Service:
     def __init__(
         self,
@@ -217,7 +263,7 @@ class Service:
         async def run(s):
             t0 = time.monotonic()
             before = await snapshot(s)
-            r = await s.run_code(code, _clamp(timeout_s), reset)
+            r = await s.run_code(code, _clamp(timeout_s), reset, rpc=_CellCalls(self, s))
             after = await snapshot(s)
             changed = sorted(p for p, meta in after.items() if before.get(p) != meta)
             r["new_files"] = changed[:NEW_FILES_CAP]
@@ -254,30 +300,31 @@ class Service:
 
         return await self._call(session_id, write, "file.write", path=path, size=len(data))
 
-    async def import_from_share(self, share_path: str, session_id: str | None = None, dest: str | None = None) -> dict:
-        async def imp(s):
-            # Off the event loop: up to max_file_mb of disk I/O would stall every call.
-            data = await asyncio.to_thread(sharefs.read_share, share_path, self.max_bytes, root=self.share_root)
-            target = dest or Path(share_path).name
-            out = await s.write_file(target, data, self.max_bytes)
-            digest = await asyncio.to_thread(sha256, data)
-            self.audit.record("file.import", s.sid, share_path=share_path, path=out["path"],
-                              size=out["size"], sha256=digest)
-            return out
+    async def _import(self, s, share_path: str, dest: str | None) -> dict:
+        # Off the event loop: up to max_file_mb of disk I/O would stall every call.
+        data = await asyncio.to_thread(sharefs.read_share, share_path, self.max_bytes, root=self.share_root)
+        target = dest or Path(share_path).name
+        out = await s.write_file(target, data, self.max_bytes)
+        digest = await asyncio.to_thread(sha256, data)
+        self.audit.record("file.import", s.sid, share_path=share_path, path=out["path"],
+                          size=out["size"], sha256=digest)
+        return out
 
-        return await self._call(session_id, imp, "file.import", share_path=share_path)
+    async def _export(self, s, path: str) -> dict:
+        data, size = await s.read_file(path, self.max_bytes + 1)
+        if size > self.max_bytes:
+            raise FileOpError(f"{path} is larger than max_file_mb ({self.options.max_file_mb} MB)", "size")
+        dest = await asyncio.to_thread(sharefs.export, data, path, self.options.export_dir, s.sid, root=self.share_root)
+        digest = await asyncio.to_thread(sha256, data)
+        self.audit.record("file.export", s.sid, path=path, share_path=str(dest), size=size, sha256=digest)
+        return {"share_path": str(dest), "size": size}
+
+    async def import_from_share(self, share_path: str, session_id: str | None = None, dest: str | None = None) -> dict:
+        return await self._call(session_id, lambda s: self._import(s, share_path, dest), "file.import",
+                                share_path=share_path)
 
     async def export_to_share(self, session_id: str, path: str) -> dict:
-        async def exp(s):
-            data, size = await s.read_file(path, self.max_bytes + 1)
-            if size > self.max_bytes:
-                raise FileOpError(f"{path} is larger than max_file_mb ({self.options.max_file_mb} MB)", "size")
-            dest = await asyncio.to_thread(sharefs.export, data, path, self.options.export_dir, s.sid, root=self.share_root)
-            digest = await asyncio.to_thread(sha256, data)
-            self.audit.record("file.export", s.sid, path=path, share_path=str(dest), size=size, sha256=digest)
-            return {"share_path": str(dest), "size": size}
-
-        return await self._call(session_id, exp, "file.export", path=path)
+        return await self._call(session_id, lambda s: self._export(s, path), "file.export", path=path)
 
     async def run_command(self, command: str, session_id: str | None = None, timeout_s: float = DEFAULT_TIMEOUT_S) -> dict:
         async def cmd(s):

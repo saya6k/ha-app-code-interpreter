@@ -5,6 +5,7 @@ import json
 import pytest
 from pathlib import Path
 
+import replclient
 import service
 from audit import Audit
 from policy import SandboxPolicy
@@ -18,8 +19,17 @@ class FakeSandbox:
         self.files = {}
         self.destroyed = False
 
-    async def run_code(self, code, timeout_s, reset=False):
+    async def run_code(self, code, timeout_s, reset=False, rpc=None):
         self.last_timeout = timeout_s
+        if code.startswith("call "):  # call <op> <json args>: what the cell's share.* would send
+            op, args = code[5:].split(" ", 1)
+            try:
+                result = json.dumps(await rpc.call(op, json.loads(args)))
+                error = None
+            except replclient.RpcError as e:
+                result, error = None, f"{e.name}: {e}"
+            return {"stdout": "", "stderr": "", "result": result, "error": error,
+                    "truncated": False, "kernel_restarted": False}
         if reset:
             self.vars.clear()
         if code.startswith("touch "):
@@ -442,3 +452,34 @@ def test_self_check_fails_closed_when_cleanup_or_run_fails(tmp_path):
         assert "did not restart" in await svc2.self_check()
 
     run(go())
+
+
+def call(svc, sid, op, **args):
+    return asyncio.run(svc.run_code(f"call {op} {json.dumps(args)}", session_id=sid))
+
+
+def test_cell_share_list_import_and_export(tmp_path):
+    svc, _ = make(tmp_path)
+    (tmp_path / "share" / "energy.csv").write_text("kwh\n1\n")
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    listed = json.loads(call(svc, sid, "share.list")["result"])
+    assert {"name": "energy.csv", "type": "file", "size": 6} in listed["entries"]
+    r = call(svc, sid, "share.import", share_path="energy.csv", dest="in.csv")
+    assert json.loads(r["result"]) == {"path": "/sandbox/in.csv", "size": 6}
+    r = call(svc, sid, "share.export", path="/sandbox/in.csv")
+    out = json.loads(r["result"])
+    assert out["share_path"].endswith(f"/code-interpreter/{sid}/in.csv")
+    assert {"share.list", "file.import", "file.export"} <= {e["event"] for e in events(tmp_path)}
+
+
+def test_cell_share_errors_reach_the_cell_and_the_audit(tmp_path):
+    svc, _ = make(tmp_path)
+    sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]
+    r = call(svc, sid, "share.import", share_path="../etc/passwd")
+    assert r["error"].startswith("ShareError: ") and "outside /share" in r["error"]
+    r = call(svc, sid, "share.list", path="..")
+    assert r["error"].startswith("ShareError: ")
+    r = call(svc, sid, "nope.op")
+    assert r["error"] == "RpcRejected: unknown call 'nope.op'"
+    kinds = [e["detail"].get("kind") for e in events(tmp_path) if e["event"] == "policy.violation"]
+    assert kinds.count("traversal") == 2 and "rpc" in kinds
