@@ -11,6 +11,7 @@ import signal
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 
+import mcpauth
 import stdin
 import web
 from audit import AUDIT_DIR, Audit
@@ -28,8 +29,10 @@ META_USER_ID = "io.home-assistant/user_id"
 
 def caller(ctx: Context) -> str | None:
     """The Home Assistant user in the conversation. Home Assistant's MCP client
-    sends it only to servers it found through Supervisor discovery (this app);
-    any other client, or a pipeline with no user, is anonymous."""
+    sends it only to servers it found through Supervisor discovery (this app),
+    and only Home Assistant holds the token every request needs (mcpauth), so
+    the id is not something another client can claim. A pipeline with no user
+    (a satellite) is anonymous."""
     meta = ctx.request_context.meta
     user = (getattr(meta, "model_extra", None) or {}).get(META_USER_ID) if meta else None
     return user if isinstance(user, str) and user else None
@@ -170,8 +173,13 @@ async def main() -> None:
     # re-raises the signal. With the default handler that kills the process
     # before the cleanup below; a no-op handler lets serve() return instead.
     signal.signal(signal.SIGTERM, lambda *_: None)
+    token = mcpauth.load_or_create()
+    api = uvicorn.Server(uvicorn.Config(
+        mcpauth.RequireToken(mcp.streamable_http_app(), token), host=mcp.settings.host, port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    ))
     try:
-        await mcp.run_streamable_http_async()
+        await api.serve()
     finally:
         requests.close()
         ui.should_exit = True

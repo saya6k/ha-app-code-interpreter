@@ -10,6 +10,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 URL = "http://127.0.0.1:8099/mcp"
+# What Home Assistant gets through discovery (mcpauth): every request needs it.
+AUTH = {"Authorization": "Bearer " + open("/data/mcp_token").read().strip()}
 fails = 0
 
 
@@ -113,7 +115,7 @@ async def ha_like_long_call() -> None:
     import httpx
     from mcp.client.streamable_http import streamable_http_client
 
-    async with httpx.AsyncClient() as http, streamable_http_client(url=URL, http_client=http) as (r, w, _):
+    async with httpx.AsyncClient(headers=AUTH) as http, streamable_http_client(url=URL, http_client=http) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
             try:
@@ -161,10 +163,24 @@ def ingress_ui(sid: str) -> None:
     check(f"ingress UI refuses a non-Ingress client ({own_ip})", status == 403, status)
 
 
+def refuses_without_token() -> None:
+    import urllib.error
+    import urllib.request
+
+    for headers in ({}, {"Authorization": "Bearer wrong"}):
+        try:
+            urllib.request.urlopen(urllib.request.Request(URL, method="POST", headers=headers, data=b"{}"), timeout=10)
+            status = 200
+        except urllib.error.HTTPError as e:
+            status = e.code
+        check(f"MCP refuses {'a wrong' if headers else 'no'} token", status == 401, status)
+
+
 async def main(idle_wait_s: int, mode: str) -> int:
     if mode == "default":
+        refuses_without_token()
         await ha_like_long_call()
-    async with streamablehttp_client(URL) as (read, write, _):
+    async with streamablehttp_client(URL, headers=AUTH) as (read, write, _):
         async with ClientSession(read, write) as s:
             await s.initialize()
             call = lambda name, **args: s.call_tool(name, args)  # noqa: E731
