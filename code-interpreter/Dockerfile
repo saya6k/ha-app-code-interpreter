@@ -112,3 +112,7 @@ RUN find /etc/s6-overlay/s6-rc.d -type f \( -name run -o -name finish \) -exec c
  && find /etc/s6-overlay/s6-rc.d -type f -name type -exec chmod 644 {} \;
 
 WORKDIR /
+
+# Only the main program receives the container's stdin (hassio.app_stdin);
+# it hands each line to the MCP server. s6 still supervises the services.
+CMD ["/opt/venv/bin/python3", "/opt/mcp-server/stdin_reader.py"]

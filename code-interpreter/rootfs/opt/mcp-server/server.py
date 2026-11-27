@@ -11,6 +11,7 @@ import signal
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 
+import stdin
 import web
 from audit import AUDIT_DIR, Audit
 from service import DEFAULT_TIMEOUT_S, Service, load_options
@@ -155,6 +156,7 @@ async def main() -> None:
         log.info("[hab] %d commands; %d allow and %d deny rules", n, len(rules.allow), len(rules.deny))
     except Exception as e:  # noqa: BLE001 - ha.admin.hab() then answers HabUnavailable
         log.error("[hab] unavailable: %s", e)
+    requests = await stdin.serve(svc.handle_stdin)
     reaper = asyncio.create_task(svc.run_reaper())
     pruner = asyncio.create_task(prune_audit())
     ui = _EmbeddedServer(uvicorn.Config(
@@ -168,6 +170,7 @@ async def main() -> None:
     try:
         await mcp.run_streamable_http_async()
     finally:
+        requests.close()
         ui.should_exit = True
         with contextlib.suppress(Exception):
             await asyncio.wait_for(ui_task, 5)

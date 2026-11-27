@@ -90,7 +90,7 @@
         <option>file.import</option><option>file.export</option><option>file.write</option>
         <option>file.read</option><option>file.list</option>
         <option>net.connect</option><option>policy.violation</option><option>ui.close_session</option>
-        <option>skill.proposed</option><option>skill.review</option><option>skill.used</option>
+        <option>skill.requested</option><option>skill.proposed</option><option>skill.review</option><option>skill.used</option>
         <option>skill.approved</option><option>skill.rejected</option><option>skill.deleted</option>
       </select></label>
       <span class="muted" id="events-note"></span>
@@ -152,7 +152,14 @@ async function loadSkills() {
               el("td", status), el("td", v.description), buttons);
     const code = el("tr"); const td = el("td"); td.colSpan = 5;
     const det = el("details"); det.append(el("summary", `code${k.pending && k.active ? " (proposed)" : ""} · ${v.params || "no params"}`), el("pre", v.code, "mono"));
-    td.append(det); code.append(td);
+    // The manifest only describes the code; the skill runs with the speaker's rights.
+    const check = k.check[k.pending ? "pending" : "active"] || { undeclared: [], dynamic: [] };
+    const uses = v.uses || {};
+    const declared = [...(uses.ha || []), ...(uses.hab || []).map((c) => "hab " + c)];
+    td.append(det, el("div", "uses: " + (declared.join(", ") || "nothing declared"), "muted mono"));
+    if (check.undeclared.length) td.append(el("div", "⚠ calls not in uses: " + check.undeclared.join(", "), "badge warn"));
+    if (check.dynamic.length) td.append(el("div", "⚠ calls through a variable (not checked): " + check.dynamic.join(", "), "badge warn"));
+    code.append(td);
     tbody.append(tr, code);
   }
 }

@@ -23,13 +23,23 @@ class FakeHA:
         return {"u1": "Alice"}
 
 
+class FakeReviewer:
+    def __init__(self):
+        self.dismissed = []
+
+    async def dismiss(self, user, name):
+        self.dismissed.append((user, name))
+
+
 class FakeService:
     def __init__(self, audit, skills_dir):
         self.options = Options(policy=SandboxPolicy(allowlist=("pypi.org",)), skill_workflow=True)
         self.audit = audit
         self.ha = FakeHA()
+        self.reviewer = FakeReviewer()
         self.skills = SkillStore(skills_dir)
-        self.skills.propose("u1", "greet", "says hi", "{}", "async () => 'hi'", {})
+        self.skills.propose("u1", "greet", "says hi", "{}", "async () => ha.intent.HassTurnOn({})", {},
+                            uses={"ha": ["intent__HassTurnOff"]})
         self.open = {"abc": {"session_id": "abc", "created": 1.0, "last_used": 2.0, "expires_in_s": 90}}
 
     def list_sessions(self, everyone=False):
@@ -116,11 +126,13 @@ def test_skills_are_listed_and_need_the_ui_header_to_approve(env):
     body = client.get("/api/skills").json()
     assert body["workflow"] is True
     (k,) = body["skills"]
-    assert (k["user"], k["name"], k["active"], k["pending"]["code"]) == ("Alice", "greet", None, "async () => 'hi'")
+    assert (k["user"], k["name"], k["active"], k["pending"]["code"]) == ("Alice", "greet", None, "async () => ha.intent.HassTurnOn({})")
+    assert k["check"] == {"pending": {"undeclared": ["intent__HassTurnOn"], "dynamic": []}}
     assert client.post("/api/skills/u1/greet/approve").status_code == 403
     r = client.post("/api/skills/u1/greet/approve", headers={"X-Requested-With": "code-interpreter-ui",
                                                               "X-Remote-User-Name": "admin"})
     assert r.status_code == 200 and svc.skills.get("u1", "greet")["active"]["approved_by"] == "admin"
+    assert svc.reviewer.dismissed == [("u1", "greet")]  # the approval notification is done
     assert client.post("/api/skills/u1/greet/approve", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 400
     assert client.post("/api/skills/u1/greet/explode", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 404
     assert client.post("/api/skills/..%2Fx/greet/delete", headers={"X-Requested-With": "code-interpreter-ui"}).status_code in (400, 404)

@@ -436,6 +436,23 @@ class FakeHA:
     def __init__(self, admins=("alice",)):
         self.admins = set(admins)
         self.calls = []
+        self.notes = []
+        self.users = {"alice": "Alice", "bob": "Bob"}
+
+    def known_users(self):
+        return dict(self.users)
+
+    async def find_user(self, who):
+        found = [uid for uid, name in self.users.items() if who.casefold() in (uid, name.casefold())]
+        if len(found) != 1:
+            raise LookupError(f"no active Home Assistant user {who!r}")
+        return found[0]
+
+    async def notify(self, notification_id, title, message):
+        self.notes.append(("create", notification_id, message))
+
+    async def dismiss(self, notification_id):
+        self.notes.append(("dismiss", notification_id))
 
     async def is_admin(self, user_id):
         return user_id in self.admins
@@ -671,7 +688,8 @@ def test_cells_use_only_their_users_approved_skills(tmp_path):
     svc.skills.propose("alice", "greet", "", "", "async () => 1", {})
     sid = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
     listed = json.loads(asyncio.run(svc.run_code("call skills.list {}", session_id=sid, user_id="alice"))["result"])
-    assert listed == [{"name": "greet", "status": "pending", "description": "", "params": "", "update_pending": False}]
+    assert listed == [{"name": "greet", "status": "pending", "description": "", "params": "",
+                       "uses": {"ha": [], "hab": [], "plugins": []}, "update_pending": False}]
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
     assert r["error"].startswith("NotApproved: ")
     svc.skills.approve("alice", "greet", "admin")
@@ -699,3 +717,77 @@ def test_nothing_is_remembered_while_the_workflow_is_off(tmp_path):
     svc, _ = skill_service(tmp_path, {}, skill_workflow=False)
     asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))
     assert svc.reviewer._history == {}
+
+
+def test_a_proposal_carries_its_manifest_and_notifies_the_administrators(tmp_path):
+    answer = {"save": True, "name": "lights_off_except", "description": "turns lights off", "params": "{ except }",
+              "code": "async () => ha.intent.HassTurnOff({ name: 'x' })", "reason": "repeatable",
+              "uses": '{"ha": ["intent__HassTurnOff"], "hab": [], "junk": [1]}'}
+    svc, _ = skill_service(tmp_path, answer)
+    sid = asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))["session_id"]
+    finish(svc, sid)
+    pending = svc.skills.get("alice", "lights_off_except")["pending"]
+    assert pending["uses"] == {"ha": ["intent__HassTurnOff"], "hab": [], "plugins": []}
+    ((kind, nid, message),) = svc.ha.notes
+    assert kind == "create" and nid == "code_interpreter_skill_alice_lights_off_except"
+    assert "Alice" in message and "lights_off_except" in message and "HassTurnOff" not in message  # no code
+
+
+def test_a_failed_notification_keeps_the_proposal(tmp_path):
+    answer = {"save": True, "name": "x_skill", "code": "async () => 1", "reason": "r"}
+    svc, _ = skill_service(tmp_path, answer)
+
+    async def down(*a):
+        raise hamcp.HaUnavailable("persistent_notification.create failed (500)")
+
+    svc.ha.notify = down
+    sid = asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))["session_id"]
+    finish(svc, sid)
+    assert svc.skills.get("alice", "x_skill")["pending"]["code"] == "async () => 1"
+
+
+def request(svc, line):
+    async def go():
+        svc.handle_stdin(line)
+        await svc.reviewer.wait()
+
+    asyncio.run(go())
+
+
+def test_a_skill_request_from_stdin_becomes_a_pending_skill(tmp_path):
+    answer = {"save": True, "name": "lights_off_except", "description": "d", "params": "{ except }",
+              "code": "async ({ except: room }) => room", "reason": "asked", "uses": '{"ha": ["intent__HassTurnOff"]}'}
+    svc, _ = skill_service(tmp_path, answer)
+    request(svc, json.dumps({"type": "skill.request", "user": "Bob", "request": "거실 빼고 불 끄기"}))
+    ((instructions, _),) = svc.ha.asked
+    assert "거실 빼고 불 끄기" in instructions and "intent__HassTurnOff" in instructions
+    assert "trace__get_trace" not in instructions  # bob is not an administrator
+    skill = svc.skills.get("bob", "lights_off_except")
+    assert skill["active"] is None and skill["pending"]["source"]["request"] == "거실 빼고 불 끄기"
+    ev = [e for e in events(tmp_path) if e["event"] in ("skill.requested", "skill.proposed")]
+    assert [e["event"] for e in ev] == ["skill.requested", "skill.proposed"] and ev[0]["detail"]["user_id"] == "bob"
+    assert svc.ha.notes[0][1] == "code_interpreter_skill_bob_lights_off_except"
+
+
+def test_an_administrators_request_lists_the_read_only_admin_tools(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "cannot"})
+    request(svc, json.dumps({"type": "skill.request", "user": "alice", "request": "trace report"}))
+    ((instructions, _),) = svc.ha.asked
+    assert "admin.trace__get_trace" in instructions and "call_action" not in instructions
+    assert svc.skills.list("alice") == []
+
+
+def test_skill_requests_are_refused_when_off_unknown_or_malformed(tmp_path):
+    svc, _ = skill_service(tmp_path, {}, skill_workflow=False)
+    request(svc, json.dumps({"type": "skill.request", "user": "bob", "request": "x"}))
+    (tmp_path / "b").mkdir()
+    on, _ = skill_service(tmp_path / "b", {})
+    request(on, json.dumps({"type": "skill.request", "user": "nobody", "request": "x"}))
+    request(on, json.dumps({"type": "skill.request", "user": "", "request": "x"}))
+    request(on, "not json")
+    request(on, json.dumps({"type": "something.else"}))
+    assert svc.ha.asked == [] and on.ha.asked == []
+    (off,) = [e for e in events(tmp_path) if e["event"] == "skill.requested"]
+    assert off["outcome"] == "denied" and off["detail"]["reason"] == "skill_workflow is off"
+    ev = [(e["event"], e["outcome"]) for e in events(tmp_path / "b") if e["event"] in ("skill.requested", "stdin")]
+    assert ev == [("skill.requested", "error"), ("skill.requested", "error"), ("stdin", "error"), ("stdin", "error")]

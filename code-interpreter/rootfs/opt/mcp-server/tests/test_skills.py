@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from skills import CODE_CAP, SkillError, SkillStore
+from skills import CODE_CAP, SkillError, SkillStore, manifest_check, parse_uses
 
 CODE = "async ({ room }) => room"
 
@@ -58,3 +58,43 @@ def test_files_are_json_with_both_versions(tmp_path):
     st.propose("u1", "a", "d", "p", CODE, {"session_id": "s"})
     data = json.loads((tmp_path / "u1" / "a.json").read_text())
     assert set(data) == {"name", "active", "pending"} and data["pending"]["source"] == {"session_id": "s"}
+
+
+def test_uses_are_normalized_from_json_or_objects():
+    assert parse_uses('{"ha": ["b", "a", "a", 3], "hab": "x"}') == {"ha": ["a", "b"], "hab": [], "plugins": []}
+    assert parse_uses("not json") == parse_uses(None) == {"ha": [], "hab": [], "plugins": []}
+
+
+def test_propose_stores_the_manifest(tmp_path):
+    st = SkillStore(tmp_path)
+    st.propose("u1", "a", "", "", CODE, {}, uses={"ha": ["intent__HassTurnOff"]})
+    assert st.get("u1", "a")["pending"]["uses"] == {"ha": ["intent__HassTurnOff"], "hab": [], "plugins": []}
+
+
+CHECKED = """async ({ room }) => {
+  const { entities } = await ha.homeassistant.GetLiveContext();
+  await ha.intent.HassTurnOff({ name: room });
+  await ha.call("light__HassLightSet", { name: room });
+  await ha.admin.history.get_history({});
+  await ha.admin.call('trace__get_trace', {});
+  await ha.admin.hab(["automation", "get", room]);
+  await ha.admin.hab(["script", "set", "x"]);
+  const tools = await ha.tools();
+}"""
+
+
+def test_manifest_check_lists_undeclared_calls():
+    uses = {"ha": ["homeassistant__GetLiveContext", "intent__HassTurnOff", "admin.history__get_history"],
+            "hab": ["automation get"]}
+    assert manifest_check(CHECKED, uses) == {
+        "undeclared": ["admin.trace__get_trace", "light__HassLightSet", "hab script set x"], "dynamic": []}
+    full = {"ha": uses["ha"] + ["admin.trace__get_trace", "light__HassLightSet"], "hab": ["automation get", "script"]}
+    assert manifest_check(CHECKED, full) == {"undeclared": [], "dynamic": []}
+
+
+def test_manifest_check_flags_calls_it_cannot_read():
+    code = "async ({ tool, argv }) => { await ha.call(tool, {}); await ha.admin.hab(argv); await ha.admin.hab([argv[0]]); }"
+    assert manifest_check(code, {}) == {"undeclared": [], "dynamic": ["ha.admin.hab", "ha.call"]}
+    # a prefix that is not a whole word does not cover a command
+    assert manifest_check('ha.admin.hab(["automations", "list"])', {"hab": ["automation"]})["undeclared"] == [
+        "hab automations list"]
