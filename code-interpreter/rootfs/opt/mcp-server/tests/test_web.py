@@ -27,7 +27,7 @@ class FakeReviewer:
     def __init__(self):
         self.dismissed = []
 
-    async def dismiss(self, user, name):
+    def dismiss(self, user, name):
         self.dismissed.append((user, name))
 
 

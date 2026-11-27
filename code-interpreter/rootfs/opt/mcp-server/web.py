@@ -99,7 +99,7 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
             return JSONResponse({"error": str(e)}, status_code=400)
         svc.audit.record(f"skill.{action}d" if action != "reject" else "skill.rejected", None,
                          user_id=user, name=name, by=by)
-        await svc.reviewer.dismiss(user, name)
+        svc.reviewer.dismiss(user, name)
         return JSONResponse({"ok": True})
 
     async def audit_days(request: Request) -> Response:

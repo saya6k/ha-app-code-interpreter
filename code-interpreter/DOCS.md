@@ -197,8 +197,8 @@ sessions:
    general function with parameters, for example `turn_off_lights_except({
    except: "거실" })`.
 3. The proposal is stored **pending** for that user only, and Home Assistant
-   shows a notification that a skill waits for approval (without its code:
-   every user sees notifications). An administrator reads the code in the
+   shows a notification that a skill waits for approval (only the user and
+   the skill's name: every user sees notifications). An administrator reads the code in the
    panel's **Skills** section and approves or rejects it; that clears the
    notification. A new proposal for an existing skill waits beside the
    approved version until it is approved.

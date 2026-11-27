@@ -738,7 +738,8 @@ def test_a_proposal_carries_its_manifest_and_notifies_the_administrators(tmp_pat
     assert pending["uses"] == {"ha": ["intent__HassTurnOff"], "hab": [], "plugins": []}
     ((kind, nid, message),) = svc.ha.notes
     assert kind == "create" and nid == "code_interpreter_skill_alice_lights_off_except"
-    assert "Alice" in message and "lights_off_except" in message and "HassTurnOff" not in message  # no code
+    assert "Alice" in message and "lights_off_except" in message
+    assert "HassTurnOff" not in message and "turns lights off" not in message  # no code, no model-written text
 
 
 def test_a_failed_notification_keeps_the_proposal(tmp_path):

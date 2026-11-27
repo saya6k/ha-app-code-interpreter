@@ -92,6 +92,13 @@ def test_manifest_check_lists_undeclared_calls():
     assert manifest_check(CHECKED, full) == {"undeclared": [], "dynamic": []}
 
 
+def test_manifest_check_reads_optional_chaining():
+    code = ("async () => { await ha.admin?.history.get_history({}); await ha?.intent.HassTurnOff({}); "
+            "await ha.admin?.call('trace__get_trace'); await ha.admin?.hab(['automation', 'list']); }")
+    assert manifest_check(code, {}) == {"undeclared": ["admin.history__get_history", "admin.trace__get_trace",
+                                                       "intent__HassTurnOff", "hab automation list"], "dynamic": []}
+
+
 def test_manifest_check_flags_calls_it_cannot_read():
     code = "async ({ tool, argv }) => { await ha.call(tool, {}); await ha.admin.hab(argv); await ha.admin.hab([argv[0]]); }"
     assert manifest_check(code, {}) == {"undeclared": [], "dynamic": ["ha.admin.hab", "ha.call"]}
