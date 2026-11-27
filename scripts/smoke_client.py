@@ -95,11 +95,26 @@ async def open_two(call) -> None:
         json.dump(sids, f)
 
 
+def panel(path: str, method: str = "GET") -> dict:
+    """The Ingress panel's API (loopback is allowed): sessions are listed and
+    closed there, not through MCP tools."""
+    import urllib.request
+
+    headers = {"X-Requested-With": "code-interpreter-ui"} if method == "POST" else {}
+    with urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8098" + path, method=method,
+                                                       headers=headers), timeout=10) as r:
+        return json.loads(r.read())
+
+
+def live_sessions() -> list:
+    return panel("/api/sessions")["sessions"]
+
+
 async def after_kill(call) -> None:
     with open(SIDS) as f:
         old = json.load(f)
-    r = payload(await call("list_sessions"))
-    check("after kill+restart: no sessions", r["sessions"] == [], r)
+    r = live_sessions()
+    check("after kill+restart: no sessions", r == [], r)
     left = sum(procs_of(u) for u in range(59999, 60010))
     check("after kill+restart: no sandbox processes", left == 0, left)
     check("after kill+restart: no session dirs", os.listdir("/var/cache/code-interpreter") == [],
@@ -125,7 +140,7 @@ async def ha_like_long_call() -> None:
                 res = {"error": f"{type(e).__name__}: {e}"}
             check("8 s call through a 5 s read timeout (HA client)", res.get("result") == "slept", res)
             if res.get("session_id"):
-                await s.call_tool("close_session", {"session_id": res["session_id"]})
+                await asyncio.to_thread(panel, f"/api/sessions/{res['session_id']}/close", "POST")
 
 
 def ingress_ui(sid: str) -> None:
@@ -197,7 +212,7 @@ async def main(idle_wait_s: int, mode: str) -> int:
             check("hab binary runs and lists its commands", found.get("hab automation update") == "write", found or p.stdout[-200:])
 
             names = sorted(t.name for t in (await s.list_tools()).tools)
-            check("tools/list", names == ["close_session", "list_sessions", "run_code"], names)
+            check("tools/list", names == ["run_code"], names)
 
             r1 = payload(await call("run_code", code="x = 20"))
             sid = r1.get("session_id")
@@ -214,8 +229,8 @@ async def main(idle_wait_s: int, mode: str) -> int:
             r = payload(await call("run_code", code="1", session_id="deadbeefdeadbeef"))
             check("unknown session -> session_not_found", r.get("error") == "session_not_found", r)
 
-            r = payload(await call("list_sessions"))
-            check("list_sessions", [x["session_id"] for x in r["sessions"]] == [sid], r)
+            r = await asyncio.to_thread(live_sessions)
+            check("panel lists the session", [x["session_id"] for x in r] == [sid], r)
             ui_sid = payload(await call("run_code", code="1"))["session_id"]
             await asyncio.to_thread(ingress_ui, ui_sid)
 
@@ -259,9 +274,9 @@ async def main(idle_wait_s: int, mode: str) -> int:
 
             if idle_wait_s:
                 deadline = time.time() + idle_wait_s
-                while time.time() < deadline and payload(await call("list_sessions"))["sessions"]:
+                while time.time() < deadline and await asyncio.to_thread(live_sessions):
                     await asyncio.sleep(5)
-                left = payload(await call("list_sessions"))["sessions"]
+                left = await asyncio.to_thread(live_sessions)
                 await asyncio.sleep(1)
                 check(f"idle expiry within {idle_wait_s}s", not left and procs_of(60000) == 0
                       and not os.listdir("/var/cache/code-interpreter"), left)
