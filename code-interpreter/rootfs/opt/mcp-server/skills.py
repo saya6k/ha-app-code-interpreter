@@ -74,10 +74,11 @@ def parse_uses(raw) -> dict[str, list[str]]:
 
 
 _LIT = r"""["'`]([^"'`\\$]+)["'`]"""  # a plain string literal (no ${} in a template)
-_ADMIN_TOOL = re.compile(r"\bha\.admin\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(")
-_TOOL = re.compile(r"\bha\.([A-Za-z_]\w*)\.([A-Za-z_]\w*)\s*\(")
-_CALL = re.compile(r"\bha\.(admin\.)?call\s*\(\s*(?:" + _LIT + ")?")
-_HAB = re.compile(r"\bha\.admin\.hab\s*\(\s*(\[[^\]]*\])?")
+_DOT = r"\??\."  # . or ?. (ha.admin?.x, as the tool description shows)
+_ADMIN_TOOL = re.compile(r"\bha" + _DOT + "admin" + _DOT + r"([A-Za-z_]\w*)" + _DOT + r"([A-Za-z_]\w*)\s*\(")
+_TOOL = re.compile(r"\bha" + _DOT + r"([A-Za-z_]\w*)" + _DOT + r"([A-Za-z_]\w*)\s*\(")
+_CALL = re.compile(r"\bha" + _DOT + "(admin" + _DOT + r")?call\s*\(\s*(?:" + _LIT + ")?")
+_HAB = re.compile(r"\bha" + _DOT + "admin" + _DOT + r"hab\s*\(\s*(\[[^\]]*\])?")
 _WORD = re.compile(_LIT)
 
 
@@ -281,14 +282,17 @@ class SkillReviewer:
         cells.append({"code": code[:REVIEW_CODE_CAP], "error": error, "ha_calls": ha_calls})
         del cells[:-HISTORY]
 
+    def _spawn(self, coro) -> None:
+        task = asyncio.ensure_future(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     def session_ended(self, sid: str, owner: str | None, reason: str) -> None:
         history = self._history.pop(sid, [])
         cells = [c for c in history if not c["error"] and worth_reviewing(c["code"])]
         if not (self.enabled and owner and cells) or reason == "shutdown":
             return
-        task = asyncio.ensure_future(self._review(owner, sid, cells[-REVIEW_CELLS:]))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._spawn(self._review(owner, sid, cells[-REVIEW_CELLS:]))
 
     async def wait(self) -> None:
         await asyncio.gather(*self._tasks)
@@ -314,14 +318,19 @@ class SkillReviewer:
                           ai_task_entity=self.entity_id or "preferred")
         who = self.ha.known_users().get(user_id) or user_id
         try:
+            # Every user sees notifications, rendered as Markdown: only the user's
+            # name and the checked skill name, never model-written text.
             await self.ha.notify(notification_id(user_id, name), "Code Interpreter: a skill waits for approval",
-                                 f"{who}: `{name}` — {description[:TEXT_CAP]}\n\n"
-                                 "Approve or reject it in the Code Interpreter panel.")
+                                 f"{who}: `{name}`\n\nApprove or reject it in the Code Interpreter panel.")
         except HaUnavailable as e:  # the proposal stands; the panel still shows it
             log.warning("[skills] notification for %s failed: %s", name, e)
 
-    async def dismiss(self, user_id: str, name: str) -> None:
-        """The proposal was handled in the panel: its notification is done."""
+    def dismiss(self, user_id: str, name: str) -> None:
+        """The proposal was handled in the panel: its notification is done.
+        In the background, so a slow Home Assistant does not hold the panel."""
+        self._spawn(self._dismiss(user_id, name))
+
+    async def _dismiss(self, user_id: str, name: str) -> None:
         try:
             await self.ha.dismiss(notification_id(user_id, name))
         except HaUnavailable as e:
@@ -344,9 +353,7 @@ class SkillReviewer:
     def request(self, who: str, text: str) -> None:
         """A skill asked for by name through the app's stdin
         (hassio.app_stdin, administrators only), handled in the background."""
-        task = asyncio.ensure_future(self._request(who, text))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._spawn(self._request(who, text))
 
     async def _request(self, who: str, text: str) -> None:
         detail = {"user": who[:100], "request": text[:REQUEST_CAP]}
