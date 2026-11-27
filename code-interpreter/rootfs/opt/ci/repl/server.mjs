@@ -20,6 +20,7 @@ import path from "node:path";
 import util from "node:util";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
+import { install, killRunning } from "./globals.mjs";
 import { transform } from "./transform.mjs";
 
 const OUT_LIMIT = 16000;
@@ -49,6 +50,7 @@ class Capped {
 // Cells run as scripts in this (ES module) process: give them require for
 // Node's built-ins and the libraries preinstalled under /opt/js.
 globalThis.require = createRequire("/opt/js/");
+install(globalThis);
 
 let current = null; // the running cell or command: {interrupt()}
 let late = []; // errors from abandoned async work, reported with the next cell
@@ -79,7 +81,8 @@ function formatResult(value) {
   if (typeof value === "string") return value;
   const proto = value !== null && typeof value === "object" ? Object.getPrototypeOf(value) : undefined;
   const plain = value === null || ["number", "boolean"].includes(typeof value) ||
-    Array.isArray(value) || proto === Object.prototype || proto === null;
+    Array.isArray(value) || proto === Object.prototype || proto === null ||
+    typeof value?.toJSON === "function"; // e.g. a $ result
   if (plain) {
     try {
       return JSON.stringify(value);
@@ -88,6 +91,16 @@ function formatResult(value) {
     }
   }
   return util.inspect(value, { depth: 4, breakLength: 120 });
+}
+
+// ({a: $`…`, b: fetch(…)}) returns once its promises have settled, so a cell
+// can start work in parallel and hand back every result.
+async function awaitMembers(value) {
+  const proto = value !== null && typeof value === "object" ? Object.getPrototypeOf(value) : undefined;
+  if (Array.isArray(value)) return Promise.all(value);
+  if (proto !== Object.prototype && proto !== null) return value;
+  const entries = await Promise.all(Object.entries(value).map(async ([k, v]) => [k, await v]));
+  return Object.fromEntries(entries);
 }
 
 async function execute(code, cell) {
@@ -103,7 +116,12 @@ async function execute(code, cell) {
   process.stdout.write = sink(out);
   process.stderr.write = sink(err);
   const stopped = new Promise((_, reject) => {
-    current = { interrupt: () => reject(new Interrupted("interrupted")) };
+    current = {
+      interrupt: () => {
+        killRunning(); // $ commands of this cell (and any still running from earlier ones)
+        reject(new Interrupted("interrupted"));
+      },
+    };
   });
   stopped.catch(() => {});
   let result = null;
@@ -116,6 +134,7 @@ async function execute(code, cell) {
     });
     let value = await Promise.race([script.runInThisContext({ breakOnSigint: true }), stopped]);
     if (value !== null && typeof value?.then === "function") value = await Promise.race([value, stopped]);
+    value = await Promise.race([awaitMembers(value), stopped]);
     result = formatResult(value);
     if (result !== null && result.length > RESULT_LIMIT) {
       result = result.slice(0, RESULT_LIMIT);

@@ -209,6 +209,33 @@ def test_require_reaches_node_builtins(repl):
     assert repl("require('node:path').join('a', 'b')")["result"] == "a/b"
 
 
+def test_shell_result_shows_exit_and_output(repl):
+    assert repl("await $`echo hi`")["result"] == '{"exitCode":0,"stdout":"hi\\n","stderr":""}'
+
+
+def test_promises_in_a_returned_object_are_awaited(repl):
+    r = repl("({a: $`echo a`.text(), b: Promise.resolve(2), c: 3})")
+    assert r["result"] == '{"a":"a\\n","b":2,"c":3}'
+
+
+def test_failing_command_is_a_shell_error(repl):
+    r = repl("await $`exit 5`")
+    assert r["error"] == "ShellError" and "exit code 5" in r["stderr"]
+
+
+def test_log_writes_to_stdout(repl):
+    assert repl("log('a', 1, {b: 2})")["stdout"] == "a 1 { b: 2 }\n"
+
+
+def test_timeout_kills_running_shell_commands(repl):
+    marker = os.path.join(repl.sandbox_dir, "marker")
+    r = repl("await $`sleep 2; touch marker`", timeout=0.5)
+    assert r["error"] == "TimeoutError" and r["restart_required"] is False
+    repl.do(asyncio.sleep(2.5))
+    assert not os.path.exists(marker)
+    assert repl("await $`echo ok`.text()")["result"] == "ok\n"
+
+
 def test_wait_ready_fails_closed_when_peer_is_gone():
     (app_repl, app_ctl), (child_repl, child_ctl) = socketpairs()
     child_repl.close()
