@@ -20,6 +20,8 @@ panel_title: Code Interpreter
 # /core/api/mcp/<api> and the websocket API through the Supervisor proxy:
 # the app calls Home Assistant's MCP Server for the cells (ha.*).
 homeassistant_api: true
+# hassio.app_stdin: skill requests from automations and scripts (DOCS: Skills).
+stdin: true
 map:
   - share:rw
 discovery:

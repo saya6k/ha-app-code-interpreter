@@ -195,19 +195,53 @@ sessions:
 2. The AI Task decides whether one task is worth keeping and rewrites it as a
    general function with parameters, for example `turn_off_lights_except({
    except: "거실" })`.
-3. The proposal is stored **pending** for that user only. An administrator
-   reads the code in the panel's **Skills** section and approves or rejects
-   it. A new proposal for an existing skill waits beside the approved
-   version until it is approved.
+3. The proposal is stored **pending** for that user only, and Home Assistant
+   shows a notification that a skill waits for approval (only the user and
+   the skill's name: every user sees notifications). An administrator reads the code in the
+   panel's **Skills** section and approves or rejects it; that clears the
+   notification. A new proposal for an existing skill waits beside the
+   approved version until it is approved.
 4. Scripts see their user's skills with `skills.list()` and run approved
    ones as `skills.<name>(args)`, with the same permissions as any other
    code.
 
+### Asking for a skill
+
+An administrator can also ask for a skill directly, from an automation, a
+script or **Developer tools → Actions**:
+
+```yaml
+action: hassio.app_stdin
+data:
+  app: <this app's slug, e.g. 03f32180_code-interpreter>
+  input:
+    type: skill.request
+    user: Bob            # name, username or user id of the skill's owner
+    request: Turn off every light except the living room's
+```
+
+The AI Task writes the skill from the request, using only the Home Assistant
+tools that user can call, and it is stored pending like any other proposal.
+The action returns nothing; the outcome is in the audit log
+(`skill.requested`, then `skill.proposed` or `skill.review`). A name that
+matches no user or several users is refused: use the username then. Requests
+are ignored while `skill_workflow` is off.
+
+### What a skill uses
+
+Each proposal lists what it calls (`uses`): Home Assistant tools, and hab
+commands for administrators. The panel shows the list, and warns about calls
+in the code that the list leaves out, or that go through a variable and
+cannot be read. The list helps you review; it is **not** a permission. An
+approved skill always runs with the rights of the person whose script runs
+it, no more.
+
 Calls with no user never propose skills. Nothing is sent while
 `skill_workflow` is off (the default). The AI Task reads code that came from
-conversations, so it can be misled like any model; that is why nothing runs
-before an administrator approves it. Proposals, reviews, approvals and uses
-are in the audit log (`skill.*`).
+conversations, and requests that anyone could have written, so it can be
+misled like any model; that is why nothing runs before an administrator
+approves it. Requests, proposals, reviews, approvals and uses are in the
+audit log (`skill.*`).
 
 ## Files and /share
 

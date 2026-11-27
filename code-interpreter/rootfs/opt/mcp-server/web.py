@@ -16,7 +16,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 import auditview
-from skills import SkillError
+from skills import SkillError, manifest_check
 
 INGRESS_PORT = 8098
 INGRESS_PROXY = "172.30.32.2"  # Supervisor's Ingress gateway on the hassio network
@@ -76,7 +76,9 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
         out = []
         for user in svc.skills.users():
             for s in svc.skills.list(user):
-                out.append({"user_id": user, "user": names.get(user), **s})
+                # What the code visibly calls vs. its manifest, for the reviewer.
+                check = {k: manifest_check(s[k]["code"], s[k].get("uses")) for k in ("active", "pending") if s.get(k)}
+                out.append({"user_id": user, "user": names.get(user), **s, "check": check})
         return JSONResponse({"skills": out, "workflow": svc.options.skill_workflow})
 
     async def skill_action(request: Request) -> Response:
@@ -97,6 +99,7 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
             return JSONResponse({"error": str(e)}, status_code=400)
         svc.audit.record(f"skill.{action}d" if action != "reject" else "skill.rejected", None,
                          user_id=user, name=name, by=by)
+        svc.reviewer.dismiss(user, name)
         return JSONResponse({"ok": True})
 
     async def audit_days(request: Request) -> Response:

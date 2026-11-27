@@ -157,25 +157,38 @@ class HomeAssistant:
         async with self._session(api, timeout_s) as s:
             return enrich(name, unwrap(await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s))))
 
-    async def generate_data(self, task_name: str, instructions: str, structure: dict,
-                            entity_id: str | None = None, timeout_s: float = 120) -> dict:
-        """ai_task.generate_data; entity_id None = Home Assistant's preferred AI Task entity."""
+    async def _action(self, action: str, body: dict, timeout_s: float, response: bool = False):
+        """Call a Home Assistant action ("domain/service") over REST."""
         import httpx
 
         if not self.token:
             raise HaUnavailable("no Supervisor token")
+        url = f"{self.base}/api/services/{action}" + ("?return_response" if response else "")
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as http:
+                r = await http.post(url, headers={"Authorization": f"Bearer {self.token}"}, json=body)
+        except httpx.HTTPError as e:  # Home Assistant restarting, the model too slow, …
+            raise HaUnavailable(f"{action.replace('/', '.')}: {type(e).__name__}: {e}") from None
+        if r.status_code != 200:
+            raise HaUnavailable(f"{action.replace('/', '.')} failed ({r.status_code}): {r.text[:200]}")
+        return r.json()
+
+    async def generate_data(self, task_name: str, instructions: str, structure: dict,
+                            entity_id: str | None = None, timeout_s: float = 120) -> dict:
+        """ai_task.generate_data; entity_id None = Home Assistant's preferred AI Task entity."""
         body = {"task_name": task_name, "instructions": instructions, "structure": structure}
         if entity_id:
             body["entity_id"] = entity_id
-        try:
-            async with httpx.AsyncClient(timeout=timeout_s) as http:
-                r = await http.post(f"{self.base}/api/services/ai_task/generate_data?return_response",
-                                    headers={"Authorization": f"Bearer {self.token}"}, json=body)
-        except httpx.HTTPError as e:  # Home Assistant restarting, the model too slow, …
-            raise HaUnavailable(f"ai_task.generate_data: {type(e).__name__}: {e}") from None
-        if r.status_code != 200:
-            raise HaUnavailable(f"ai_task.generate_data failed ({r.status_code}): {r.text[:200]}")
-        return (r.json().get("service_response") or {}).get("data") or {}
+        out = await self._action("ai_task/generate_data", body, timeout_s, response=True)
+        return (out.get("service_response") or {}).get("data") or {}
+
+    async def notify(self, notification_id: str, title: str, message: str) -> None:
+        """A persistent notification (every Home Assistant user sees it)."""
+        await self._action("persistent_notification/create",
+                           {"notification_id": notification_id, "title": title, "message": message}, 15)
+
+    async def dismiss(self, notification_id: str) -> None:
+        await self._action("persistent_notification/dismiss", {"notification_id": notification_id}, 15)
 
     def pool(self) -> "CallPool":
         """Connections that last one run: a cell's calls share them."""
@@ -198,22 +211,44 @@ class HomeAssistant:
             raise HaUnavailable(f"config/auth/list failed: {reply.get('error')}")
         return reply["result"]
 
+    async def _user_map(self) -> dict[str, dict]:
+        if self._users is None or self.clock() - self._users[0] >= CACHE_S:
+            self._users = (self.clock(), {u.get("id"): u for u in await self._fetch_users()})
+        return self._users[1]
+
     async def is_admin(self, user_id: str | None) -> bool:
         """An active, human administrator. System users (Supervisor, apps) are
         not: another app's token in a conversation's context is not the
         person speaking. Any failure counts as not an admin (fail-closed)."""
         if not user_id:
             return False
-        if self._users is None or self.clock() - self._users[0] >= CACHE_S:
-            try:
-                users = await self._fetch_users()
-            except Exception as e:  # noqa: BLE001
-                log.warning("[hamcp] user lookup failed: %s", e)
-                return False
-            self._users = (self.clock(), {u.get("id"): u for u in users})
-        u = self._users[1].get(user_id)
+        try:
+            users = await self._user_map()
+        except Exception as e:  # noqa: BLE001
+            log.warning("[hamcp] user lookup failed: %s", e)
+            return False
+        u = users.get(user_id)
         return bool(u and u.get("is_active") and not u.get("system_generated")
                     and ADMIN_GROUP in (u.get("group_ids") or []))
+
+    async def find_user(self, who: str) -> str:
+        """The id of the one active, human user whose id, username or name is
+        `who` (case-insensitive). LookupError if none or several match."""
+        try:
+            users = await self._user_map()
+        except HaUnavailable:
+            raise
+        except Exception as e:  # noqa: BLE001 - websocket errors
+            raise HaUnavailable(f"user lookup failed: {type(e).__name__}: {e}") from None
+        key = who.strip().casefold()
+        found = {uid for uid, u in users.items()
+                 if u.get("is_active") and not u.get("system_generated") and key
+                 and key in {(uid or "").casefold(), (u.get("username") or "").casefold(),
+                             (u.get("name") or "").casefold()}}
+        if len(found) != 1:
+            raise LookupError(f"{len(found)} Home Assistant users match {who!r}: use the username or user id"
+                              if found else f"no active Home Assistant user {who!r}")
+        return found.pop()
 
     def known_users(self) -> dict[str, str]:
         """User id -> name from the last lookup (no request of its own)."""

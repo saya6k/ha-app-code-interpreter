@@ -188,6 +188,7 @@ class _CellCalls:
                 return [{"name": k["name"], "status": "active" if k.get("active") else "pending",
                          "description": (k.get("active") or k.get("pending") or {}).get("description", ""),
                          "params": (k.get("active") or k.get("pending") or {}).get("params", ""),
+                         "uses": (k.get("active") or k.get("pending") or {}).get("uses") or {},
                          "update_pending": bool(k.get("active") and k.get("pending"))}
                         for k in svc.skills.list(self.user_id)]
             name = str(args.get("name", ""))
@@ -493,6 +494,23 @@ class Service:
             except SandboxError as e:  # fail closed, never crash the app over it
                 problem = f"self-check sandbox was not cleaned up: {e}"
         return problem
+
+    def handle_stdin(self, line: str) -> None:
+        """One line from hassio.app_stdin (an administrator's action):
+        {"type": "skill.request", "user": "<name, username or id>", "request": "<what the skill should do>"}."""
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            msg = None
+        if not isinstance(msg, dict) or msg.get("type") != "skill.request":
+            self.audit.record("stdin", None, "error", message="expected {\"type\": \"skill.request\", ...}",
+                              input=line[:200])
+            return
+        who, text = msg.get("user"), msg.get("request")
+        if not (isinstance(who, str) and who.strip() and isinstance(text, str) and text.strip()):
+            self.audit.record("skill.requested", None, "error", message="user and request must be non-empty strings")
+            return
+        self.reviewer.request(who, text)
 
     async def run_reaper(self) -> None:
         await self.manager.run_reaper()
