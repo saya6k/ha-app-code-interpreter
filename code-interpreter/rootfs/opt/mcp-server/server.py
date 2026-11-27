@@ -64,9 +64,10 @@ async def run_code(
 
     One call runs a whole script: read state, filter it in code, act, and
     return only what is needed. Top-level await works; const/let/function/
-    class declared at the top level stay defined for later calls with the
-    same session_id (omit it to start a new session; session_not_found means
-    the old variables and files are gone). The last expression is returned as
+    class declared at the top level stay defined for later calls. Omit
+    session_id to continue your latest session (`resumed: true`; pass
+    reset: true for a clean one); session_not_found means that session's
+    variables and files are gone. The last expression is returned as
     `result` (promises inside a returned object are awaited); console.log and
     log() output comes back as `logs`; a thrown error as `error` + `message`.
 

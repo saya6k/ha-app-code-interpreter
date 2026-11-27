@@ -80,6 +80,11 @@ class SessionManager:
             finally:
                 session.last_used = self._clock()
 
+    def latest(self, owner: str) -> str | None:
+        """The owner's most recently used session, if any."""
+        mine = [s for s in self._sessions.values() if s.owner == owner]
+        return max(mine, key=lambda s: s.last_used).id if mine else None
+
     async def close(self, session_id: str, reason: str = "close") -> None:
         session = self._sessions.get(session_id)
         if session is None:

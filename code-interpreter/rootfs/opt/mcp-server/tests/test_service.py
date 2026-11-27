@@ -445,6 +445,12 @@ class FakeHA:
         return [{"name": "trace__get_trace", "read_only": True, "destructive": False, "description": "", "input_schema": {}},
                 {"name": "homeassistant__call_action", "read_only": False, "destructive": True, "description": "", "input_schema": {}}]
 
+    def pool(self):
+        return self
+
+    async def close(self):
+        pass
+
     async def call(self, api, name, args, timeout_s):
         self.calls.append((api, name, args))
         if name == "intent__HassTurnOff" and args.get("name") == "boom":
@@ -571,3 +577,26 @@ def test_hab_rules_come_from_the_options(tmp_path):
     opts.write_text(json.dumps({"hab_allow": ["automation *", " ", None], "hab_deny": ["automation delete *"]}))
     o = service.load_options(opts)
     assert o.hab_rules == hab.Rules(allow=("automation *",), deny=("automation delete *",))
+
+
+def test_a_user_without_session_id_continues_their_latest_session(tmp_path):
+    svc, created = make_ha(tmp_path)
+    first = asyncio.run(svc.run_code("set x=1", user_id="alice"))
+    assert "resumed" not in first
+    r = asyncio.run(svc.run_code("x", user_id="alice"))
+    assert r["session_id"] == first["session_id"] and r["result"] == "1" and r["resumed"] is True
+    other = asyncio.run(svc.run_code("x", user_id="bob"))
+    assert other["session_id"] != first["session_id"] and other["result"] is None
+    anon1 = asyncio.run(svc.run_code("set y=2"))
+    anon2 = asyncio.run(svc.run_code("y"))
+    assert anon1["session_id"] != anon2["session_id"] and anon2["result"] is None and "resumed" not in anon2
+
+
+def test_resuming_a_session_closed_meanwhile_starts_a_new_one(tmp_path):
+    svc, _ = make_ha(tmp_path)
+    sid = asyncio.run(svc.run_code("set x=1", user_id="alice"))["session_id"]
+    real_latest = svc.manager.latest
+    svc.manager.latest = lambda owner: "0000000000000000"  # a session that is already gone
+    r = asyncio.run(svc.run_code("x", user_id="alice"))
+    svc.manager.latest = real_latest
+    assert r["session_id"] not in (sid, "0000000000000000") and r["error"] is None and "resumed" not in r
