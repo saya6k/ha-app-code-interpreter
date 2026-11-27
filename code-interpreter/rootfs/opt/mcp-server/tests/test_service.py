@@ -8,6 +8,7 @@ import hab
 import hamcp
 import replclient
 import service
+from skills import SkillReviewer, SkillStore
 from audit import Audit
 from policy import SandboxPolicy
 from sandbox import FileOpError, SandboxError
@@ -600,3 +601,101 @@ def test_resuming_a_session_closed_meanwhile_starts_a_new_one(tmp_path):
     r = asyncio.run(svc.run_code("x", user_id="alice"))
     svc.manager.latest = real_latest
     assert r["session_id"] not in (sid, "0000000000000000") and r["error"] is None and "resumed" not in r
+
+
+class FakeAITask(FakeHA):
+    def __init__(self, answer):
+        super().__init__()
+        self.answer = answer
+        self.asked = []
+
+    async def generate_data(self, task_name, instructions, structure, entity_id=None, timeout_s=120):
+        self.asked.append((instructions, entity_id))
+        return self.answer
+
+
+SKILL_CODE = "const on = (await ha.homeassistant.GetLiveContext());\nconst names = [];\nawait Promise.all(names.map((n) => ha.intent.HassTurnOff({ name: n })));"
+
+
+def skill_service(tmp_path, answer, **opts):
+    svc, created = make(tmp_path, {"skill_workflow": True, **opts})
+    svc.ha = FakeAITask(answer)
+    svc.skills = SkillStore(tmp_path / "skills")
+    svc.reviewer = SkillReviewer(svc.skills, svc.ha, svc.audit, enabled=svc.options.skill_workflow,
+                                 entity_id=svc.options.skill_ai_task_entity)
+    return svc, created
+
+
+def finish(svc, sid):
+    async def go():
+        await svc.close_session(sid, everyone=True)
+        await svc.reviewer.wait()
+
+    asyncio.run(go())
+
+
+def test_a_finished_session_can_propose_a_pending_skill(tmp_path):
+    answer = {"save": True, "name": "lights_off_except", "description": "d", "params": "{ except }",
+              "code": "async ({ except: room }) => room", "reason": "repeatable"}
+    svc, _ = skill_service(tmp_path, answer, skill_ai_task_entity="ai_task.claude_ai_task")
+    sid = asyncio.run(svc.run_code("set " + "a=1", user_id="alice"))["session_id"]
+    asyncio.run(svc.run_code(SKILL_CODE, session_id=sid, user_id="alice"))
+    finish(svc, sid)
+    (instructions, entity), = svc.ha.asked
+    assert entity == "ai_task.claude_ai_task" and "GetLiveContext" in instructions and "set a=1" not in instructions
+    skill = svc.skills.get("alice", "lights_off_except")
+    assert skill["active"] is None and skill["pending"]["code"] == "async ({ except: room }) => room"
+    assert any(e["event"] == "skill.proposed" for e in events(tmp_path))
+
+
+def test_no_review_when_off_anonymous_trivial_or_declined(tmp_path):
+    svc, _ = skill_service(tmp_path, {"save": False, "reason": "one-off"}, skill_workflow=False)
+    sid = asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))["session_id"]
+    finish(svc, sid)
+    assert svc.ha.asked == []
+    (tmp_path / "b").mkdir()
+    svc, _ = skill_service(tmp_path / "b", {"save": False, "reason": "one-off"})
+    anon = asyncio.run(svc.run_code(SKILL_CODE))["session_id"]
+    finish(svc, anon)
+    short = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
+    finish(svc, short)
+    assert svc.ha.asked == []
+    sid = asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))["session_id"]
+    finish(svc, sid)
+    assert len(svc.ha.asked) == 1 and svc.skills.list("alice") == []
+    assert any(e["event"] == "skill.review" and e["detail"]["saved"] is False for e in events(tmp_path / "b"))
+
+
+def test_cells_use_only_their_users_approved_skills(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+    svc.skills.propose("alice", "greet", "", "", "async () => 1", {})
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
+    listed = json.loads(asyncio.run(svc.run_code("call skills.list {}", session_id=sid, user_id="alice"))["result"])
+    assert listed == [{"name": "greet", "status": "pending", "description": "", "params": "", "update_pending": False}]
+    r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
+    assert r["error"].startswith("NotApproved: ")
+    svc.skills.approve("alice", "greet", "admin")
+    r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
+    assert json.loads(r["result"]) == {"code": "async () => 1"}
+    other = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=other, user_id="bob"))
+    assert r["error"].startswith("UnknownSkill: ")
+
+
+def test_a_failed_review_is_audited_not_lost(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+
+    async def down(*a, **kw):
+        raise hamcp.HaUnavailable("ai_task.generate_data: ConnectError: refused")
+
+    svc.ha.generate_data = down
+    sid = asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))["session_id"]
+    finish(svc, sid)
+    (e,) = [e for e in events(tmp_path) if e["event"] == "skill.review"]
+    assert e["outcome"] == "error" and e["detail"]["error"] == "HaUnavailable"
+
+
+def test_nothing_is_remembered_while_the_workflow_is_off(tmp_path):
+    svc, _ = skill_service(tmp_path, {}, skill_workflow=False)
+    asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))
+    assert svc.reviewer._history == {}

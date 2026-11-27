@@ -19,7 +19,7 @@ import path from "node:path";
 import util from "node:util";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { install, installHa, installShare, killRunning } from "./globals.mjs";
+import { install, installHa, installShare, installSkills, killRunning } from "./globals.mjs";
 import { transform } from "./transform.mjs";
 
 const LOGS_LIMIT = 16000;
@@ -49,6 +49,7 @@ class Capped {
 globalThis.require = createRequire("/opt/js/");
 install(globalThis);
 installShare(globalThis, (...a) => rpc(...a));
+installSkills(globalThis, (...a) => rpc(...a));
 
 let current = null; // the running cell or command: {interrupt()}
 let late = []; // errors from abandoned async work, reported with the next cell

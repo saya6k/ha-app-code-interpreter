@@ -1,4 +1,5 @@
 import asyncio
+import json
 import contextlib
 
 import httpx
@@ -118,3 +119,33 @@ def test_why_names_the_missing_integration_and_token_problems():
 def test_no_token_is_unavailable_not_a_crash():
     with pytest.raises(HaUnavailable, match="outside Home Assistant"):
         asyncio.run(HomeAssistant(token="").tools("assist"))
+
+
+def test_generate_data_posts_to_ai_task_and_returns_the_data(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        seen["auth"] = request.headers["authorization"]
+        return httpx.Response(200, json={"service_response": {"conversation_id": "c", "data": {"save": False}}})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    ha = HomeAssistant(token="t", base="http://supervisor/core")
+    out = asyncio.run(ha.generate_data("task", "do it", {"save": {"selector": {"boolean": {}}}}))
+    assert out == {"save": False}
+    assert seen["url"] == "http://supervisor/core/api/services/ai_task/generate_data?return_response"
+    assert "entity_id" not in seen["body"] and seen["auth"] == "Bearer t"
+    asyncio.run(ha.generate_data("task", "do it", {}, entity_id="ai_task.claude_ai_task"))
+    assert seen["body"]["entity_id"] == "ai_task.claude_ai_task"
+
+
+def test_generate_data_network_errors_are_unavailable(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    with pytest.raises(HaUnavailable, match="ConnectError"):
+        asyncio.run(HomeAssistant(token="t").generate_data("task", "do it", {}))

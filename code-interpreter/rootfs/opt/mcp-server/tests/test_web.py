@@ -15,12 +15,21 @@ from audit import Audit  # noqa: E402
 from policy import SandboxPolicy  # noqa: E402
 from service import Options  # noqa: E402
 from sessions import SessionNotFound  # noqa: E402
+from skills import SkillStore  # noqa: E402
+
+
+class FakeHA:
+    def known_users(self):
+        return {"u1": "Alice"}
 
 
 class FakeService:
-    def __init__(self, audit):
-        self.options = Options(policy=SandboxPolicy(allowlist=("pypi.org",)))
+    def __init__(self, audit, skills_dir):
+        self.options = Options(policy=SandboxPolicy(allowlist=("pypi.org",)), skill_workflow=True)
         self.audit = audit
+        self.ha = FakeHA()
+        self.skills = SkillStore(skills_dir)
+        self.skills.propose("u1", "greet", "says hi", "{}", "async () => 'hi'", {})
         self.open = {"abc": {"session_id": "abc", "created": 1.0, "last_used": 2.0, "expires_in_s": 90}}
 
     def list_sessions(self, everyone=False):
@@ -39,7 +48,7 @@ def env(tmp_path):
     audit = Audit(tmp_path)
     audit.record("session.create", "abc", uid=60000)
     audit.record("code.exec", "abc", code="<img src=x onerror=alert(1)>", ms=3)
-    svc = FakeService(audit)
+    svc = FakeService(audit, tmp_path / "skills")
     app = web.build_app(svc, tmp_path, allowed_clients={"testclient"})
     return TestClient(app), svc, tmp_path
 
@@ -91,7 +100,7 @@ def test_close_requires_the_ui_header_and_is_audited_with_the_user(env):
 
 
 def test_requests_from_other_hosts_are_refused(tmp_path):
-    app = web.build_app(FakeService(Audit(tmp_path)), tmp_path)  # default allowlist: ingress + loopback
+    app = web.build_app(FakeService(Audit(tmp_path), tmp_path / "skills"), tmp_path)  # default allowlist: ingress + loopback
     client = TestClient(app)  # client host is "testclient"
     assert client.get("/").status_code == 403
     assert client.get("/api/sessions").status_code == 403
@@ -100,3 +109,24 @@ def test_requests_from_other_hosts_are_refused(tmp_path):
 def test_ui_never_injects_html():
     html = web.UI_FILE.read_text()
     assert "innerHTML" not in html and "insertAdjacentHTML" not in html and "document.write" not in html
+
+
+def test_skills_are_listed_and_need_the_ui_header_to_approve(env):
+    client, svc, _ = env
+    body = client.get("/api/skills").json()
+    assert body["workflow"] is True
+    (k,) = body["skills"]
+    assert (k["user"], k["name"], k["active"], k["pending"]["code"]) == ("Alice", "greet", None, "async () => 'hi'")
+    assert client.post("/api/skills/u1/greet/approve").status_code == 403
+    r = client.post("/api/skills/u1/greet/approve", headers={"X-Requested-With": "code-interpreter-ui",
+                                                              "X-Remote-User-Name": "admin"})
+    assert r.status_code == 200 and svc.skills.get("u1", "greet")["active"]["approved_by"] == "admin"
+    assert client.post("/api/skills/u1/greet/approve", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 400
+    assert client.post("/api/skills/u1/greet/explode", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 404
+    assert client.post("/api/skills/..%2Fx/greet/delete", headers={"X-Requested-With": "code-interpreter-ui"}).status_code in (400, 404)
+
+
+def test_skill_code_is_only_inserted_as_text():
+    html = web.UI_FILE.read_text()
+    start = html.index("async function loadSkills")
+    assert "innerHTML" not in html[start:html.index("async function loadLive")]

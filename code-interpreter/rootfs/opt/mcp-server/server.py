@@ -86,6 +86,8 @@ async def run_code(
                                                .json() .nothrow() .timeout(ms); non-zero exit throws
       file(p).text()/json()/lines()/exists(), write(p, s), sleep(ms), log(...), require(builtin)
       share.list(dir?), share.import(sharePath, dest?), share.export(path)   Home Assistant's /share
+      skills.list(), skills.<name>(args)       this user's saved skills (approved ones run);
+                                               prefer a fitting skill over writing the code again
 
     Example, one call:
       const ctx = await ha.homeassistant.GetLiveContext();

@@ -23,6 +23,7 @@ from hamcp import ADMIN, APIS, ASSIST, HaToolError, HaUnavailable, HomeAssistant
 from audit import Audit, code_detail, sha256
 from policy import SandboxPolicy
 from replclient import RpcError
+from skills import SkillError, SkillReviewer, SkillStore
 from sandbox import BASE_DIR, FileOpError, Sandbox, SandboxError
 from sharefs import ShareError
 from sessions import UID_BASE, Session, SessionManager, SessionNotFound
@@ -57,6 +58,8 @@ class Options:
     export_dir: Path = Path(DEFAULT_EXPORT_DIR)
     audit_retention_days: int = 30
     hab_rules: Rules = field(default_factory=Rules)
+    skill_workflow: bool = False
+    skill_ai_task_entity: str | None = None  # None: Home Assistant's preferred AI Task entity
 
 
 def load_options(path: Path = OPTIONS_PATH) -> Options:
@@ -88,6 +91,8 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
         max_file_mb=int(raw.get("max_file_mb", 20)),
         export_dir=export_dir,
         audit_retention_days=int(raw.get("audit_retention_days", 30)),
+        skill_workflow=bool(raw.get("skill_workflow", False)),
+        skill_ai_task_entity=(raw.get("skill_ai_task_entity") or "").strip() or None,
         hab_rules=Rules(
             allow=tuple(r.strip() for r in raw.get("hab_allow") or [] if r and r.strip()),
             deny=tuple(r.strip() for r in raw.get("hab_deny") or [] if r and r.strip()),
@@ -164,6 +169,8 @@ class _CellCalls:
             return await self._ha(op, args)
         if op == "ha.hab":
             return await self._hab(args)
+        if op in ("skills.list", "skills.get"):
+            return self._skills(op, args)
         self.rejected(f"unknown call {op!r}")
         raise RpcError("RpcRejected", f"unknown call {op!r}")
 
@@ -171,6 +178,28 @@ class _CellCalls:
         self.service.audit.record("policy.violation", self.sandbox.sid, "denied", kind=kind, message=message,
                                   user_id=self.user_id)
         return RpcError(name, message)
+
+    def _skills(self, op: str, args: dict):
+        svc, s = self.service, self.sandbox
+        if not self.user_id:
+            raise RpcError("NoUser", "skills belong to a Home Assistant user; this call has none")
+        try:
+            if op == "skills.list":
+                return [{"name": k["name"], "status": "active" if k.get("active") else "pending",
+                         "description": (k.get("active") or k.get("pending") or {}).get("description", ""),
+                         "params": (k.get("active") or k.get("pending") or {}).get("params", ""),
+                         "update_pending": bool(k.get("active") and k.get("pending"))}
+                        for k in svc.skills.list(self.user_id)]
+            name = str(args.get("name", ""))
+            skill = svc.skills.get(self.user_id, name)
+        except SkillError as e:
+            raise RpcError("SkillError", str(e)) from None
+        if not skill:
+            raise RpcError("UnknownSkill", f"no skill {name!r} (see await skills.list())")
+        if not skill.get("active"):
+            raise RpcError("NotApproved", f"skill {name!r} waits for an administrator's approval")
+        svc.audit.record("skill.used", s.sid, name=name, user_id=self.user_id)
+        return {"code": skill["active"]["code"]}
 
     async def _hab(self, args: dict):
         svc, s = self.service, self.sandbox
@@ -277,6 +306,9 @@ class Service:
         self.base_dir = base_dir
         self._create = create_sandbox
         self.audit = audit or Audit(retention_days=options.audit_retention_days)
+        self.skills = SkillStore()
+        self.reviewer = SkillReviewer(self.skills, self.ha, self.audit, enabled=options.skill_workflow,
+                                      entity_id=options.skill_ai_task_entity)
         self.manager = SessionManager(
             self._factory,
             idle_timeout_s=options.idle_timeout_minutes * 60,
@@ -298,6 +330,7 @@ class Service:
     def _destroyed(self, session: Session, reason: str) -> None:
         self.audit.record("session.destroy", session.id, reason=reason,
                           lifetime_s=round(time.time() - session.created))
+        self.reviewer.session_ended(session.id, session.owner, reason)
 
     def _net_event(self, entry: dict) -> None:
         sid = entry.get("session_id")
@@ -380,6 +413,7 @@ class Service:
                 reset=reset, logs_chars=len(r["logs"]),
                 new_files=len(changed), user_id=user_id, admin=admin, ha_calls=calls.ha_calls,
             )
+            self.reviewer.record(s.sid, code, r["error"], calls.ha_calls)
             return r
 
         # Without session_id, a known user continues their latest session, as
@@ -465,3 +499,4 @@ class Service:
 
     async def shutdown(self) -> None:
         await self.manager.close_all("shutdown")
+        self.reviewer.cancel()  # a review in flight cannot finish now

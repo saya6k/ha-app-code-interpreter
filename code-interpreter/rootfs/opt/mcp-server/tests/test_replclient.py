@@ -307,6 +307,24 @@ def test_ha_admin_hab_sends_argv_and_stdin(repl):
     assert repl.do(repl.client.run("typeof ha.hab", timeout_s=10, rpc=calls))["result"] == "object"
 
 
+class SkillCalls(FakeCalls):
+    async def call(self, op, args):
+        self.seen.append((op, args))
+        if op == "skills.list":
+            return [{"name": "double", "status": "active"}]
+        if op == "skills.get" and args["name"] == "double":
+            return {"code": "async ({ n }) => n * 2"}
+        raise replclient.RpcError("NotApproved", "waits for approval")
+
+
+def test_skills_proxy_runs_approved_code_with_its_arguments(repl):
+    calls = SkillCalls()
+    r = repl.do(repl.client.run("[await skills.double({ n: 21 }), (await skills.list())[0].name, "
+                                "await skills.other().catch((e) => e.name)]", timeout_s=10, rpc=calls))
+    assert r["result"] == '[42,"double","NotApproved"]', r
+    assert calls.seen[0] == ("skills.get", {"name": "double"})
+
+
 def test_ha_namespaces_are_not_thenables(repl):
     assert repl("const d = await ha.intent; typeof d.HassTurnOn")["result"] == "function"
 
