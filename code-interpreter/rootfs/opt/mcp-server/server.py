@@ -89,6 +89,8 @@ async def run_code(
                                                .json() .nothrow() .timeout(ms); non-zero exit throws
       file(p).text()/json()/lines()/exists(), write(p, s), sleep(ms), log(...), require(builtin)
       share.list(dir?), share.import(sharePath, dest?), share.export(path)   Home Assistant's /share
+      plugins?.<server>.<tool>(args)           MCP servers Home Assistant reaches that the app allows
+                                               you (plugins.tools() lists them); undefined if none
       skills.list(), skills.<name>(args)       this user's saved skills (approved ones run);
                                                prefer a fitting skill over writing the code again
 
@@ -156,6 +158,7 @@ async def main() -> None:
         log.info("[hab] %d commands; %d allow and %d deny rules", n, len(rules.allow), len(rules.deny))
     except Exception as e:  # noqa: BLE001 - ha.admin.hab() then answers HabUnavailable
         log.error("[hab] unavailable: %s", e)
+    log.info("[plugins] %s", await svc.plugins.describe())
     requests = await stdin.serve(svc.handle_stdin)
     reaper = asyncio.create_task(svc.run_reaper())
     pruner = asyncio.create_task(prune_audit())

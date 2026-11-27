@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import time
 from datetime import timedelta
 from typing import Any
@@ -27,6 +28,14 @@ ASSIST, ADMIN = "assist", "homeassistant"
 APIS = (ASSIST, ADMIN)
 CACHE_S = 60.0
 ADMIN_GROUP = "system-admin"
+# The API the MCP client integration registers for each server it reaches
+# ("mcp-" + config entry id): plugins (SPEC-code-mode §3.12).
+PLUGIN_API = re.compile(r"^mcp-[0-9A-Za-z]+$")
+
+
+def check_api(api: str) -> None:
+    if api not in APIS and not PLUGIN_API.match(api):
+        raise ValueError(f"unknown API {api!r}")
 
 
 class HaUnavailable(RuntimeError):
@@ -52,6 +61,32 @@ def unwrap(result) -> Any:
         except ValueError:
             return joined
     return [c.model_dump(mode="json") for c in result.content]
+
+
+def unwrap_plugin(value: Any) -> Any:
+    """Home Assistant's MCP Server hands back a plugin server's whole tool
+    result as JSON text ({"content": [...], "structuredContent"?, "isError"?}):
+    take the value out of it as unwrap() does. Anything else stays as it was."""
+    if not (isinstance(value, dict) and isinstance(value.get("content"), list)
+            and set(value) <= {"content", "structuredContent", "isError"}):
+        return value
+    texts = [c.get("text") for c in value["content"] if isinstance(c, dict) and c.get("type") == "text"]
+    if value.get("isError"):
+        raise HaToolError(" ".join(t for t in texts if isinstance(t, str)) or "the tool reported an error")
+    if value.get("structuredContent") is not None:
+        return value["structuredContent"]
+    if texts and len(texts) == len(value["content"]) and all(isinstance(t, str) for t in texts):
+        joined = "\n".join(texts)
+        try:
+            return json.loads(joined)
+        except ValueError:
+            return joined
+    return value["content"]
+
+
+def _value(api: str, name: str, result) -> Any:
+    value = unwrap(result)
+    return unwrap_plugin(value) if PLUGIN_API.match(api) else enrich(name, value)
 
 
 LIVE_CONTEXT = "homeassistant__GetLiveContext"
@@ -122,6 +157,8 @@ class HomeAssistant:
             if isinstance(inner, HaToolError):  # raised by unwrap() inside the session's task group
                 raise inner from None
             failed = next((s for s in reversed(statuses) if s >= 400), None)
+            if failed == 404 and PLUGIN_API.match(api):
+                raise HaUnavailable(f"Home Assistant has no API {api} for this MCP server (404)") from None
             raise HaUnavailable(self._why(inner, failed)) from None
 
     @staticmethod
@@ -141,8 +178,7 @@ class HomeAssistant:
         return f"Home Assistant MCP Server unreachable: {type(e).__name__}: {e}"
 
     async def tools(self, api: str) -> list[dict]:
-        if api not in APIS:
-            raise ValueError(f"unknown API {api!r}")
+        check_api(api)
         hit = self._tools.get(api)
         if hit and self.clock() - hit[0] < CACHE_S:
             return hit[1]
@@ -152,10 +188,9 @@ class HomeAssistant:
         return listed
 
     async def call(self, api: str, name: str, args: dict, timeout_s: float) -> Any:
-        if api not in APIS:
-            raise ValueError(f"unknown API {api!r}")
+        check_api(api)
         async with self._session(api, timeout_s) as s:
-            return enrich(name, unwrap(await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s))))
+            return _value(api, name, await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s)))
 
     async def _action(self, action: str, body: dict, timeout_s: float, response: bool = False):
         """Call a Home Assistant action ("domain/service") over REST."""
@@ -181,6 +216,24 @@ class HomeAssistant:
             body["entity_id"] = entity_id
         out = await self._action("ai_task/generate_data", body, timeout_s, response=True)
         return (out.get("service_response") or {}).get("data") or {}
+
+    async def mcp_servers(self) -> list[dict]:
+        """The MCP client integration's config entries: the MCP servers Home
+        Assistant reaches, each with an API of its own."""
+        import httpx
+
+        if not self.token:
+            raise HaUnavailable("no Supervisor token")
+        try:
+            async with httpx.AsyncClient(timeout=15) as http:
+                r = await http.get(f"{self.base}/api/config/config_entries/entry", params={"domain": "mcp"},
+                                   headers={"Authorization": f"Bearer {self.token}"})
+        except httpx.HTTPError as e:
+            raise HaUnavailable(f"config entries: {type(e).__name__}: {e}") from None
+        if r.status_code != 200:
+            raise HaUnavailable(f"config entries failed ({r.status_code}): {r.text[:200]}")
+        return [{"entry_id": e.get("entry_id"), "title": e.get("title") or "", "state": e.get("state")}
+                for e in r.json() if e.get("domain") == "mcp"]
 
     async def notify(self, notification_id: str, title: str, message: str) -> None:
         """A persistent notification (every Home Assistant user sees it)."""
@@ -308,15 +361,14 @@ class CallPool:
                 await asyncio.wait_for(entry[2], 5)
 
     async def call(self, api: str, name: str, args: dict, timeout_s: float) -> Any:
-        if api not in APIS:
-            raise ValueError(f"unknown API {api!r}")
+        check_api(api)
         s = await self._get(api)
         try:
             result = await s.call_tool(name, args, read_timeout_seconds=timedelta(seconds=timeout_s))
         except Exception as e:  # the connection broke (HA restarted, …): the next call reopens it
             await self._drop(api)
             raise HaUnavailable(HomeAssistant._why(e)) from None
-        return enrich(name, unwrap(result))
+        return _value(api, name, result)
 
     async def close(self) -> None:
         for api in list(self._open):

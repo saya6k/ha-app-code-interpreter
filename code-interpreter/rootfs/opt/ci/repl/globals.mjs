@@ -204,6 +204,11 @@ export function installShare(target, rpc) {
 function haNamespace(rpc, api, extra = {}) {
   const call = (name, args = {}) => rpc("ha.call", { api, name: String(name), args });
   const tools = () => rpc("ha.list", { api });
+  return toolNamespace(call, tools, extra);
+}
+
+// <prefix>.<tool>(args) -> call("<prefix>__<tool>", args); call and tools as given.
+function toolNamespace(call, tools, extra = {}) {
   const domains = new Map();
   const notThenable = (key) => typeof key !== "string" || key === "then" || key === "toJSON";
   return new Proxy({ call, tools, ...extra }, {
@@ -226,6 +231,15 @@ export function installHa(target, rpc, admin) {
   const hab = (argv, { stdin } = {}) => rpc("ha.hab", { argv, ...(stdin === undefined ? {} : { stdin: String(stdin) }) });
   const adminApi = admin ? haNamespace(rpc, "homeassistant", { hab }) : undefined;
   target.ha = new Proxy(ha, { get: (base, key) => (key === "admin" ? adminApi : base[key]) });
+}
+
+// plugins.<server>.<tool>(args) calls the plugin tool "<server>__<tool>" (an MCP
+// server Home Assistant reaches); plugins.call(name, args), plugins.tools().
+// Undefined when this caller may use none.
+export function installPlugins(target, rpc, enabled) {
+  target.plugins = enabled
+    ? toolNamespace((name, args = {}) => rpc("plugins.call", { name: String(name), args }), () => rpc("plugins.list", {}))
+    : undefined;
 }
 
 // skills.list(); skills.<name>(args) runs the user's approved skill: the app

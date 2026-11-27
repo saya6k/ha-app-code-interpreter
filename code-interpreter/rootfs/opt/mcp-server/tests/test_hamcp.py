@@ -167,6 +167,44 @@ def test_generate_data_posts_to_ai_task_and_returns_the_data(monkeypatch):
     assert seen["body"]["entity_id"] == "ai_task.claude_ai_task"
 
 
+def test_plugin_results_are_taken_out_of_home_assistants_envelope():
+    rows = [{"title": "x"}]
+    assert hamcp.unwrap_plugin({"content": [{"type": "text", "text": json.dumps(rows)}]}) == rows
+    assert hamcp.unwrap_plugin({"content": [{"type": "text", "text": "plain"}]}) == "plain"
+    assert hamcp.unwrap_plugin({"content": [], "structuredContent": {"a": 1}}) == {"a": 1}
+    image = {"content": [{"type": "image", "data": "..."}]}
+    assert hamcp.unwrap_plugin(image) == image["content"]
+    assert hamcp.unwrap_plugin({"content": [1], "other": 2}) == {"content": [1], "other": 2}  # not an envelope
+    with pytest.raises(HaToolError, match="Fact not found"):
+        hamcp.unwrap_plugin({"content": [{"type": "text", "text": "Fact not found: x"}], "isError": True})
+
+
+@pytest.mark.parametrize("api,ok", [("assist", True), ("homeassistant", True), ("mcp-01KYW9YR29S3RJZ0RH6RVWCWRT", True),
+                                    ("mcp-", False), ("mcp-../x", False), ("all", False), ("conversation", False)])
+def test_only_known_and_plugin_apis_are_accepted(api, ok):
+    if ok:
+        hamcp.check_api(api)
+    else:
+        with pytest.raises(ValueError):
+            hamcp.check_api(api)
+
+
+def test_mcp_servers_lists_the_mcp_client_entries(monkeypatch):
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[
+            {"entry_id": "A", "domain": "mcp", "title": "Memory", "state": "loaded", "source": "user"},
+            {"entry_id": "B", "domain": "mcp_server", "title": "Assist", "state": "loaded"}])
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    out = asyncio.run(HomeAssistant(token="t").mcp_servers())
+    assert out == [{"entry_id": "A", "title": "Memory", "state": "loaded"}]
+    assert seen["url"] == "http://supervisor/core/api/config/config_entries/entry?domain=mcp"
+
+
 def test_notify_and_dismiss_call_persistent_notification(monkeypatch):
     seen = []
 

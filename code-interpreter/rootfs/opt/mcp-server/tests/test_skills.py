@@ -105,3 +105,15 @@ def test_manifest_check_flags_calls_it_cannot_read():
     # a prefix that is not a whole word does not cover a command
     assert manifest_check('ha.admin.hab(["automations", "list"])', {"hab": ["automation"]})["undeclared"] == [
         "hab automations list"]
+
+
+def test_manifest_check_covers_plugin_tools():
+    code = ('async () => { await plugins.memory.search({}); await plugins["multi-service-mcp"].find_places({}); '
+            'await plugins.call("memory__save", {}); const t = await plugins.tools(); }')
+    assert manifest_check(code, {"plugins": ["memory__search"]}) == {
+        "undeclared": ["plugin memory__save", "plugin multi-service-mcp__find_places"], "dynamic": []}
+    assert manifest_check("plugins.call(name, {})", {})["dynamic"] == ["plugins.call"]
+    # optional chaining, as the tool description writes plugins?.<server>.<tool>
+    chained = 'await plugins?.memory.search({}); await plugins?.["multi-service-mcp"]?.find_places({}); plugins?.call("x__y")'
+    assert manifest_check(chained, {})["undeclared"] == [
+        "plugin memory__search", "plugin multi-service-mcp__find_places", "plugin x__y"]
