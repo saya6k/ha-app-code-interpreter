@@ -8,7 +8,7 @@ import hab
 import hamcp
 import replclient
 import service
-from skills import SkillStore
+from skills import SkillReviewer, SkillStore
 from audit import Audit
 from policy import SandboxPolicy
 from sandbox import FileOpError, SandboxError
@@ -621,13 +621,15 @@ def skill_service(tmp_path, answer, **opts):
     svc, created = make(tmp_path, {"skill_workflow": True, **opts})
     svc.ha = FakeAITask(answer)
     svc.skills = SkillStore(tmp_path / "skills")
+    svc.reviewer = SkillReviewer(svc.skills, svc.ha, svc.audit, enabled=svc.options.skill_workflow,
+                                 entity_id=svc.options.skill_ai_task_entity)
     return svc, created
 
 
 def finish(svc, sid):
     async def go():
         await svc.close_session(sid, everyone=True)
-        await asyncio.gather(*svc._skill_tasks)
+        await svc.reviewer.wait()
 
     asyncio.run(go())
 
@@ -678,3 +680,22 @@ def test_cells_use_only_their_users_approved_skills(tmp_path):
     other = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=other, user_id="bob"))
     assert r["error"].startswith("UnknownSkill: ")
+
+
+def test_a_failed_review_is_audited_not_lost(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+
+    async def down(*a, **kw):
+        raise hamcp.HaUnavailable("ai_task.generate_data: ConnectError: refused")
+
+    svc.ha.generate_data = down
+    sid = asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))["session_id"]
+    finish(svc, sid)
+    (e,) = [e for e in events(tmp_path) if e["event"] == "skill.review"]
+    assert e["outcome"] == "error" and e["detail"]["error"] == "HaUnavailable"
+
+
+def test_nothing_is_remembered_while_the_workflow_is_off(tmp_path):
+    svc, _ = skill_service(tmp_path, {}, skill_workflow=False)
+    asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))
+    assert svc.reviewer._history == {}

@@ -146,9 +146,12 @@ class HomeAssistant:
         body = {"task_name": task_name, "instructions": instructions, "structure": structure}
         if entity_id:
             body["entity_id"] = entity_id
-        async with httpx.AsyncClient(timeout=timeout_s) as http:
-            r = await http.post(f"{self.base}/api/services/ai_task/generate_data?return_response",
-                                headers={"Authorization": f"Bearer {self.token}"}, json=body)
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as http:
+                r = await http.post(f"{self.base}/api/services/ai_task/generate_data?return_response",
+                                    headers={"Authorization": f"Bearer {self.token}"}, json=body)
+        except httpx.HTTPError as e:  # Home Assistant restarting, the model too slow, …
+            raise HaUnavailable(f"ai_task.generate_data: {type(e).__name__}: {e}") from None
         if r.status_code != 200:
             raise HaUnavailable(f"ai_task.generate_data failed ({r.status_code}): {r.text[:200]}")
         return (r.json().get("service_response") or {}).get("data") or {}

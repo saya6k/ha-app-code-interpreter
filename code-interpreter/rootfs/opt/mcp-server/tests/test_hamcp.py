@@ -139,3 +139,13 @@ def test_generate_data_posts_to_ai_task_and_returns_the_data(monkeypatch):
     assert "entity_id" not in seen["body"] and seen["auth"] == "Bearer t"
     asyncio.run(ha.generate_data("task", "do it", {}, entity_id="ai_task.claude_ai_task"))
     assert seen["body"]["entity_id"] == "ai_task.claude_ai_task"
+
+
+def test_generate_data_network_errors_are_unavailable(monkeypatch):
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    with pytest.raises(HaUnavailable, match="ConnectError"):
+        asyncio.run(HomeAssistant(token="t").generate_data("task", "do it", {}))
