@@ -35,6 +35,30 @@ def test_read_share_refuses_symlink_escape(share, tmp_path):
         sharefs.read_share("link", 1000, root=share)
 
 
+def test_list_share_root_and_subdir(share):
+    top = sharefs.list_share("", root=share)
+    assert top["path"] == "/share" and top["truncated"] is False
+    assert top["entries"] == [{"name": "energy.csv", "type": "file", "size": 8}, {"name": "sub", "type": "dir"}]
+    assert sharefs.list_share("/share/sub", root=share)["entries"] == [{"name": "x.txt", "type": "file", "size": 1}]
+
+
+def test_list_share_refuses_outside_and_hides_escaping_links(share, tmp_path):
+    (share / "link").symlink_to(tmp_path / "secret")
+    (share / "updir").symlink_to(tmp_path)
+    assert [e["name"] for e in sharefs.list_share("", root=share)["entries"]] == ["energy.csv", "sub"]
+    for p in ("..", "sub/../..", "updir"):
+        with pytest.raises(ShareError, match="outside"):
+            sharefs.list_share(p, root=share)
+    with pytest.raises(ShareError, match="not a directory"):
+        sharefs.list_share("energy.csv", root=share)
+
+
+def test_list_share_caps_entries(share, monkeypatch):
+    monkeypatch.setattr(sharefs, "LIST_CAP", 1)
+    out = sharefs.list_share("", root=share)
+    assert len(out["entries"]) == 1 and out["truncated"] is True
+
+
 def test_read_share_size_cap(share):
     with pytest.raises(ShareError, match="larger than"):
         sharefs.read_share("energy.csv", 3, root=share)

@@ -27,7 +27,7 @@ from typing import Callable
 
 import egress
 from policy import SANDBOX_ROOT, SandboxPolicy, bwrap_argv, exec_prefix, sandbox_env
-from replclient import ReplClient, SandboxNotReady, socketpairs
+from replclient import ReplClient, RpcHandler, SandboxNotReady, socketpairs
 from seccomp import compile_filter
 
 BASE_DIR = Path("/var/cache/code-interpreter")
@@ -387,11 +387,11 @@ class Sandbox:
         r["kernel_restarted"] = restarted
         return r
 
-    async def run_code(self, code: str, timeout_s: float, reset: bool = False) -> dict:
+    async def run_code(self, code: str, timeout_s: float, reset: bool = False, rpc: RpcHandler | None = None) -> dict:
         if reset:
             # Node has no safe way to empty globalThis: a fresh REPL does it.
             await self._restart_repl()
-        return await self._with_restart(lambda c: c.run(code, timeout_s))
+        return await self._with_restart(lambda c: c.run(code, timeout_s, rpc))
 
     async def run_command(self, command: str, timeout_s: float) -> dict:
         return await self._with_restart(lambda c: c.command(command, timeout_s))
