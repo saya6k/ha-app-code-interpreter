@@ -12,8 +12,8 @@ calls, work with files, and hand results (tables, plots) back to you through
   announces itself through Supervisor discovery.
 - **One sandbox per session:** each session runs in its own
   [bubblewrap](https://github.com/containers/bubblewrap) sandbox inside the
-  app container. A Python REPL keeps the session's variables until the
-  session ends.
+  app container. A JavaScript (Node) REPL keeps the session's variables
+  until the session ends; Python runs as a command in the same sandbox.
 - **Preinstalled analysis stack:** numpy, pandas, scipy, statsmodels,
   scikit-learn, sympy, networkx, matplotlib (Korean labels work out of the
   box), seaborn, openpyxl, xlsxwriter, pyarrow, pillow, lxml, beautifulsoup4,
@@ -46,7 +46,7 @@ Home Assistant host.
 
 | Tool | What it does |
 |---|---|
-| `run_code` | Run Python. Variables persist across calls with the same `session_id`. Returns stdout, stderr, the last expression's value, and `new_files` |
+| `run_code` | Run JavaScript (Node). Variables persist across calls with the same `session_id`; top-level `await` works. Returns stdout, stderr, the last expression's value, and `new_files` |
 | `run_command` | Run a shell command (`sh -c`) in the same sandbox and files |
 | `list_files` / `read_file` / `write_file` | Work with files under `/sandbox` |
 | `import_from_share` | Copy a file from `/share` into the session |
@@ -119,7 +119,7 @@ hosts.
 |---|---|---|
 | `idle_timeout_minutes` | `20` | Close a session after this many minutes without a call |
 | `max_sessions` | `3` | Sessions at once; the least recently used idle session is closed to make room |
-| `memory_limit_mb` | `2048` | Address-space limit per sandbox (`RLIMIT_AS`, minimum 768). This counts reserved memory, so real use is lower. Allocations beyond it raise `MemoryError` |
+| `memory_limit_mb` | `2048` | Address-space limit per sandbox (`RLIMIT_AS`, minimum 1024). This counts reserved memory, so real use is lower. Allocations beyond it raise `MemoryError` |
 | `network_allowlist` | empty | Hosts the sandbox may reach over HTTPS (see above); `"*"` = any public host. Empty = no network |
 | `max_file_mb` | `20` | Largest file for import, export and `write_file` |
 | `export_dir` | `/share/code-interpreter` | Where exported files go; must be under `/share` |
@@ -178,10 +178,11 @@ shows as a one-line `[audit]` summary in the app log.
   `sandbox_unavailable` until this is fixed; the log line says why.
 - **`Timeout when calling tool`:** the call ran into Home Assistant's 30 s
   limit. Ask for shorter steps.
-- **`KernelDied`:** the Python process ended below Python (out of memory,
-  a native library crash). Its last error output is in `stderr`. Variables
-  are lost and files are kept.
-- **`MemoryError` on import:** raise `memory_limit_mb`.
+- **`KernelDied`:** the REPL process ended (out of memory, a native crash).
+  Its last error output is in `stderr`. Variables are lost and files are
+  kept.
+- **`MemoryError` in Python, or `RangeError` / `Fatal process out of
+  memory` in JavaScript:** raise `memory_limit_mb`.
 - **A package is missing:** add `pypi.org` and `*.pythonhosted.org` to
   `network_allowlist` and let the agent `pip install` it (keep each install
   under 25 s).
@@ -191,8 +192,10 @@ shows as a one-line `[audit]` summary in the app log.
 The app's source is at
 <https://github.com/saya6k/ha-app-code-interpreter> under the MIT license.
 The sandbox bundles
-bubblewrap (LGPL-2.0-or-later) and the Python packages listed above under
-their own open-source licenses.
+bubblewrap (LGPL-2.0-or-later), Node.js (MIT, with its bundled components
+under their own licenses; see `/opt/node/LICENSE` in the sandbox), acorn
+(MIT) and the Python packages listed above under their own open-source
+licenses.
 
 The icon is the Python logo symbol as published on python.org, and the logo
 sets it beside the words "Code Interpreter"; the symbol is not altered.

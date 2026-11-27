@@ -133,14 +133,6 @@ class ReplClient:
             return False
         return bool(resp.get("interrupted"))
 
-    async def reset(self) -> dict:
-        out = _blank()
-        try:
-            _merge(out, await self._reply(await self._send({"op": "reset"}), 10), _CODE_KEYS)
-        except (ConnectionError, TimeoutError):
-            out.update(error="KernelDied", restart_required=True)
-        return out
-
     async def _bounded(self, req: dict, timeout_s: float, out: dict, keys: tuple[str, ...]) -> dict:
         """Send, wait timeout_s, then interrupt and wait grace_s, then give up."""
         try:

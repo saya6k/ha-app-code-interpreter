@@ -14,11 +14,12 @@ if [ -e "$dest" ]; then
   fi
   rm -rf "$dest"
 fi
-mkdir -p "$dest/mcp-server" "$dest/ci/repl"
+mkdir -p "$dest/mcp-server" "$dest/ci/repl/vendor"
 cp "$repo"/poc/node-probe/config.yaml "$repo"/poc/node-probe/Dockerfile "$repo"/poc/node-probe/probe.py "$dest/"
 cp -R "$repo/poc/node-probe/js" "$dest/js"
 cp "$repo/code-interpreter/apparmor.txt" "$dest/"
 cp "$opt"/mcp-server/*.py "$dest/mcp-server/"
 cp "$opt"/ci/*.py "$dest/ci/"
-cp "$opt"/ci/repl/*.py "$dest/ci/repl/"
+cp "$opt"/ci/repl/*.py "$opt"/ci/repl/*.mjs "$dest/ci/repl/"
+cp "$opt"/ci/repl/vendor/* "$dest/ci/repl/vendor/"
 echo "assembled: $dest"

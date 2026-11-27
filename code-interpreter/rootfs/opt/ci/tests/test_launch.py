@@ -155,15 +155,29 @@ def call(sock, req):
 linux_only = pytest.mark.skipif(sys.platform != "linux", reason="AF_UNIX SOCK_SEQPACKET is Linux-only")
 
 
+def find_node() -> str | None:
+    node = os.environ.get("CI_NODE") or shutil.which("node")
+    if not node:
+        return None
+    out = subprocess.run([node, "--version"], capture_output=True, text=True).stdout
+    return node if out.startswith("v") and int(out[1:].split(".")[0]) >= 22 else None
+
+
+NODE = find_node()
+
+
 @pytest.fixture
 def agent():
+    if NODE is None:
+        pytest.skip("needs Node 22+ (CI_NODE or node on PATH)")
     assert "CI_IN_SANDBOX" not in os.environ  # kill(-1) must never run here
     (a_repl, a_ctl), (c_repl, c_ctl) = pairs()
     a_agent, c_agent = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     fds = (c_repl.fileno(), c_ctl.fileno(), c_agent.fileno())
     env = dict(os.environ, REPL_FD=str(fds[0]), REPL_CTL_FD=str(fds[1]), CI_AGENT_FD=str(fds[2]),
-               CI_PROXY_SOCK="/nonexistent")
-    p = subprocess.Popen([sys.executable, str(LAUNCH), sys.executable, str(REPL_DIR / "server.py")],
+               CI_PROXY_SOCK="/nonexistent", CI_PYTHON=sys.executable)
+    p = subprocess.Popen([sys.executable, str(LAUNCH), NODE, "--disable-warning=ExperimentalWarning",
+                          str(REPL_DIR / "server.mjs")],
                          env=env, pass_fds=fds)
     for s in (c_repl, c_ctl, c_agent):
         s.close()
@@ -184,12 +198,12 @@ def restart(a_agent):
 @linux_only
 def test_agent_restarts_repl_on_new_channels_and_old_one_closes(agent):
     p, a_agent, a_repl = agent
-    assert call(a_repl, {"op": "exec", "code": "x = 1", "id": 1})["id"] == 1
+    assert call(a_repl, {"op": "exec", "code": "const x = 1", "id": 1})["id"] == 1
     reply, n_repl, n_ctl = restart(a_agent)
     assert reply == {"ok": True}
     a_repl.settimeout(5)
     assert a_repl.recv(1) == b""  # old REPL is gone and nobody holds its channel
-    assert call(n_repl, {"op": "exec", "code": "x", "id": 2})["error"] == "NameError"
+    assert call(n_repl, {"op": "exec", "code": "x", "id": 2})["error"] == "ReferenceError"
 
 
 @linux_only

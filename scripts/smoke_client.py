@@ -52,7 +52,8 @@ async def allowlist_mode(call) -> None:
                            command="pip download -q --no-deps -d /tmp/dl requests && ls /tmp/dl"))
     check("pip download via proxy", r.get("exit_code") == 0 and r.get("stdout", "").startswith("requests-"), r)
     sid = r.get("session_id")
-    r = payload(await call("run_code", session_id=sid, code=(
+    r = payload(await call("run_command", session_id=sid, command=(
+        "python3 - <<'EOF'\n"
         "import urllib.request, urllib.error, socket\n"
         "def get(u):\n"
         "    try: return urllib.request.urlopen(u, timeout=20).status\n"
@@ -60,9 +61,12 @@ async def allowlist_mode(call) -> None:
         "def tcp(h, p):\n"
         "    try: socket.create_connection((h, p), timeout=3).close(); return 'open'\n"
         "    except OSError as e: return type(e).__name__\n"
-        "(get('https://example.com/'), tcp('1.1.1.1', 443))")))
-    example, ip = eval(r["result"]) if r.get("result") else (None, None)
-    check("example.com refused, direct IP blocked", "403" in str(example) and ip != "open", r.get("result"))
+        "print(repr((get('https://example.com/'), tcp('1.1.1.1', 443))))\n"
+        "EOF")))
+    example, ip = eval(r["stdout"]) if r.get("stdout") else (None, None)
+    check("example.com refused, direct IP blocked", "403" in str(example) and ip != "open", r.get("stdout"))
+    r = payload(await call("run_code", session_id=sid, code="(await fetch('https://pypi.org/simple/requests/')).status"))
+    check("fetch() in the REPL goes through the proxy", r.get("result") == "200", r)
     for _ in range(100):  # entries land when each tunnel closes
         ev = [e for e in audit_events() if e["event"] == "net.connect"]
         if {"pypi.org", "example.com"} <= {e["detail"]["host"] for e in ev}:
@@ -81,7 +85,7 @@ SIDS = "/data/smoke-sids.json"  # survives the container restart (volume)
 async def open_two(call) -> None:
     sids = []
     for _ in range(2):
-        r = payload(await call("run_code", code="import subprocess; subprocess.Popen(['sleep', '600']); x = 1"))
+        r = payload(await call("run_code", code="require('child_process').spawn('sleep', ['600'], {stdio: 'ignore'}).unref(); x = 1"))
         sids.append(r.get("session_id"))
     check("two sessions with background processes", all(sids) and procs_of(60000) + procs_of(60001) > 0, sids)
     with open(SIDS, "w") as f:
@@ -113,10 +117,10 @@ async def ha_like_long_call() -> None:
             await s.initialize()
             try:
                 async with asyncio.timeout(30):  # HA's per-call cap
-                    res = payload(await s.call_tool("run_code", {"code": "import time; time.sleep(8); 'slept'"}))
+                    res = payload(await s.call_tool("run_code", {"code": "await new Promise((r) => setTimeout(r, 8000)); 'slept'"}))
             except Exception as e:  # noqa: BLE001
                 res = {"error": f"{type(e).__name__}: {e}"}
-            check("8 s call through a 5 s read timeout (HA client)", res.get("result") == "'slept'", res)
+            check("8 s call through a 5 s read timeout (HA client)", res.get("result") == "slept", res)
             if res.get("session_id"):
                 await s.call_tool("close_session", {"session_id": res["session_id"]})
 
@@ -176,8 +180,9 @@ async def main(idle_wait_s: int, mode: str) -> int:
             r2 = payload(await call("run_code", code="x + 1", session_id=sid))
             check("run_code keeps variables", r2.get("result") == "21" and r2.get("session_id") == sid, r2)
 
-            r = payload(await call("run_code", code="import pandas as pd; pd.DataFrame({'a': [1, 2]}).a.sum()", session_id=sid))
-            check("analysis stack", r.get("result") in ("3", "np.int64(3)"), r)
+            r = payload(await call("run_command", session_id=sid,
+                                   command="python3 -c \"import pandas as pd; print(pd.DataFrame({'a': [1, 2]}).a.sum())\""))
+            check("analysis stack (python3)", r.get("stdout") == "3\n", r)
 
             r = payload(await call("run_command", command="echo hi; exit 2", session_id=sid))
             check("run_command", (r.get("stdout"), r.get("exit_code")) == ("hi\n", 2), r)
@@ -194,11 +199,13 @@ async def main(idle_wait_s: int, mode: str) -> int:
             r = payload(await call("import_from_share", share_path="energy.csv", session_id=sid))
             check("import_from_share", r.get("path") == "/sandbox/energy.csv", r)
             r = payload(await call("run_code", session_id=sid, code=(
-                "import pandas as pd, matplotlib.pyplot as plt\n"
+                "const PY = `import pandas as pd, matplotlib.pyplot as plt\n"
                 "df = pd.read_csv('energy.csv'); df.kwh.plot(); plt.title('전력'); plt.savefig('plot.png')\n"
-                "df.kwh.mean()")))
-            check("run_code reads it and reports new_files",
-                  r.get("result") in ("2.0", "np.float64(2.0)") and r.get("new_files") == ["/sandbox/plot.png"], r)
+                "print(df.kwh.mean())`;\n"
+                "const p = require('child_process').spawnSync('python3', ['-c', PY], {encoding: 'utf8'});\n"
+                "console.error(p.stderr); p.stdout.trim()")))
+            check("run_code runs python3 on it and reports new_files",
+                  r.get("result") == "2.0" and r.get("new_files") == ["/sandbox/plot.png"], r)
             check("Korean title renders (no missing-glyph warning)", "Glyph" not in r.get("stderr", "x"), r.get("stderr"))
             r = payload(await call("read_file", session_id=sid, path="/sandbox/plot.png"))
             check("read_file on binary -> mime only", r.get("binary") is True and r.get("mime") == "image/png", r)
@@ -211,7 +218,7 @@ async def main(idle_wait_s: int, mode: str) -> int:
             check("read outside /sandbox refused", r.get("error") == "file_error", r)
 
             # Audit (T9): events recorded, execution output never stored.
-            r = payload(await call("run_code", session_id=sid, code="print('OUT' + 'PUT-MARKER-7')"))
+            r = payload(await call("run_code", session_id=sid, code="console.log('OUT' + 'PUT-MARKER-7')"))
             check("marker printed", r.get("stdout") == "OUTPUT-MARKER-7\n", r)
             ev = audit_events()
             names = {e["event"] for e in ev}
