@@ -80,7 +80,9 @@ async def run_code(
     log() output comes back as `logs`; a thrown error as `error` + `message`.
 
     Globals:
-      ha.tools(): Promise<Tool[]>              Home Assistant tools for entities exposed to Assist
+      ha.tools(): Promise<Tool[]>              Home Assistant tools for entities exposed to Assist;
+                                               ha.find(text): the few that match a task (also
+                                               ha.admin.find, plugins.find)
       ha.<domain>.<tool>(args): Promise<any>   e.g. ha.intent.HassTurnOff({name: "Kitchen light"}),
                                                ha.homeassistant.GetLiveContext() -> {result: text,
                                                entities: [{names, domain, state, areas, attributes}]}:

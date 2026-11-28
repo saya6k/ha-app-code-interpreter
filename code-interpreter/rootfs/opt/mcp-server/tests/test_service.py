@@ -901,6 +901,20 @@ def test_plugins_by_access_and_audited(tmp_path):
         ("memory", "memory__search", "bob"), ("Secrets", "secrets__read", "alice")]
 
 
+def test_find_returns_the_matching_tools_the_caller_may_use(tmp_path):
+    svc, _ = plugin_service(tmp_path)
+    bob = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+
+    def found(op, args):
+        r = asyncio.run(svc.run_code(f"call {op} {json.dumps(args)}", session_id=bob, user_id="bob"))
+        return r.get("error") or [t["name"] for t in json.loads(r["result"])]
+
+    assert found("ha.list", {"api": "assist", "query": "turn off the kitchen"}) == ["intent__HassTurnOff"]
+    assert found("plugins.list", {"query": "search memory"}) == ["memory__search"]
+    assert found("plugins.list", {"query": "read secrets"}) == []  # admin-only plugin: not even found
+    assert found("ha.list", {"api": "assist", "query": " "}).startswith("TypeError: ")
+
+
 def test_no_plugins_without_a_user(tmp_path):
     svc, created = plugin_service(tmp_path)
     sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]

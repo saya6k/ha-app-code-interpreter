@@ -19,6 +19,7 @@ import time
 from pathlib import Path
 
 from hamcp import HaUnavailable
+from rank import rank
 
 log = logging.getLogger("mcp-server")
 
@@ -242,39 +243,9 @@ class SkillStore:
         path.unlink()
 
 
-STOPWORDS = frozenset("a an and are as at be but by for from in is it of on or the to with".split())
-
-
-def _grams(text: str) -> set[str]:
-    """What a request and a skill can share, with no tokenizer or model:
-    Korean words as character bigrams ("코디를" meets "코디"), other words
-    whole and by their first five letters ("lights" meets "light"). English
-    bigrams would make every description match ("th", "in")."""
-    out = set()
-    for word in re.findall(r"\w+", text.replace("_", " ").casefold()):
-        if word in STOPWORDS:
-            continue
-        out.add(word)
-        if re.search("[가-힣]", word):
-            out.update(word[i:i + 2] for i in range(len(word) - 1))
-        else:
-            out.add(word[:5])
-    return out
-
-
 def find(skills: list[dict], text: str, cap: int = FIND_CAP) -> list[dict]:
-    """The skills that share the most of the request's words with their name
-    (counted twice) and description, best first. One that scores under half
-    the best shares only a stray word."""
-    query = _grams(text)
-    scored = []
-    for s in skills:
-        version = s.get("active") or s.get("pending") or {}
-        score = 2 * len(query & _grams(s["name"])) + len(query & _grams(version.get("description", "")))
-        if score:
-            scored.append((-score, s["name"], s))
-    best = -min(scored, key=lambda x: x[0])[0] if scored else 0
-    return [s for score, _, s in sorted(scored, key=lambda x: x[:2])[:cap] if -score * 2 >= best]
+    return rank(skills, text, lambda s: s["name"],
+                lambda s: (s.get("active") or s.get("pending") or {}).get("description", ""), cap)
 
 
 def worth_reviewing(code: str) -> bool:
