@@ -118,15 +118,17 @@ test("ha.find and ha.admin.find ask for the matching tools of their API", async 
   assert.deepEqual(sent, [["ha.list", { api: "assist", query: "turn off" }], ["ha.list", { api: "homeassistant", query: "traces" }]]);
 });
 
-test("skills.save and skills.delete manage a guide; calling a guide returns its text", async () => {
+test("skills.save takes code (a function or its source) or a guide; a guide is returned, not run", async () => {
   const sent = [];
   const target = {};
   installSkills(target, async (op, args) => (sent.push([op, args]), op === "skills.get" ? { guide: "be brief" } : { ok: true }));
   await target.skills.save("notes", { description: "how", guide: "be brief" });
+  await target.skills.save("greet", { description: "hi", code: async ({ who }) => who, params: "{ who }" });
   await target.skills.delete("notes");
   assert.deepEqual(await target.skills.notes(), { guide: "be brief" });
   assert.deepEqual(sent, [
-    ["skills.save", { name: "notes", description: "how", guide: "be brief" }],
+    ["skills.save", { name: "notes", description: "how", params: "", guide: "be brief" }],
+    ["skills.save", { name: "greet", description: "hi", params: "{ who }", code: "async ({ who }) => who" }],
     ["skills.delete", { name: "notes" }],
     ["skills.get", { name: "notes" }],
   ]);

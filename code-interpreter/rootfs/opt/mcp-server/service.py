@@ -129,24 +129,29 @@ CONVERSATION_GAP_S = 300  # Home Assistant ends a conversation after 5 idle minu
 
 
 TOOLS_FIND_CAP = 8
+BRIEF_DESC_CAP = 160
 
 
 def _matching(tools: list[dict], args: dict) -> list[dict]:
-    """All tools, or with a query (find(text)) the few that match it."""
+    """Like Claude Code's deferred tools: without a query, each tool's name and
+    first description line only (a full listing with schemas filled 16 k on a
+    real Home Assistant); find(text) returns the few that match a task, and
+    find("select:a,b") the named ones, each with its full input schema."""
     query = args.get("query")
     if query is None:
-        return tools
+        return [{"name": t["name"], "description": (t.get("description") or "").split("\n")[0][:BRIEF_DESC_CAP],
+                 **({"plugin": t["plugin"]} if "plugin" in t else {})} for t in tools]
     if not isinstance(query, str) or not query.strip():
         raise RpcError("TypeError", "find(text) takes what the tool should do, as a string")
+    if query.startswith("select:"):
+        wanted = [n.strip() for n in query[len("select:"):].split(",") if n.strip()]
+        return [t for t in tools if t["name"] in wanted]
     return rank(tools, query, lambda t: t["name"], lambda t: t.get("description"), TOOLS_FIND_CAP)
 
 
 def _skill_entry(skill: dict) -> dict:
-    version = skill.get("active") or skill.get("pending") or {}
-    return {"name": skill["name"], "kind": skill.get("kind", "code"),
-            "status": "active" if skill.get("active") else "pending",
-            "description": version.get("description", ""), "params": version.get("params", ""),
-            "uses": version.get("uses") or {}, "update_pending": bool(skill.get("active") and skill.get("pending"))}
+    return {"name": skill["name"], "kind": skill.get("kind", "code"), "description": skill.get("description", ""),
+            "params": skill.get("params", "")}
 
 
 def _snapshot(listing: dict) -> dict[str, tuple]:
@@ -240,8 +245,8 @@ class _CellCalls:
                     raise self._deny("rate", "RateLimited", f"more than {HA_CALLS_PER_CELL} Home Assistant calls in one run")
                 svc.reviewer.ask(self.user_id, text, s.sid)
                 return {"requested": True, "note": (
-                    "The skill is being written in the background. It waits for an administrator's approval "
-                    "in the Code Interpreter panel and cannot be used before that.")}
+                    "The skill is being written in the background and is usable once saved, in about a minute "
+                    "(skills.find() then shows it).")}
             if op == "skills.list":
                 return [_skill_entry(k) for k in svc.skills.list(self.user_id)]
             if op == "skills.find":
@@ -251,14 +256,19 @@ class _CellCalls:
                 return [_skill_entry(k) for k in skills_find(svc.skills.list(self.user_id), text)]
             name = str(args.get("name", ""))
             if op == "skills.save":
-                guide, description = args.get("guide"), args.get("description", "")
-                if not isinstance(guide, str) or not isinstance(description, str):
-                    raise RpcError("TypeError", "skills.save(name, {description, guide}) takes strings")
-                svc.skills.save_guide(self.user_id, name, description, guide)
-                svc.audit.record("skill.saved", s.sid, name=name, user_id=self.user_id, chars=len(guide))
-                return {"saved": name, "note": "In force now; skills.<name>() returns it."}
+                kinds = [k for k in ("code", "guide") if args.get(k) is not None]
+                fields = [args.get(k, "") for k in ("description", "params", *kinds)]
+                if len(kinds) != 1 or not all(isinstance(f, str) for f in fields):
+                    raise RpcError("TypeError", "skills.save(name, {description, code | guide, params?}) takes strings, "
+                                                "and either code or guide")
+                kind = kinds[0]
+                svc.skills.save(self.user_id, name, kind, args.get("description", ""), args[kind], args.get("params", ""),
+                                {"session_id": s.sid, "time": time.time()})
+                svc.audit.record("skill.saved", s.sid, name=name, kind=kind, via="agent", user_id=self.user_id,
+                                 chars=len(args[kind]))
+                return {"saved": name, "note": f"In force now: skills.{name}() {'runs it' if kind == 'code' else 'returns it'}."}
             if op == "skills.delete":
-                svc.skills.delete_guide(self.user_id, name)
+                svc.skills.delete(self.user_id, name)
                 svc.audit.record("skill.deleted", s.sid, name=name, user_id=self.user_id, by="user")
                 return {"deleted": name}
             skill = svc.skills.get(self.user_id, name)
@@ -266,13 +276,11 @@ class _CellCalls:
             raise RpcError("SkillError", str(e)) from None
         if not skill:
             raise RpcError("UnknownSkill", f"no skill {name!r} (see await skills.list())")
-        if not skill.get("active"):
-            raise RpcError("NotApproved", f"skill {name!r} waits for an administrator's approval")
         svc.audit.record("skill.used", s.sid, name=name, user_id=self.user_id)
         svc.skills.touch(self.user_id, name)
         if skill.get("kind") == "guide":
-            return {"guide": skill["active"]["guide"]}
-        return {"code": skill["active"]["code"]}
+            return {"guide": skill["guide"]}
+        return {"code": skill["code"]}
 
     async def _hab(self, args: dict):
         svc, s = self.service, self.sandbox
@@ -550,9 +558,9 @@ class Service:
     def _with_skills(self, out: dict, user_id: str | None, greet: bool) -> dict:
         if greet and out.get("session_id"):
             with contextlib.suppress(SkillError):
-                names, more = self.skills.names(user_id)
-                if names:
-                    out["skills"] = names
+                listed, more = self.skills.listing(user_id)
+                if listed:
+                    out["skills"] = listed
                 if more:
                     out["skills_more"] = more
         return out
