@@ -1031,6 +1031,19 @@ def test_a_skill_asked_for_in_a_conversation_becomes_pending_for_the_speaker(tmp
     assert ev["session_id"] == sid and ev["detail"]["via"] == "conversation" and ev["detail"]["user_id"] == "bob"
 
 
+def test_a_skill_request_is_told_a_guides_name_is_taken(tmp_path):
+    answer = {"save": True, "name": "todays_outfit", "description": "d", "params": "{}",
+              "code": "async () => plugins.wardrowbe.suggest_outfit({})", "reason": "asked", "uses": "{}"}
+    svc, _ = skill_service(tmp_path, answer)
+    svc.skills.save_guide("bob", "outfit_rules", "코디 규칙", "우산을 챙기라고 말해.")
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    ask(svc, sid, "bob")
+    asyncio.run(svc.reviewer.wait())
+    ((instructions, _),) = svc.ha.asked
+    assert '"name": "outfit_rules", "kind": "guide"' in instructions and "never reuse their names" in instructions
+    assert svc.skills.get("bob", "outfit_rules")["kind"] == "guide"  # and the guide stays as it was
+
+
 def test_skill_requests_need_a_user_the_workflow_and_one_at_a_time(tmp_path):
     svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
     anon = asyncio.run(svc.run_code("1 + 1"))["session_id"]
