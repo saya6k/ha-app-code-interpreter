@@ -59,6 +59,14 @@ def test_files_written_while_skills_waited_for_approval_still_load(tmp_path):
     assert st.get("u1", "note")["guide"] == "be brief"
 
 
+def test_an_approval_era_update_replaces_the_version_it_waited_beside(tmp_path):
+    (tmp_path / "u1").mkdir()
+    (tmp_path / "u1" / "a.json").write_text(json.dumps({"name": "a", "active": {"description": "v1", "code": "async () => 1"},
+                                                        "pending": {"description": "v2", "code": "async () => 2"}}))
+    skill = SkillStore(tmp_path).get("u1", "a")
+    assert (skill["description"], skill["code"]) == ("v2", "async () => 2")
+
+
 def test_the_listing_is_recent_first_capped_and_counts_the_rest(tmp_path):
     st = SkillStore(tmp_path)
     for name in ("alpha", "beta", "gamma"):
