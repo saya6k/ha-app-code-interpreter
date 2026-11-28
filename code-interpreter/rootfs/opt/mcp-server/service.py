@@ -227,6 +227,13 @@ class _CellCalls:
                                   user_id=self.user_id)
         return RpcError(name, message)
 
+    def _spend(self) -> None:
+        """Count a call that reaches Home Assistant with the run's others, so a
+        loop cannot run up a bill or flood it with notifications."""
+        self.ha_calls += 1
+        if self.ha_calls > HA_CALLS_PER_CELL:
+            raise self._deny("rate", "RateLimited", f"more than {HA_CALLS_PER_CELL} Home Assistant calls in one run")
+
     def _skills(self, op: str, args: dict):
         svc, s = self.service, self.sandbox
         if not self.user_id:
@@ -238,10 +245,7 @@ class _CellCalls:
                     raise RpcError("TypeError", "skills.request(text) takes what the skill should do, as a string")
                 if not svc.reviewer.enabled:
                     raise RpcError("SkillsOff", "skill requests are off (the app's skill_workflow option)")
-                # Each asks the AI Task: counted with the run's Home Assistant calls, so a loop cannot run up its bill.
-                self.ha_calls += 1
-                if self.ha_calls > HA_CALLS_PER_CELL:
-                    raise self._deny("rate", "RateLimited", f"more than {HA_CALLS_PER_CELL} Home Assistant calls in one run")
+                self._spend()  # it asks the AI Task
                 svc.reviewer.ask(self.user_id, text, s.sid)
                 return {"requested": True, "note": (
                     "The skill is being written in the background and is usable once saved, in about a minute "
@@ -259,11 +263,13 @@ class _CellCalls:
                 if not isinstance(description, str) or not isinstance(guide, str):
                     raise RpcError("TypeError", "skills.save(name, {description, guide}) takes strings: a skill is a "
                                                 "guide, instructions with any code to adapt written inside")
+                self._spend()  # it raises a notification
                 svc.skills.save(self.user_id, name, description, guide, {"session_id": s.sid, "time": time.time()})
                 svc.audit.record("skill.saved", s.sid, name=name, via="agent", user_id=self.user_id, chars=len(guide))
                 svc.reviewer.saved(self.user_id, name, "agent")
                 return {"saved": name, "note": f"In force now: skills.{name}() returns it."}
             if op == "skills.delete":
+                self._spend()  # it dismisses the notification
                 svc.skills.delete(self.user_id, name)
                 svc.audit.record("skill.deleted", s.sid, name=name, user_id=self.user_id, by="user")
                 svc.reviewer.deleted(self.user_id, name)

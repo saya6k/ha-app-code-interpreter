@@ -1107,6 +1107,19 @@ def test_a_stdin_request_does_not_free_a_conversation_requests_turn(tmp_path):
     assert first["error"] is None and second["error"].startswith("SkillError: ")
 
 
+def test_saves_and_deletions_count_toward_the_runs_call_limit(tmp_path, monkeypatch):
+    svc, _ = skill_service(tmp_path, {})
+    svc.skills.save("bob", "keep", "d", "x")
+    monkeypatch.setattr(service, "HA_CALLS_PER_CELL", 0)
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    r = asyncio.run(svc.run_code('call skills.save {"name": "a", "description": "d", "guide": "x"}', session_id=sid, user_id="bob"))
+    assert r["error"].startswith("RateLimited: ")
+    r = asyncio.run(svc.run_code('call skills.delete {"name": "keep"}', session_id=sid, user_id="bob"))
+    assert r["error"].startswith("RateLimited: ")
+    asyncio.run(svc.reviewer.wait())
+    assert svc.skills.get("bob", "a") is None and svc.skills.get("bob", "keep") and svc.ha.notes == []
+
+
 def test_skill_requests_count_toward_the_runs_call_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "HA_CALLS_PER_CELL", 0)
     svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
