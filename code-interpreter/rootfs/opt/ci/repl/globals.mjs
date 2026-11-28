@@ -242,11 +242,13 @@ export function installPlugins(target, rpc, enabled) {
     : undefined;
 }
 
-// skills.list(); skills.<name>(args) runs the user's approved skill: the app
+// skills.list(), skills.find(text); skills.<name>(args) runs the user's approved skill: the app
 // hands back its code each time (approvals can change), compiled here.
 export function installSkills(target, rpc) {
   const base = {
     list: () => rpc("skills.list", {}),
+    // The user's skills that best match what was asked, with descriptions and params.
+    find: (text) => rpc("skills.find", { text: String(text) }),
     // Ask for a new skill; it waits for an administrator's approval.
     request: (text) => rpc("skills.request", { request: String(text) }),
   };

@@ -23,11 +23,13 @@ log = logging.getLogger("mcp-server")
 
 ROOT = Path("/data/skills")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
-RESERVED = frozenset({"list", "request"})  # skills.list() and skills.request(): a skill by those names could never run
+RESERVED = frozenset({"list", "find", "request"})  # skills.list/find/request(): a skill by those names could never run
 USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CODE_CAP = 8192
 TEXT_CAP = 500
 PER_USER_CAP = 50
+NAMES_CAP = 30  # skill names a new session's first result carries
+FIND_CAP = 5
 
 
 USES_KEYS = ("ha", "hab", "plugins")
@@ -178,6 +180,21 @@ class SkillStore:
     def get(self, user: str, name: str) -> dict | None:
         return self._read(self._path(user, name))
 
+    def touch(self, user: str, name: str) -> None:
+        """Remember when a skill last ran: names() lists recent ones first."""
+        path = self._path(user, name)
+        if (skill := self._read(path)) is not None:
+            skill["used"] = time.time()
+            self._write(path, skill)
+
+    def names(self, user: str, cap: int = NAMES_CAP) -> tuple[list[str], int]:
+        """Approved skills' names, most recently used first, and how many more
+        there are. A name costs a few tokens: the model learns what exists
+        without the descriptions, and reads them with skills.find()."""
+        active = [s for s in self.list(user) if s.get("active")]
+        active.sort(key=lambda s: (-(s.get("used") or 0), s["name"]))
+        return [s["name"] for s in active[:cap]], max(0, len(active) - cap)
+
     def propose(self, user: str, name: str, description: str, params: str, code: str, source: dict,
                 uses: dict | None = None) -> dict:
         path = self._path(user, name)
@@ -221,6 +238,29 @@ class SkillStore:
         if not path.exists():
             raise SkillError("no such skill")
         path.unlink()
+
+
+def _grams(text: str) -> set[str]:
+    """Words and their character bigrams: "코디를" still meets "코디", and
+    "outfits" meets "outfit", with no tokenizer or model."""
+    out = set()
+    for word in re.findall(r"\w+", text.replace("_", " ").casefold()):
+        out.add(word)
+        out.update(word[i:i + 2] for i in range(len(word) - 1))
+    return out
+
+
+def find(skills: list[dict], text: str, cap: int = FIND_CAP) -> list[dict]:
+    """The skills that share the most of the request's words with their name
+    (counted twice) and description, best first; none that share nothing."""
+    query = _grams(text)
+    scored = []
+    for s in skills:
+        version = s.get("active") or s.get("pending") or {}
+        score = 2 * len(query & _grams(s["name"])) + len(query & _grams(version.get("description", "")))
+        if score:
+            scored.append((-score, s["name"], s))
+    return [s for *_, s in sorted(scored, key=lambda x: x[:2])[:cap]]
 
 
 def worth_reviewing(code: str) -> bool:

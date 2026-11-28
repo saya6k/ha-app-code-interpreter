@@ -98,3 +98,11 @@ test("skills.request sends the text; it is not taken for a skill name", async ()
   assert.deepEqual(await target.skills.request("today's outfit"), { requested: true });
   assert.deepEqual(sent, [["skills.request", { request: "today's outfit" }]]);
 });
+
+test("skills.find sends the text; it is not taken for a skill name", async () => {
+  const sent = [];
+  const target = {};
+  installSkills(target, async (op, args) => (sent.push([op, args]), []));
+  assert.deepEqual(await target.skills.find("오늘 코디"), []);
+  assert.deepEqual(sent, [["skills.find", { text: "오늘 코디" }]]);
+});

@@ -25,6 +25,7 @@ from plugins import ACCESS, Plugin, Plugins, valid_api
 from policy import SandboxPolicy
 from replclient import RpcError
 from skills import SkillError, SkillReviewer, SkillStore
+from skills import find as skills_find
 from sandbox import BASE_DIR, FileOpError, Sandbox, SandboxError
 from sharefs import ShareError
 from sessions import UID_BASE, Session, SessionManager, SessionNotFound
@@ -122,6 +123,16 @@ def _ms(t0: float) -> int:
     return int((time.monotonic() - t0) * 1000)
 
 
+CONVERSATION_GAP_S = 300  # Home Assistant ends a conversation after 5 idle minutes (chat_session)
+
+
+def _skill_entry(skill: dict) -> dict:
+    version = skill.get("active") or skill.get("pending") or {}
+    return {"name": skill["name"], "status": "active" if skill.get("active") else "pending",
+            "description": version.get("description", ""), "params": version.get("params", ""),
+            "uses": version.get("uses") or {}, "update_pending": bool(skill.get("active") and skill.get("pending"))}
+
+
 def _snapshot(listing: dict) -> dict[str, tuple]:
     """Files worth reporting: no dot paths (HOME lives in /sandbox)."""
     return {
@@ -184,7 +195,7 @@ class _CellCalls:
             return await self._ha(op, args)
         if op == "ha.hab":
             return await self._hab(args)
-        if op in ("skills.list", "skills.get", "skills.request"):
+        if op in ("skills.list", "skills.find", "skills.get", "skills.request"):
             return self._skills(op, args)
         if op in ("plugins.list", "plugins.call"):
             return await self._plugin(op, args)
@@ -216,12 +227,12 @@ class _CellCalls:
                     "The skill is being written in the background. It waits for an administrator's approval "
                     "in the Code Interpreter panel and cannot be used before that.")}
             if op == "skills.list":
-                return [{"name": k["name"], "status": "active" if k.get("active") else "pending",
-                         "description": (k.get("active") or k.get("pending") or {}).get("description", ""),
-                         "params": (k.get("active") or k.get("pending") or {}).get("params", ""),
-                         "uses": (k.get("active") or k.get("pending") or {}).get("uses") or {},
-                         "update_pending": bool(k.get("active") and k.get("pending"))}
-                        for k in svc.skills.list(self.user_id)]
+                return [_skill_entry(k) for k in svc.skills.list(self.user_id)]
+            if op == "skills.find":
+                text = args.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    raise RpcError("TypeError", "skills.find(text) takes what the user asked for, as a string")
+                return [_skill_entry(k) for k in skills_find(svc.skills.list(self.user_id), text)]
             name = str(args.get("name", ""))
             skill = svc.skills.get(self.user_id, name)
         except SkillError as e:
@@ -231,6 +242,7 @@ class _CellCalls:
         if not skill.get("active"):
             raise RpcError("NotApproved", f"skill {name!r} waits for an administrator's approval")
         svc.audit.record("skill.used", s.sid, name=name, user_id=self.user_id)
+        svc.skills.touch(self.user_id, name)
         return {"code": skill["active"]["code"]}
 
     async def _hab(self, args: dict):
@@ -493,11 +505,27 @@ class Service:
         # id back. Callers with no user (a satellite) always get a new one,
         # so anonymous conversations never share variables.
         resumed = session_id is None and user_id is not None and (latest := self.manager.latest(user_id)) is not None
+        # A new conversation (a new session, or the latest one once Home
+        # Assistant's conversation has expired) is told which skills exist,
+        # so the agent can use one instead of writing the code again.
+        greet = user_id is not None and session_id is None and (
+            not resumed or self.manager.idle_for(latest) >= CONVERSATION_GAP_S)
         if resumed:
             out = await self._call(latest, run, "code.exec", owner=user_id, **code_detail(code))
             if out.get("error") != "session_not_found":  # closed in between: start a new one below
-                return {**out, "resumed": True}
-        return await self._call(session_id, run, "code.exec", owner=user_id, **code_detail(code))
+                return self._with_skills({**out, "resumed": True}, user_id, greet)
+        out = await self._call(session_id, run, "code.exec", owner=user_id, **code_detail(code))
+        return self._with_skills(out, user_id, greet)
+
+    def _with_skills(self, out: dict, user_id: str | None, greet: bool) -> dict:
+        if greet and out.get("session_id"):
+            with contextlib.suppress(SkillError):
+                names, more = self.skills.names(user_id)
+                if names:
+                    out["skills"] = names
+                if more:
+                    out["skills_more"] = more
+        return out
 
     async def _has_plugins(self, user_id: str | None, admin: bool) -> bool:
         """Whether `plugins` exists in this caller's cells."""
