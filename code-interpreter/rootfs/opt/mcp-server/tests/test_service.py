@@ -9,6 +9,7 @@ import hamcp
 import replclient
 import service
 from skills import SkillReviewer, SkillStore
+from skills import find as skills_find
 from audit import Audit
 from policy import SandboxPolicy
 from sandbox import FileOpError, SandboxError
@@ -747,12 +748,31 @@ def test_skills_find_ranks_by_the_requests_words(tmp_path):
         return r.get("error") or [s["name"] for s in json.loads(r["result"])]
 
     assert find("오늘 코디 추천해 줘") == ["todays_outfit"]
-    assert find("turn the lights off but not the bedroom")[0] == "lights_off_except"
+    assert find("turn the lights off but not the bedroom") == ["lights_off_except"]  # not "the garden"
+    assert find("start watering the garden") == ["water_plants"]
     assert find("zzz") == []
     assert find("  ").startswith("TypeError: ")
     other = asyncio.run(svc.run_code("1", user_id="bob"))["session_id"]
     r = asyncio.run(svc.run_code('call skills.find {"text": "코디"}', session_id=other, user_id="bob"))
     assert json.loads(r["result"]) == []
+
+
+def test_skills_find_weighs_the_name_over_the_description():
+    skills = [
+        {"name": "garden_report", "active": {"description": "what the sensors say"}},
+        {"name": "sensor_summary", "active": {"description": "the garden's sensors"}},
+    ]
+    assert [s["name"] for s in skills_find(skills, "garden")] == ["garden_report", "sensor_summary"]
+
+
+def test_a_skill_still_runs_when_its_use_cannot_be_recorded(tmp_path, monkeypatch):
+    svc, _ = skill_service(tmp_path, {})
+    svc.skills.propose("alice", "greet", "", "", "async () => 1", {})
+    svc.skills.approve("alice", "greet", "admin")
+    sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
+    monkeypatch.setattr(svc.skills, "_write", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
+    assert json.loads(r["result"]) == {"code": "async () => 1"}
 
 
 def test_a_failed_review_is_audited_not_lost(tmp_path):

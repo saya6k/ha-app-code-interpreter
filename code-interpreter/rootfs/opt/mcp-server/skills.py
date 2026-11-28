@@ -10,6 +10,7 @@ someone approves it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -185,7 +186,8 @@ class SkillStore:
         path = self._path(user, name)
         if (skill := self._read(path)) is not None:
             skill["used"] = time.time()
-            self._write(path, skill)
+            with contextlib.suppress(OSError):  # only the order of names(): never worth failing the run
+                self._write(path, skill)
 
     def names(self, user: str, cap: int = NAMES_CAP) -> tuple[list[str], int]:
         """Approved skills' names, most recently used first, and how many more
@@ -240,19 +242,30 @@ class SkillStore:
         path.unlink()
 
 
+STOPWORDS = frozenset("a an and are as at be but by for from in is it of on or the to with".split())
+
+
 def _grams(text: str) -> set[str]:
-    """Words and their character bigrams: "코디를" still meets "코디", and
-    "outfits" meets "outfit", with no tokenizer or model."""
+    """What a request and a skill can share, with no tokenizer or model:
+    Korean words as character bigrams ("코디를" meets "코디"), other words
+    whole and by their first five letters ("lights" meets "light"). English
+    bigrams would make every description match ("th", "in")."""
     out = set()
     for word in re.findall(r"\w+", text.replace("_", " ").casefold()):
+        if word in STOPWORDS:
+            continue
         out.add(word)
-        out.update(word[i:i + 2] for i in range(len(word) - 1))
+        if re.search("[가-힣]", word):
+            out.update(word[i:i + 2] for i in range(len(word) - 1))
+        else:
+            out.add(word[:5])
     return out
 
 
 def find(skills: list[dict], text: str, cap: int = FIND_CAP) -> list[dict]:
     """The skills that share the most of the request's words with their name
-    (counted twice) and description, best first; none that share nothing."""
+    (counted twice) and description, best first. One that scores under half
+    the best shares only a stray word."""
     query = _grams(text)
     scored = []
     for s in skills:
@@ -260,7 +273,8 @@ def find(skills: list[dict], text: str, cap: int = FIND_CAP) -> list[dict]:
         score = 2 * len(query & _grams(s["name"])) + len(query & _grams(version.get("description", "")))
         if score:
             scored.append((-score, s["name"], s))
-    return [s for *_, s in sorted(scored, key=lambda x: x[:2])[:cap]]
+    best = -min(scored, key=lambda x: x[0])[0] if scored else 0
+    return [s for score, _, s in sorted(scored, key=lambda x: x[:2])[:cap] if -score * 2 >= best]
 
 
 def worth_reviewing(code: str) -> bool:
