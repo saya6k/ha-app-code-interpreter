@@ -255,12 +255,18 @@ export function installSkills(target, rpc) {
     find: (text) => rpc("skills.find", { text: String(text) }),
     // Ask for a new skill; it waits for an administrator's approval.
     request: (text) => rpc("skills.request", { request: String(text) }),
+    // A guide: instructions for this user's agent, in force at once; the user replaces or deletes it.
+    save: (name, { description = "", guide } = {}) =>
+      rpc("skills.save", { name: String(name), description: String(description), guide: String(guide ?? "") }),
+    delete: (name) => rpc("skills.delete", { name: String(name) }),
   };
   target.skills = new Proxy(base, {
     get(b, key) {
       if (key in b || typeof key !== "string" || key === "then" || key === "toJSON") return b[key];
       return async (args = {}) => {
-        const { code } = await rpc("skills.get", { name: key });
+        const got = await rpc("skills.get", { name: key });
+        if (got.guide !== undefined) return { guide: got.guide };  // instructions to follow, not code
+        const { code } = got;
         const fn = vm.runInThisContext(`(${code})`, {
           filename: `skill:${key}`,
           importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,

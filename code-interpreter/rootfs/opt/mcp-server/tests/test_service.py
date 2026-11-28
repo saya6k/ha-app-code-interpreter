@@ -2,13 +2,15 @@ import asyncio
 import dataclasses
 import json
 
+import pytest
+
 from pathlib import Path
 
 import hab
 import hamcp
 import replclient
 import service
-from skills import SkillReviewer, SkillStore
+from skills import SkillError, SkillReviewer, SkillStore
 from skills import find as skills_find
 from audit import Audit
 from policy import SandboxPolicy
@@ -697,7 +699,7 @@ def test_cells_use_only_their_users_approved_skills(tmp_path):
     svc.skills.propose("alice", "greet", "", "", "async () => 1", {})
     sid = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
     listed = json.loads(asyncio.run(svc.run_code("call skills.list {}", session_id=sid, user_id="alice"))["result"])
-    assert listed == [{"name": "greet", "status": "pending", "description": "", "params": "",
+    assert listed == [{"name": "greet", "kind": "code", "status": "pending", "description": "", "params": "",
                        "uses": {"ha": [], "hab": [], "plugins": []}, "update_pending": False}]
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
     assert r["error"].startswith("NotApproved: ")
@@ -773,6 +775,51 @@ def test_a_skill_still_runs_when_its_use_cannot_be_recorded(tmp_path, monkeypatc
     monkeypatch.setattr(svc.skills, "_write", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
     assert json.loads(r["result"]) == {"code": "async () => 1"}
+
+
+def test_a_guide_is_in_force_at_once_and_the_user_edits_and_deletes_it(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+    sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
+
+    def cell(op, args):
+        r = asyncio.run(svc.run_code(f"call {op} {json.dumps(args, ensure_ascii=False)}", session_id=sid, user_id="alice"))
+        return r.get("error") or json.loads(r["result"])
+
+    saved = cell("skills.save", {"name": "outfit_notes", "description": "코디 추천 규칙", "guide": "비 오면 우산을 챙기라고 말해."})
+    assert saved["saved"] == "outfit_notes"
+    assert cell("skills.get", {"name": "outfit_notes"}) == {"guide": "비 오면 우산을 챙기라고 말해."}  # no approval
+    (entry,) = cell("skills.find", {"text": "코디 추천해 줘"})
+    assert (entry["name"], entry["kind"], entry["status"]) == ("outfit_notes", "guide", "active")
+    cell("skills.save", {"name": "outfit_notes", "description": "코디 추천 규칙", "guide": "우산과 겉옷을 챙기라고 말해."})
+    assert cell("skills.get", {"name": "outfit_notes"}) == {"guide": "우산과 겉옷을 챙기라고 말해."}
+    assert cell("skills.delete", {"name": "outfit_notes"}) == {"deleted": "outfit_notes"}
+    assert cell("skills.get", {"name": "outfit_notes"}).startswith("UnknownSkill: ")
+    assert [e["detail"]["name"] for e in events(tmp_path) if e["event"] in ("skill.saved", "skill.deleted")] == [
+        "outfit_notes"] * 3
+
+
+def test_a_guide_never_takes_or_loses_a_code_skills_place(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+    svc.skills.propose("alice", "greet", "", "", "async () => 1", {})
+    svc.skills.approve("alice", "greet", "admin")
+    sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
+
+    def cell(op, args):
+        r = asyncio.run(svc.run_code(f"call {op} {json.dumps(args)}", session_id=sid, user_id="alice"))
+        return r.get("error") or json.loads(r["result"])
+
+    assert cell("skills.save", {"name": "greet", "guide": "x"}).startswith("SkillError: ")  # would skip approval
+    assert cell("skills.delete", {"name": "greet"}).startswith("SkillError: ")  # code skills: the panel
+    assert svc.skills.get("alice", "greet")["active"]["code"] == "async () => 1"
+    cell("skills.save", {"name": "notes", "guide": "x"})
+    with pytest.raises(SkillError):
+        svc.skills.propose("alice", "notes", "", "", "async () => 1", {})
+    assert cell("skills.save", {"name": "list", "guide": "x"}).startswith("SkillError: ")
+    assert cell("skills.save", {"name": "n2", "guide": ""}).startswith("SkillError: ")
+    assert cell("skills.save", {"name": "n2", "guide": 3}).startswith("TypeError: ")
+    other = asyncio.run(svc.run_code("1"))["session_id"]
+    r = asyncio.run(svc.run_code('call skills.save {"name": "n3", "guide": "x"}', session_id=other))
+    assert r["error"].startswith("NoUser: ")
 
 
 def test_a_failed_review_is_audited_not_lost(tmp_path):
@@ -982,6 +1029,19 @@ def test_a_skill_asked_for_in_a_conversation_becomes_pending_for_the_speaker(tmp
     assert svc.skills.get("bob", "todays_outfit")["active"] is None  # nothing runs before approval
     (ev,) = [e for e in events(tmp_path) if e["event"] == "skill.requested"]
     assert ev["session_id"] == sid and ev["detail"]["via"] == "conversation" and ev["detail"]["user_id"] == "bob"
+
+
+def test_a_skill_request_is_told_a_guides_name_is_taken(tmp_path):
+    answer = {"save": True, "name": "todays_outfit", "description": "d", "params": "{}",
+              "code": "async () => plugins.wardrowbe.suggest_outfit({})", "reason": "asked", "uses": "{}"}
+    svc, _ = skill_service(tmp_path, answer)
+    svc.skills.save_guide("bob", "outfit_rules", "코디 규칙", "우산을 챙기라고 말해.")
+    sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    ask(svc, sid, "bob")
+    asyncio.run(svc.reviewer.wait())
+    ((instructions, _),) = svc.ha.asked
+    assert '"name": "outfit_rules", "kind": "guide"' in instructions and "never reuse their names" in instructions
+    assert svc.skills.get("bob", "outfit_rules")["kind"] == "guide"  # and the guide stays as it was
 
 
 def test_skill_requests_need_a_user_the_workflow_and_one_at_a_time(tmp_path):

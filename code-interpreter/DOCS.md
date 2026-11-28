@@ -92,6 +92,7 @@ the panel.
 | `plugins.<server>.<tool>(args)` | MCP servers Home Assistant connects to, if the app allows this person any (see [Plugins](#plugins)); `plugins.tools()` lists them, `plugins.call(name, args)` takes a full name. Undefined otherwise |
 | `skills.list()`, `skills.find(text)`, `skills.<name>(args)` | The speaker's saved skills (see [Skills](#skills)): all of them, or the few that best match a request, with descriptions and parameters; only approved ones run |
 | `skills.request(text)` | Ask for a new skill for the speaker; it waits for an administrator's approval |
+| `skills.save(name, {description, guide})`, `skills.delete(name)` | Save, replace or delete one of the speaker's guides: instructions in force at once (see [Guides](#guides)) |
 | `sleep(ms)`, `log(...)`, `require(name)` | Waiting, logging, Node's built-in modules |
 
 There is no npm: only Node's built-ins and the preinstalled Python packages
@@ -215,6 +216,29 @@ sessions:
    agent knows what exists without reading every description.
    `skills.find(text)` matches the request's words against each skill's
    name and description and returns the best five.
+
+### Guides
+
+A guide is a skill made of instructions instead of code: how the person
+wants something done from now on ("when you suggest an outfit, always say
+whether to take an umbrella"). The agent saves it with
+`skills.save(name, {description, guide})`. It is in force at once, with no
+approval: calling `skills.<name>()` returns `{guide}`, which the agent
+reads and follows, and `skills.find()` and the names at a conversation's
+start include it like any skill.
+
+- A guide belongs to one person and only reaches that person's agent. It
+  runs nothing itself, so whatever the agent does after reading it still
+  goes through that person's rights.
+- The person replaces it by saving the same name again and deletes it with
+  `skills.delete(name)`; administrators see and delete guides in the
+  panel too (`skill.saved` and `skill.deleted` in the audit log).
+- A guide is text that returns to the model in later conversations. Plugin
+  answers or files the agent read could talk it into saving one. Every save
+  is audited, and the panel shows each guide's text.
+- A guide never takes a code skill's name, and a code skill never takes a
+  guide's: saving a guide cannot replace approved code. `skills.delete()`
+  deletes guides only; code skills are deleted in the panel.
 
 ### Asking for a skill
 

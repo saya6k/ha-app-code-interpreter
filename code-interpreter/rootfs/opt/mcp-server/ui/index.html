@@ -91,7 +91,7 @@
         <option>file.read</option><option>file.list</option>
         <option>net.connect</option><option>policy.violation</option><option>ui.close_session</option>
         <option>skill.requested</option><option>skill.proposed</option><option>skill.review</option><option>skill.used</option>
-        <option>skill.approved</option><option>skill.rejected</option><option>skill.deleted</option>
+        <option>skill.saved</option><option>skill.approved</option><option>skill.rejected</option><option>skill.deleted</option>
       </select></label>
       <span class="muted" id="events-note"></span>
     </div>
@@ -138,7 +138,8 @@ async function loadSkills() {
     { method: "POST", headers: { "X-Requested-With": "code-interpreter-ui" } }).then(loadSkills, (e) => alert(e.message));
   for (const k of data.skills) {
     const v = k.pending || k.active;
-    const status = k.pending ? (k.active ? "update pending" : "pending") : "active";
+    const guide = k.kind === "guide";  // the user's own instructions: no approval, the user edits them
+    const status = guide ? "guide" : k.pending ? (k.active ? "update pending" : "pending") : "active";
     const tr = el("tr");
     const buttons = el("td");
     if (k.pending) {
@@ -151,13 +152,16 @@ async function loadSkills() {
     tr.append(el("td", k.user || k.user_id.slice(0, 8)), el("td", k.name, "mono"),
               el("td", status), el("td", v.description), buttons);
     const code = el("tr"); const td = el("td"); td.colSpan = 5;
-    const det = el("details"); det.append(el("summary", `code${k.pending && k.active ? " (proposed)" : ""} · ${v.params || "no params"}`), el("pre", v.code, "mono"));
+    const det = el("details");
+    if (guide) det.append(el("summary", "guide (saved by the user)"), el("pre", v.guide, "mono"));
+    else det.append(el("summary", `code${k.pending && k.active ? " (proposed)" : ""} · ${v.params || "no params"}`), el("pre", v.code, "mono"));
     // The manifest only describes the code; the skill runs with the speaker's rights.
     const check = k.check[k.pending ? "pending" : "active"] || { undeclared: [], dynamic: [] };
     const uses = v.uses || {};
     const declared = [...(uses.ha || []), ...(uses.hab || []).map((c) => "hab " + c),
                       ...(uses.plugins || []).map((t) => "plugin " + t)];
-    td.append(det, el("div", "uses: " + (declared.join(", ") || "nothing declared"), "muted mono"));
+    td.append(det);
+    if (!guide) td.append(el("div", "uses: " + (declared.join(", ") || "nothing declared"), "muted mono"));
     if (check.undeclared.length) td.append(el("div", "⚠ calls not in uses: " + check.undeclared.join(", "), "badge warn"));
     if (check.dynamic.length) td.append(el("div", "⚠ calls through a variable (not checked): " + check.dynamic.join(", "), "badge warn"));
     code.append(td);

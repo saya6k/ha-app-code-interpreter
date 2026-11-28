@@ -143,7 +143,8 @@ def _matching(tools: list[dict], args: dict) -> list[dict]:
 
 def _skill_entry(skill: dict) -> dict:
     version = skill.get("active") or skill.get("pending") or {}
-    return {"name": skill["name"], "status": "active" if skill.get("active") else "pending",
+    return {"name": skill["name"], "kind": skill.get("kind", "code"),
+            "status": "active" if skill.get("active") else "pending",
             "description": version.get("description", ""), "params": version.get("params", ""),
             "uses": version.get("uses") or {}, "update_pending": bool(skill.get("active") and skill.get("pending"))}
 
@@ -210,7 +211,7 @@ class _CellCalls:
             return await self._ha(op, args)
         if op == "ha.hab":
             return await self._hab(args)
-        if op in ("skills.list", "skills.find", "skills.get", "skills.request"):
+        if op in ("skills.list", "skills.find", "skills.get", "skills.request", "skills.save", "skills.delete"):
             return self._skills(op, args)
         if op in ("plugins.list", "plugins.call"):
             return await self._plugin(op, args)
@@ -249,6 +250,17 @@ class _CellCalls:
                     raise RpcError("TypeError", "skills.find(text) takes what the user asked for, as a string")
                 return [_skill_entry(k) for k in skills_find(svc.skills.list(self.user_id), text)]
             name = str(args.get("name", ""))
+            if op == "skills.save":
+                guide, description = args.get("guide"), args.get("description", "")
+                if not isinstance(guide, str) or not isinstance(description, str):
+                    raise RpcError("TypeError", "skills.save(name, {description, guide}) takes strings")
+                svc.skills.save_guide(self.user_id, name, description, guide)
+                svc.audit.record("skill.saved", s.sid, name=name, user_id=self.user_id, chars=len(guide))
+                return {"saved": name, "note": "In force now; skills.<name>() returns it."}
+            if op == "skills.delete":
+                svc.skills.delete_guide(self.user_id, name)
+                svc.audit.record("skill.deleted", s.sid, name=name, user_id=self.user_id, by="user")
+                return {"deleted": name}
             skill = svc.skills.get(self.user_id, name)
         except SkillError as e:
             raise RpcError("SkillError", str(e)) from None
@@ -258,6 +270,8 @@ class _CellCalls:
             raise RpcError("NotApproved", f"skill {name!r} waits for an administrator's approval")
         svc.audit.record("skill.used", s.sid, name=name, user_id=self.user_id)
         svc.skills.touch(self.user_id, name)
+        if skill.get("kind") == "guide":
+            return {"guide": skill["active"]["guide"]}
         return {"code": skill["active"]["code"]}
 
     async def _hab(self, args: dict):
