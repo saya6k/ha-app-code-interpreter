@@ -214,6 +214,40 @@ def test_mcp_servers_lists_the_mcp_client_entries(monkeypatch):
     assert seen["url"] == "http://supervisor/core/api/config/config_entries/entry?domain=mcp"
 
 
+def test_reload_own_entries_reloads_only_the_apps_discovered_entries(monkeypatch):
+    posted = []
+
+    def handler(request):
+        if request.url.path == "/addons/self/info":
+            return httpx.Response(200, json={"data": {"name": "Code Interpreter"}})
+        if request.method == "POST":
+            posted.append(request.url.path)
+            return httpx.Response(200, json={"require_restart": False})
+        return httpx.Response(200, json=[
+            {"entry_id": "A", "domain": "mcp", "title": "Code Interpreter", "source": "hassio"},
+            {"entry_id": "B", "domain": "mcp", "title": "Code Interpreter", "source": "user"},
+            {"entry_id": "C", "domain": "mcp", "title": "Memory", "source": "hassio"}])
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    assert asyncio.run(HomeAssistant(token="t").reload_own_entries()) == ["A"]
+    assert posted == ["/core/api/config/config_entries/entry/A/reload"]
+
+
+def test_reload_own_entries_reports_a_refused_reload(monkeypatch):
+    def handler(request):
+        if request.url.path == "/addons/self/info":
+            return httpx.Response(200, json={"data": {"name": "CI"}})
+        if request.method == "POST":
+            return httpx.Response(401)
+        return httpx.Response(200, json=[{"entry_id": "A", "domain": "mcp", "title": "CI", "source": "hassio"}])
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    with pytest.raises(HaUnavailable, match="401"):
+        asyncio.run(HomeAssistant(token="t").reload_own_entries())
+
+
 def test_generate_data_network_errors_are_unavailable(monkeypatch):
     def handler(request):
         raise httpx.ConnectError("connection refused", request=request)

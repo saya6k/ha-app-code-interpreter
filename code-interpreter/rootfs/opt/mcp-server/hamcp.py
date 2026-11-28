@@ -237,6 +237,36 @@ class HomeAssistant:
         return [{"entry_id": e.get("entry_id"), "title": e.get("title") or "", "state": e.get("state")}
                 for e in r.json() if e.get("domain") == "mcp"]
 
+    async def reload_own_entries(self) -> list[str]:
+        """Reload the MCP client entries that reach this app. Home Assistant
+        reads an MCP server's tools when the entry loads and then only every
+        30 minutes, so after an update the agent would keep the previous
+        run_code description. The app's entries are the ones Supervisor
+        discovery created (source "hassio") under the app's name."""
+        import httpx
+
+        if not self.token:
+            raise HaUnavailable("no Supervisor token")
+        auth = {"Authorization": f"Bearer {self.token}"}
+        supervisor = self.base.removesuffix("/core")
+        try:
+            async with httpx.AsyncClient(timeout=15) as http:
+                me = await http.get(f"{supervisor}/addons/self/info", headers=auth)
+                entries = await http.get(f"{self.base}/api/config/config_entries/entry", params={"domain": "mcp"},
+                                         headers=auth)
+                if me.status_code != 200 or entries.status_code != 200:
+                    raise HaUnavailable(f"app info {me.status_code}, config entries {entries.status_code}")
+                name = (me.json().get("data") or {}).get("name")
+                ids = [e["entry_id"] for e in entries.json()
+                       if e.get("domain") == "mcp" and e.get("source") == "hassio" and name and e.get("title") == name]
+                for entry_id in ids:
+                    r = await http.post(f"{self.base}/api/config/config_entries/entry/{entry_id}/reload", headers=auth)
+                    if r.status_code != 200:
+                        raise HaUnavailable(f"reloading {entry_id} failed ({r.status_code})")
+        except httpx.HTTPError as e:
+            raise HaUnavailable(f"reload: {type(e).__name__}: {e}") from None
+        return ids
+
     def pool(self) -> "CallPool":
         """Connections that last one run: a cell's calls share them."""
         return CallPool(self)
