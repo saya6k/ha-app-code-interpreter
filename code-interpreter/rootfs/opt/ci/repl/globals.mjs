@@ -246,18 +246,21 @@ export function installPlugins(target, rpc, enabled) {
     : undefined;
 }
 
-// skills.list(), skills.find(text); skills.<name>(args) runs the user's approved skill: the app
-// hands back its code each time (approvals can change), compiled here.
+// skills.list(), skills.find(text); skills.<name>(args) runs the user's skill: the app hands
+// back its code each time (it can be replaced), compiled here; a guide comes back as {guide}.
 export function installSkills(target, rpc) {
   const base = {
     list: () => rpc("skills.list", {}),
     // The user's skills that best match what was asked, with descriptions and params.
     find: (text) => rpc("skills.find", { text: String(text) }),
-    // Ask for a new skill; it waits for an administrator's approval.
+    // Have the AI Task write a routine in the background.
     request: (text) => rpc("skills.request", { request: String(text) }),
-    // A guide: instructions for this user's agent, in force at once; the user replaces or deletes it.
-    save: (name, { description = "", guide } = {}) =>
-      rpc("skills.save", { name: String(name), description: String(description), guide: String(guide ?? "") }),
+    // Save or replace a skill, in force at once: code (an async function, or its source) or a guide.
+    save: (name, { description = "", code, guide, params = "" } = {}) =>
+      rpc("skills.save", {
+        name: String(name), description: String(description), params: String(params),
+        ...(code !== undefined ? { code: String(code) } : {}), ...(guide !== undefined ? { guide: String(guide) } : {}),
+      }),
     delete: (name) => rpc("skills.delete", { name: String(name) }),
   };
   target.skills = new Proxy(base, {

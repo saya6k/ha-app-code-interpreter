@@ -214,23 +214,6 @@ def test_mcp_servers_lists_the_mcp_client_entries(monkeypatch):
     assert seen["url"] == "http://supervisor/core/api/config/config_entries/entry?domain=mcp"
 
 
-def test_notify_and_dismiss_call_persistent_notification(monkeypatch):
-    seen = []
-
-    def handler(request):
-        seen.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json=[])
-
-    real = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
-    ha = HomeAssistant(token="t")
-    asyncio.run(ha.notify("n1", "title", "body"))
-    asyncio.run(ha.dismiss("n1"))
-    assert seen == [("/core/api/services/persistent_notification/create",
-                     {"notification_id": "n1", "title": "title", "message": "body"}),
-                    ("/core/api/services/persistent_notification/dismiss", {"notification_id": "n1"})]
-
-
 def test_generate_data_network_errors_are_unavailable(monkeypatch):
     def handler(request):
         raise httpx.ConnectError("connection refused", request=request)

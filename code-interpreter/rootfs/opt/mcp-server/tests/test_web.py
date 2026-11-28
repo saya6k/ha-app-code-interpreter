@@ -19,16 +19,8 @@ from skills import SkillStore  # noqa: E402
 
 
 class FakeHA:
-    def known_users(self):
+    async def user_names(self):
         return {"u1": "Alice"}
-
-
-class FakeReviewer:
-    def __init__(self):
-        self.dismissed = []
-
-    def dismiss(self, user, name):
-        self.dismissed.append((user, name))
 
 
 class FakeService:
@@ -36,10 +28,8 @@ class FakeService:
         self.options = Options(policy=SandboxPolicy(allowlist=("pypi.org",)), skill_workflow=True)
         self.audit = audit
         self.ha = FakeHA()
-        self.reviewer = FakeReviewer()
         self.skills = SkillStore(skills_dir)
-        self.skills.propose("u1", "greet", "says hi", "{}", "async () => ha.intent.HassTurnOn({})", {},
-                            uses={"ha": ["intent__HassTurnOff"]})
+        self.skills.save("u1", "greet", "code", "says hi", "async () => ha.intent.HassTurnOn({})", "{}")
         self.open = {"abc": {"session_id": "abc", "created": 1.0, "last_used": 2.0, "expires_in_s": 90}}
 
     def list_sessions(self, everyone=False):
@@ -121,30 +111,31 @@ def test_ui_never_injects_html():
     assert "innerHTML" not in html and "insertAdjacentHTML" not in html and "document.write" not in html
 
 
-def test_skills_are_listed_and_need_the_ui_header_to_approve(env):
-    client, svc, _ = env
+def test_skills_are_listed_with_their_calls_and_deleted_with_the_ui_header(env):
+    client, svc, tmp = env
     body = client.get("/api/skills").json()
     assert body["workflow"] is True
     (k,) = body["skills"]
-    assert (k["user"], k["name"], k["active"], k["pending"]["code"]) == ("Alice", "greet", None, "async () => ha.intent.HassTurnOn({})")
-    assert k["check"] == {"pending": {"undeclared": ["intent__HassTurnOn"], "dynamic": []}}
-    assert client.post("/api/skills/u1/greet/approve").status_code == 403
-    r = client.post("/api/skills/u1/greet/approve", headers={"X-Requested-With": "code-interpreter-ui",
-                                                              "X-Remote-User-Name": "admin"})
-    assert r.status_code == 200 and svc.skills.get("u1", "greet")["active"]["approved_by"] == "admin"
-    assert svc.reviewer.dismissed == [("u1", "greet")]  # the approval notification is done
-    assert client.post("/api/skills/u1/greet/approve", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 400
-    assert client.post("/api/skills/u1/greet/explode", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 404
+    assert (k["user"], k["name"], k["kind"], k["code"]) == ("Alice", "greet", "code", "async () => ha.intent.HassTurnOn({})")
+    assert k["calls"] == {"calls": ["intent__HassTurnOn"], "dynamic": []}
+    assert client.post("/api/skills/u1/greet/delete").status_code == 403
+    for action in ("approve", "reject", "explode"):  # nothing waits for approval any more
+        assert client.post(f"/api/skills/u1/greet/{action}", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 404
+    r = client.post("/api/skills/u1/greet/delete", headers={"X-Requested-With": "code-interpreter-ui",
+                                                             "X-Remote-User-Name": "admin"})
+    assert r.status_code == 200 and svc.skills.get("u1", "greet") is None
+    assert client.post("/api/skills/u1/greet/delete", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 400
     assert client.post("/api/skills/..%2Fx/greet/delete", headers={"X-Requested-With": "code-interpreter-ui"}).status_code in (400, 404)
+    (ev,) = [json.loads(x) for f in tmp.glob("audit-*.jsonl") for x in f.read_text().splitlines()
+             if json.loads(x)["event"] == "skill.deleted"]
+    assert ev["detail"] == {"user_id": "u1", "name": "greet", "by": "admin"}
 
 
-def test_a_users_guide_is_listed_without_a_code_check(env):
+def test_a_users_guide_is_listed_without_calls(env):
     client, svc, _ = env
-    svc.skills.save_guide("u1", "outfit_notes", "how I like outfits", "Always mention an umbrella when rain is likely.")
+    svc.skills.save("u1", "outfit_notes", "guide", "how I like outfits", "Always mention an umbrella when rain is likely.")
     guide = next(k for k in client.get("/api/skills").json()["skills"] if k["name"] == "outfit_notes")
-    assert guide["kind"] == "guide" and guide["check"] == {} and guide["active"]["guide"].startswith("Always")
-    r = client.post("/api/skills/u1/outfit_notes/delete", headers={"X-Requested-With": "code-interpreter-ui"})
-    assert r.status_code == 200 and svc.skills.get("u1", "outfit_notes") is None
+    assert guide["kind"] == "guide" and guide["calls"] is None and guide["guide"].startswith("Always")
 
 
 def test_skill_code_is_only_inserted_as_text():

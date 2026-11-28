@@ -16,7 +16,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Route
 
 import auditview
-from skills import SkillError, manifest_check
+from skills import SkillError, calls_in
 
 INGRESS_PORT = 8098
 INGRESS_PROXY = "172.30.32.2"  # Supervisor's Ingress gateway on the hassio network
@@ -72,14 +72,13 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
         return JSONResponse(result, status_code=404 if "error" in result else 200)
 
     async def list_skills(request: Request) -> Response:
-        names = svc.ha.known_users()
+        names = await svc.ha.user_names()
         out = []
         for user in svc.skills.users():
             for s in svc.skills.list(user):
-                # What the code visibly calls vs. its manifest, for the reviewer.
-                check = {k: manifest_check(s[k]["code"], s[k].get("uses")) for k in ("active", "pending")
-                         if s.get(k) and "code" in s[k]}  # a guide has no code
-                out.append({"user_id": user, "user": names.get(user), **s, "check": check})
+                # What the code visibly calls, for whoever reads it here.
+                calls = calls_in(s["code"]) if s.get("kind", "code") == "code" else None
+                out.append({"user_id": user, "user": names.get(user), **s, "calls": calls})
         return JSONResponse({"skills": out, "workflow": svc.options.skill_workflow})
 
     async def skill_action(request: Request) -> Response:
@@ -87,20 +86,13 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
             return JSONResponse({"error": "missing X-Requested-With"}, status_code=403)
         user, name, action = (request.path_params[k] for k in ("user", "name", "action"))
         by = request.headers.get("x-remote-user-name") or request.headers.get("x-remote-user-id")
+        if action != "delete":
+            return JSONResponse({"error": "unknown action"}, status_code=404)
         try:
-            if action == "approve":
-                svc.skills.approve(user, name, by)
-            elif action == "reject":
-                svc.skills.reject(user, name)
-            elif action == "delete":
-                svc.skills.delete(user, name)
-            else:
-                return JSONResponse({"error": "unknown action"}, status_code=404)
+            svc.skills.delete(user, name)
         except SkillError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        svc.audit.record(f"skill.{action}d" if action != "reject" else "skill.rejected", None,
-                         user_id=user, name=name, by=by)
-        svc.reviewer.dismiss(user, name)
+        svc.audit.record("skill.deleted", None, user_id=user, name=name, by=by)
         return JSONResponse({"ok": True})
 
     async def audit_days(request: Request) -> Response:

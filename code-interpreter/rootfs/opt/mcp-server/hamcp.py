@@ -237,14 +237,6 @@ class HomeAssistant:
         return [{"entry_id": e.get("entry_id"), "title": e.get("title") or "", "state": e.get("state")}
                 for e in r.json() if e.get("domain") == "mcp"]
 
-    async def notify(self, notification_id: str, title: str, message: str) -> None:
-        """A persistent notification (every Home Assistant user sees it)."""
-        await self._action("persistent_notification/create",
-                           {"notification_id": notification_id, "title": title, "message": message}, 15)
-
-    async def dismiss(self, notification_id: str) -> None:
-        await self._action("persistent_notification/dismiss", {"notification_id": notification_id}, 15)
-
     def pool(self) -> "CallPool":
         """Connections that last one run: a cell's calls share them."""
         return CallPool(self)
@@ -305,8 +297,11 @@ class HomeAssistant:
                               if found else f"no active Home Assistant user {who!r}")
         return found.pop()
 
-    def known_users(self) -> dict[str, str]:
-        """User id -> name from the last lookup (no request of its own)."""
+    async def user_names(self) -> dict[str, str]:
+        """User id -> name, looked up again when the cache is old; the last
+        known names if Home Assistant cannot answer."""
+        with contextlib.suppress(Exception):  # noqa: BLE001 - only labels for the panel
+            await self._user_map()
         return {uid: u.get("name") or "" for uid, u in (self._users[1] if self._users else {}).items()}
 
     async def self_check(self) -> str:

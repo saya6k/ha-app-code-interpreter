@@ -68,25 +68,40 @@ async def run_code(
 ) -> dict:
     """Run JavaScript (Node 26) in a sandbox that can also reach Home Assistant.
 
-    One call runs a whole script: read state, filter it in code, act, and
-    return only what is needed. When the user asks for a skill (a reusable
-    routine), call skills.request(text) with what it should do: nothing else
-    creates one. Top-level await works; const/let/function/
-    class declared at the top level stay defined for later calls. Omit
-    session_id to continue your latest session (`resumed: true`; pass
+    What a call costs: each run_code is a full model round-trip, while the
+    work inside a script is cheap and runs concurrently with Promise.all. So
+    put everything one step needs in one script (read state, filter it in
+    code, act, return only what is needed), and call again only when the next
+    step depends on what this one returned. Top-level await works;
+    const/let/function/class declared at the top level stay defined for later
+    calls. Omit session_id to continue your latest session (`resumed: true`;
     reset: true for a clean one); session_not_found means that session's
     variables and files are gone. The last expression is returned as
     `result` (promises inside a returned object are awaited); console.log and
     log() output comes back as `logs`; a thrown error as `error` + `message`.
 
+    Skills are this user's saved routines (code) and guides (instructions for
+    you). A new conversation's first result lists them in `skills` with
+    one-line descriptions. When the task at hand is one a listed skill covers,
+    use it first, in place of your default approach: skills.<name>(args) runs
+    a routine; a guide returns {guide}, which you follow. If no `skills`
+    listing is in this conversation, skills.find(request) searches them. When
+    the user wants a routine kept, or says how you should do something from
+    now on, save it: skills.save(name, {description, code | guide}), in force
+    at once. Write description as what it does and when to use it, in the
+    user's words.
+
+    Tools: ha.tools(), ha.admin.tools() and plugins.tools() list names and
+    one-line descriptions only. ha.find(text), ha.admin.find(text) and
+    plugins.find(text) return the few that match a task with their full input
+    schema; find("select:a,b") fetches named ones. Look a tool up before
+    calling it with arguments you have not seen.
+
     Globals:
-      ha.tools(): Promise<Tool[]>              Home Assistant tools for entities exposed to Assist;
-                                               ha.find(text): the few that match a task (also
-                                               ha.admin.find, plugins.find)
       ha.<domain>.<tool>(args): Promise<any>   e.g. ha.intent.HassTurnOff({name: "Kitchen light"}),
                                                ha.homeassistant.GetLiveContext() -> {result: text,
                                                entities: [{names, domain, state, areas, attributes}]}:
-                                               filter ctx.entities, do not parse the text
+                                               filter entities, do not parse the text
       ha.call(name, args)                      the same by full name, e.g. "light__HassLightSet"
       ha.admin?                                administrators only: read-only tools (logs, history,
                                                traces, configuration); undefined for everyone else
@@ -94,24 +109,20 @@ async def run_code(
                                                ["automation", "get", "id"]; returns hab's JSON envelope.
                                                Reads run; changes only if the app's hab_allow rules
                                                allow them (see hab schema --index for commands)
+      plugins?.<server>.<tool>(args)           MCP servers Home Assistant reaches that the app allows
+                                               you; undefined if none
+      skills.list(), skills.find(text)         all of this user's skills, or the few that match
+      skills.<name>(args)                      run a routine, or read a guide ({guide})
+      skills.save(name, {description, code | guide, params?})
+                                               save or replace one; code is an async function taking
+                                               one argument object (or its source)
+      skills.delete(name)                      remove one the user no longer wants
+      skills.request(text)                     have a background writer draft a routine instead
+                                               (about a minute)
       $`cmd ${x}`                              sh -c in /sandbox, values quoted; .text() .lines()
                                                .json() .nothrow() .timeout(ms); non-zero exit throws
       file(p).text()/json()/lines()/exists(), write(p, s), sleep(ms), log(...), require(builtin)
       share.list(dir?), share.import(sharePath, dest?), share.export(path)   Home Assistant's /share
-      plugins?.<server>.<tool>(args)           MCP servers Home Assistant reaches that the app allows
-                                               you (plugins.tools() lists them); undefined if none
-      skills.find(text), skills.list()         this user's saved skills that match a request (or
-                                               all), with params; a new conversation's first
-                                               result names the approved ones as `skills`
-      skills.<name>(args)                      run an approved skill: prefer a fitting skill over
-                                               writing the code again
-      skills.request(text)                     ask for a new skill when the user wants one; it is
-                                               written in the background and runs only once an
-                                               administrator approves it
-      skills.save(name, {description, guide})  when the user says how you should do something from
-                                               now on: a guide (instructions, not code), in force
-                                               at once; skills.<name>() then returns {guide} to
-                                               follow. skills.delete(name) removes a guide
 
     Example, one call:
       const { entities } = await ha.homeassistant.GetLiveContext();

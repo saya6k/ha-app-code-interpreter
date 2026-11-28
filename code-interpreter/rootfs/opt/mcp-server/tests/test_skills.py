@@ -2,73 +2,79 @@ import json
 
 import pytest
 
-from skills import CODE_CAP, SkillError, SkillStore, manifest_check, parse_uses, tool_summary
+from skills import CODE_CAP, SkillError, SkillStore, calls_in, tool_summary
 
 CODE = "async ({ room }) => room"
 
 
-def test_propose_approve_and_a_new_proposal_does_not_replace_the_active_code(tmp_path):
+def test_a_saved_skill_is_in_force_and_a_save_replaces_it(tmp_path):
     st = SkillStore(tmp_path)
-    st.propose("u1", "lights_off", "turn lights off", "{room}", CODE, {"session_id": "s"})
-    assert st.get("u1", "lights_off")["active"] is None
-    st.approve("u1", "lights_off", "admin")
-    st.propose("u1", "lights_off", "v2", "{room}", "async () => 2", {})
+    st.save("u1", "lights_off", "code", "turn lights off", CODE, "{room}", {"session_id": "s"})
+    assert st.get("u1", "lights_off")["code"] == CODE
+    st.touch("u1", "lights_off")
+    st.save("u1", "lights_off", "guide", "how to turn lights off", "Ask which room first.")
     s = st.get("u1", "lights_off")
-    assert s["active"]["code"] == CODE and s["active"]["approved_by"] == "admin"
-    assert s["pending"]["code"] == "async () => 2"
-    st.reject("u1", "lights_off")
-    assert st.get("u1", "lights_off")["pending"] is None and st.get("u1", "lights_off")["active"]["code"] == CODE
-
-
-def test_rejecting_a_never_approved_skill_removes_it(tmp_path):
-    st = SkillStore(tmp_path)
-    st.propose("u1", "x", "", "", CODE, {})
-    st.reject("u1", "x")
-    assert st.get("u1", "x") is None and st.list("u1") == []
+    assert (s["kind"], s["guide"], "code" in s) == ("guide", "Ask which room first.", False)
+    assert s["used"]  # replacing keeps when it last ran
+    st.delete("u1", "lights_off")
+    assert st.get("u1", "lights_off") is None
+    with pytest.raises(SkillError):
+        st.delete("u1", "lights_off")
 
 
 def test_skills_are_per_user(tmp_path):
     st = SkillStore(tmp_path)
-    st.propose("u1", "a", "", "", CODE, {})
+    st.save("u1", "a", "code", "d", CODE)
     assert st.list("u2") == [] and st.get("u2", "a") is None and st.users() == ["u1"]
 
 
-@pytest.mark.parametrize("name", ["", "Bad", "1x", "../x", "a" * 41, "a-b", "list", "request"])
+@pytest.mark.parametrize("name", ["", "Bad", "1x", "../x", "a" * 41, "a-b", "list", "request", "find", "save", "delete"])
 def test_invalid_names_are_refused(tmp_path, name):
     with pytest.raises(SkillError):
-        SkillStore(tmp_path).propose("u1", name, "", "", CODE, {})
+        SkillStore(tmp_path).save("u1", name, "code", "d", CODE)
 
 
 @pytest.mark.parametrize("user", ["", "../etc", "a/b"])
 def test_invalid_users_are_refused(tmp_path, user):
     with pytest.raises(SkillError):
-        SkillStore(tmp_path).propose(user, "a", "", "", CODE, {})
+        SkillStore(tmp_path).save(user, "a", "code", "d", CODE)
 
 
-def test_code_size_and_approving_nothing(tmp_path):
-    st = SkillStore(tmp_path)
+@pytest.mark.parametrize("kind, body, description", [
+    ("code", "x" * (CODE_CAP + 1), "d"), ("code", "", "d"), ("guide", CODE, "  "), ("macro", CODE, "d")])
+def test_size_description_and_kind_are_checked(tmp_path, kind, body, description):
     with pytest.raises(SkillError):
-        st.propose("u1", "a", "", "", "x" * (CODE_CAP + 1), {})
-    with pytest.raises(SkillError):
-        st.approve("u1", "missing", None)
+        SkillStore(tmp_path).save("u1", "a", kind, description, body)
 
 
-def test_files_are_json_with_both_versions(tmp_path):
+def test_files_written_while_skills_waited_for_approval_still_load(tmp_path):
+    (tmp_path / "u1").mkdir()
+    (tmp_path / "u1" / "old.json").write_text(json.dumps({"name": "old", "active": None, "used": 5, "pending": {
+        "description": "d", "params": "{}", "code": CODE, "uses": {}, "proposed": 1.0, "source": {"session_id": "s"}}}))
+    (tmp_path / "u1" / "note.json").write_text(json.dumps({"name": "note", "kind": "guide", "pending": None,
+                                                           "active": {"description": "g", "guide": "be brief"}}))
     st = SkillStore(tmp_path)
-    st.propose("u1", "a", "d", "p", CODE, {"session_id": "s"})
-    data = json.loads((tmp_path / "u1" / "a.json").read_text())
-    assert set(data) == {"name", "active", "pending"} and data["pending"]["source"] == {"session_id": "s"}
+    assert st.get("u1", "old") == {"name": "old", "kind": "code", "description": "d", "params": "{}", "code": CODE,
+                                   "saved": 1.0, "source": {"session_id": "s"}, "used": 5}
+    assert st.get("u1", "note")["guide"] == "be brief"
 
 
-def test_uses_are_normalized_from_json_or_objects():
-    assert parse_uses('{"ha": ["b", "a", "a", 3], "hab": "x"}') == {"ha": ["a", "b"], "hab": [], "plugins": []}
-    assert parse_uses("not json") == parse_uses(None) == {"ha": [], "hab": [], "plugins": []}
+def test_an_approval_era_update_replaces_the_version_it_waited_beside(tmp_path):
+    (tmp_path / "u1").mkdir()
+    (tmp_path / "u1" / "a.json").write_text(json.dumps({"name": "a", "active": {"description": "v1", "code": "async () => 1"},
+                                                        "pending": {"description": "v2", "code": "async () => 2"}}))
+    skill = SkillStore(tmp_path).get("u1", "a")
+    assert (skill["description"], skill["code"]) == ("v2", "async () => 2")
 
 
-def test_propose_stores_the_manifest(tmp_path):
+def test_the_listing_is_recent_first_capped_and_counts_the_rest(tmp_path):
     st = SkillStore(tmp_path)
-    st.propose("u1", "a", "", "", CODE, {}, uses={"ha": ["intent__HassTurnOff"]})
-    assert st.get("u1", "a")["pending"]["uses"] == {"ha": ["intent__HassTurnOff"], "hab": [], "plugins": []}
+    for name in ("alpha", "beta", "gamma"):
+        st.save("u1", name, "code", f"{name} " + "x" * 200, CODE)
+    st.touch("u1", "gamma")
+    listed, more = st.listing("u1", cap=2)
+    assert [s["name"] for s in listed] == ["gamma", "alpha"] and more == 1
+    assert listed[0]["kind"] == "code" and len(listed[0]["description"]) == 120
 
 
 CHECKED = """async ({ room }) => {
@@ -83,39 +89,33 @@ CHECKED = """async ({ room }) => {
 }"""
 
 
-def test_manifest_check_lists_undeclared_calls():
-    uses = {"ha": ["homeassistant__GetLiveContext", "intent__HassTurnOff", "admin.history__get_history"],
-            "hab": ["automation get"]}
-    assert manifest_check(CHECKED, uses) == {
-        "undeclared": ["admin.trace__get_trace", "light__HassLightSet", "hab script set x"], "dynamic": []}
-    full = {"ha": uses["ha"] + ["admin.trace__get_trace", "light__HassLightSet"], "hab": ["automation get", "script"]}
-    assert manifest_check(CHECKED, full) == {"undeclared": [], "dynamic": []}
+def test_calls_in_lists_what_the_code_visibly_calls():
+    assert calls_in(CHECKED) == {"calls": ["admin.history__get_history", "admin.trace__get_trace",
+                                           "homeassistant__GetLiveContext", "intent__HassTurnOff", "light__HassLightSet",
+                                           "hab automation get", "hab script set x"], "dynamic": []}
 
 
-def test_manifest_check_reads_optional_chaining():
+def test_calls_in_reads_optional_chaining():
     code = ("async () => { await ha.admin?.history.get_history({}); await ha?.intent.HassTurnOff({}); "
             "await ha.admin?.call('trace__get_trace'); await ha.admin?.hab(['automation', 'list']); }")
-    assert manifest_check(code, {}) == {"undeclared": ["admin.history__get_history", "admin.trace__get_trace",
-                                                       "intent__HassTurnOff", "hab automation list"], "dynamic": []}
+    assert calls_in(code) == {"calls": ["admin.history__get_history", "admin.trace__get_trace",
+                                        "intent__HassTurnOff", "hab automation list"], "dynamic": []}
 
 
-def test_manifest_check_flags_calls_it_cannot_read():
+def test_calls_in_flags_calls_it_cannot_read():
     code = "async ({ tool, argv }) => { await ha.call(tool, {}); await ha.admin.hab(argv); await ha.admin.hab([argv[0]]); }"
-    assert manifest_check(code, {}) == {"undeclared": [], "dynamic": ["ha.admin.hab", "ha.call"]}
-    # a prefix that is not a whole word does not cover a command
-    assert manifest_check('ha.admin.hab(["automations", "list"])', {"hab": ["automation"]})["undeclared"] == [
-        "hab automations list"]
+    assert calls_in(code) == {"calls": [], "dynamic": ["ha.admin.hab", "ha.call"]}
 
 
-def test_manifest_check_covers_plugin_tools():
+def test_calls_in_covers_plugin_tools():
     code = ('async () => { await plugins.memory.search({}); await plugins["multi-service-mcp"].find_places({}); '
             'await plugins.call("memory__save", {}); const t = await plugins.tools(); }')
-    assert manifest_check(code, {"plugins": ["memory__search"]}) == {
-        "undeclared": ["plugin memory__save", "plugin multi-service-mcp__find_places"], "dynamic": []}
-    assert manifest_check("plugins.call(name, {})", {})["dynamic"] == ["plugins.call"]
+    assert calls_in(code) == {"calls": ["plugin memory__save", "plugin memory__search",
+                                        "plugin multi-service-mcp__find_places"], "dynamic": []}
+    assert calls_in("plugins.call(name, {})")["dynamic"] == ["plugins.call"]
     # optional chaining, as the tool description writes plugins?.<server>.<tool>
     chained = 'await plugins?.memory.search({}); await plugins?.["multi-service-mcp"]?.find_places({}); plugins?.call("x__y")'
-    assert manifest_check(chained, {})["undeclared"] == [
+    assert calls_in(chained)["calls"] == [
         "plugin memory__search", "plugin multi-service-mcp__find_places", "plugin x__y"]
 
 

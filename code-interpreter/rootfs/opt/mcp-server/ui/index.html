@@ -62,7 +62,7 @@
   <section class="card">
     <h2>Skills <span class="muted" id="skills-note"></span></h2>
     <div class="scroll"><table>
-      <thead><tr><th>User</th><th>Skill</th><th>Status</th><th>Description</th><th></th></tr></thead>
+      <thead><tr><th>User</th><th>Skill</th><th>Kind</th><th>Description</th><th></th></tr></thead>
       <tbody id="skills"></tbody>
     </table></div>
   </section>
@@ -90,8 +90,8 @@
         <option>file.import</option><option>file.export</option><option>file.write</option>
         <option>file.read</option><option>file.list</option>
         <option>net.connect</option><option>policy.violation</option><option>ui.close_session</option>
-        <option>skill.requested</option><option>skill.proposed</option><option>skill.review</option><option>skill.used</option>
-        <option>skill.saved</option><option>skill.approved</option><option>skill.rejected</option><option>skill.deleted</option>
+        <option>skill.requested</option><option>skill.review</option><option>skill.used</option>
+        <option>skill.saved</option><option>skill.deleted</option>
       </select></label>
       <span class="muted" id="events-note"></span>
     </div>
@@ -127,45 +127,34 @@ function emptyRow(tbody, cols, text) {
   const tr = el("tr"); const td = el("td", text, "empty"); td.colSpan = cols; tr.append(td); tbody.append(tr);
 }
 
-// Skill code comes from a model that read untrusted code: shown as text only,
-// and an administrator decides before any cell can run it.
+// Skill code and guides come from models that read conversations: shown as
+// text only. Skills are in force once saved; here they are read and deleted.
 async function loadSkills() {
   const data = await api("api/skills");
-  $("skills-note").textContent = data.workflow ? "" : "(proposals are off: skill_workflow)";
+  $("skills-note").textContent = data.workflow ? "" : "(writing from sessions and requests is off: skill_workflow)";
   const tbody = $("skills"); tbody.replaceChildren();
   if (!data.skills.length) return emptyRow(tbody, 5, "No skills yet.");
-  const act = (k, action) => api(`api/skills/${encodeURIComponent(k.user_id)}/${encodeURIComponent(k.name)}/${action}`,
+  const del = (k) => api(`api/skills/${encodeURIComponent(k.user_id)}/${encodeURIComponent(k.name)}/delete`,
     { method: "POST", headers: { "X-Requested-With": "code-interpreter-ui" } }).then(loadSkills, (e) => alert(e.message));
   for (const k of data.skills) {
-    const v = k.pending || k.active;
-    const guide = k.kind === "guide";  // the user's own instructions: no approval, the user edits them
-    const status = guide ? "guide" : k.pending ? (k.active ? "update pending" : "pending") : "active";
+    const guide = k.kind === "guide";
     const tr = el("tr");
     const buttons = el("td");
-    if (k.pending) {
-      const ok = el("button", "Approve"); ok.onclick = () => act(k, "approve");
-      const no = el("button", "Reject"); no.onclick = () => act(k, "reject");
-      buttons.append(ok, " ", no, " ");
-    }
-    const del = el("button", "Delete"); del.onclick = () => confirm(`Delete ${k.name}?`) && act(k, "delete");
-    buttons.append(del);
+    const b = el("button", "Delete"); b.onclick = () => confirm(`Delete ${k.name}?`) && del(k);
+    buttons.append(b);
     tr.append(el("td", k.user || k.user_id.slice(0, 8)), el("td", k.name, "mono"),
-              el("td", status), el("td", v.description), buttons);
-    const code = el("tr"); const td = el("td"); td.colSpan = 5;
+              el("td", guide ? "guide" : "code"), el("td", k.description), buttons);
+    const body = el("tr"); const td = el("td"); td.colSpan = 5;
     const det = el("details");
-    if (guide) det.append(el("summary", "guide (saved by the user)"), el("pre", v.guide, "mono"));
-    else det.append(el("summary", `code${k.pending && k.active ? " (proposed)" : ""} · ${v.params || "no params"}`), el("pre", v.code, "mono"));
-    // The manifest only describes the code; the skill runs with the speaker's rights.
-    const check = k.check[k.pending ? "pending" : "active"] || { undeclared: [], dynamic: [] };
-    const uses = v.uses || {};
-    const declared = [...(uses.ha || []), ...(uses.hab || []).map((c) => "hab " + c),
-                      ...(uses.plugins || []).map((t) => "plugin " + t)];
+    det.append(el("summary", guide ? "guide" : `code · ${k.params || "no params"}`), el("pre", guide ? k.guide : k.code, "mono"));
     td.append(det);
-    if (!guide) td.append(el("div", "uses: " + (declared.join(", ") || "nothing declared"), "muted mono"));
-    if (check.undeclared.length) td.append(el("div", "⚠ calls not in uses: " + check.undeclared.join(", "), "badge warn"));
-    if (check.dynamic.length) td.append(el("div", "⚠ calls through a variable (not checked): " + check.dynamic.join(", "), "badge warn"));
-    code.append(td);
-    tbody.append(tr, code);
+    // What the code visibly calls; it runs with its user's rights whatever it calls.
+    if (k.calls) {
+      td.append(el("div", "calls: " + (k.calls.calls.join(", ") || "nothing visible"), "muted mono"));
+      if (k.calls.dynamic.length) td.append(el("div", "calls through a variable: " + k.calls.dynamic.join(", "), "muted mono"));
+    }
+    body.append(td);
+    tbody.append(tr, body);
   }
 }
 
