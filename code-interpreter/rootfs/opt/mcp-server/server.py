@@ -154,6 +154,8 @@ async def reload_when_listening(api: uvicorn.Server) -> None:
         if api.started:
             break
         await asyncio.sleep(0.5)
+    else:
+        return  # not listening: a reload would only make Home Assistant fail to connect
     try:
         log.info("[hamcp] reloaded MCP entries: %s", await svc.ha.reload_own_entries() or "none yet")
     except HaUnavailable as e:
