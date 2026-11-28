@@ -82,7 +82,7 @@ the panel.
 
 | Global | What it does |
 |---|---|
-| `ha.tools()` | The Home Assistant tools this person may use |
+| `ha.tools()`, `ha.find(text)` | The Home Assistant tools this person may use: all of them, or the few (at most 8) whose name and description best match a task. `ha.admin.find(text)` and `plugins.find(text)` do the same for those lists |
 | `ha.<domain>.<tool>(args)` | Call one, e.g. `ha.intent.HassTurnOff({name: "Kitchen light"})`; `ha.call("light__HassLightSet", args)` takes the full name. `ha.homeassistant.GetLiveContext()` returns Home Assistant's text as `result` and the same entities parsed as `entities` (`names`, `domain`, `state`, `areas`, `attributes`), so scripts filter objects instead of matching text |
 | `ha.admin` | Administrators only: read-only Home Assistant tools (see below) |
 | `ha.admin.hab(argv, {stdin})` | Administrators only: the Home Assistant Builder CLI, for example `["automation", "get", "night"]`; changes need `hab_allow` (see [Editing with hab](#editing-with-hab)) |

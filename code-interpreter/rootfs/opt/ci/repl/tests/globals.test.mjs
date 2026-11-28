@@ -8,7 +8,7 @@ import test from "node:test";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sbx-"));
 process.env.CI_SANDBOX_DIR = dir;
 const g = {};
-const { install, installPlugins, installSkills, quote, ShellError } = await import("../globals.mjs");
+const { install, installHa, installPlugins, installSkills, quote, ShellError } = await import("../globals.mjs");
 install(g);
 const { $, file, write } = g;
 
@@ -80,11 +80,13 @@ test("plugins map <server>.<tool> to the full tool name, and are undefined when 
   await target.plugins["multi-service-mcp"].find_places();
   await target.plugins.call("memory__save", { v: 2 });
   await target.plugins.tools();
+  await target.plugins.find("search notes");
   assert.deepEqual(sent, [
     ["plugins.call", { name: "memory__search", args: { q: 1 } }],
     ["plugins.call", { name: "multi-service-mcp__find_places", args: {} }],
     ["plugins.call", { name: "memory__save", args: { v: 2 } }],
     ["plugins.list", {}],
+    ["plugins.list", { query: "search notes" }],
   ]);
   assert.equal(target.plugins.then, undefined); // awaiting the namespace does not call a tool
   installPlugins(target, rpc, false);
@@ -105,4 +107,13 @@ test("skills.find sends the text; it is not taken for a skill name", async () =>
   installSkills(target, async (op, args) => (sent.push([op, args]), []));
   assert.deepEqual(await target.skills.find("오늘 코디"), []);
   assert.deepEqual(sent, [["skills.find", { text: "오늘 코디" }]]);
+});
+
+test("ha.find and ha.admin.find ask for the matching tools of their API", async () => {
+  const sent = [];
+  const target = {};
+  installHa(target, async (op, args) => (sent.push([op, args]), []), true);
+  await target.ha.find("turn off");
+  await target.ha.admin.find("traces");
+  assert.deepEqual(sent, [["ha.list", { api: "assist", query: "turn off" }], ["ha.list", { api: "homeassistant", query: "traces" }]]);
 });

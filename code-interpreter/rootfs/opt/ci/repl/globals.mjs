@@ -199,12 +199,14 @@ export function installShare(target, rpc) {
 
 // ha.<domain>.<tool>(args) calls Home Assistant's tool "<domain>__<tool>" (the
 // names its MCP Server gives, e.g. intent__HassTurnOn); ha.call(name, args)
-// takes a full name, ha.tools() lists them. The app decides what each call
+// takes a full name, ha.tools() lists them and ha.find(text) the few that
+// match. The app decides what each call
 // may reach; nothing here is a check.
 function haNamespace(rpc, api, extra = {}) {
   const call = (name, args = {}) => rpc("ha.call", { api, name: String(name), args });
   const tools = () => rpc("ha.list", { api });
-  return toolNamespace(call, tools, extra);
+  const find = (text) => rpc("ha.list", { api, query: String(text) });
+  return toolNamespace(call, tools, { find, ...extra });
 }
 
 // <prefix>.<tool>(args) -> call("<prefix>__<tool>", args); call and tools as given.
@@ -234,11 +236,13 @@ export function installHa(target, rpc, admin) {
 }
 
 // plugins.<server>.<tool>(args) calls the plugin tool "<server>__<tool>" (an MCP
-// server Home Assistant reaches); plugins.call(name, args), plugins.tools().
+// server Home Assistant reaches); plugins.call(name, args), plugins.tools(),
+// plugins.find(text) (the few tools that match).
 // Undefined when this caller may use none.
 export function installPlugins(target, rpc, enabled) {
   target.plugins = enabled
-    ? toolNamespace((name, args = {}) => rpc("plugins.call", { name: String(name), args }), () => rpc("plugins.list", {}))
+    ? toolNamespace((name, args = {}) => rpc("plugins.call", { name: String(name), args }), () => rpc("plugins.list", {}),
+      { find: (text) => rpc("plugins.list", { query: String(text) }) })
     : undefined;
 }
 

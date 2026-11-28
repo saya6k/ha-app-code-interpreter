@@ -23,6 +23,7 @@ from hamcp import ADMIN, APIS, ASSIST, HaToolError, HaUnavailable, HomeAssistant
 from audit import Audit, code_detail, sha256
 from plugins import ACCESS, Plugin, Plugins, valid_api
 from policy import SandboxPolicy
+from rank import rank
 from replclient import RpcError
 from skills import SkillError, SkillReviewer, SkillStore
 from skills import find as skills_find
@@ -124,6 +125,19 @@ def _ms(t0: float) -> int:
 
 
 CONVERSATION_GAP_S = 300  # Home Assistant ends a conversation after 5 idle minutes (chat_session)
+
+
+TOOLS_FIND_CAP = 8
+
+
+def _matching(tools: list[dict], args: dict) -> list[dict]:
+    """All tools, or with a query (find(text)) the few that match it."""
+    query = args.get("query")
+    if query is None:
+        return tools
+    if not isinstance(query, str) or not query.strip():
+        raise RpcError("TypeError", "find(text) takes what the tool should do, as a string")
+    return rank(tools, query, lambda t: t["name"], lambda t: t.get("description"), TOOLS_FIND_CAP)
 
 
 def _skill_entry(skill: dict) -> dict:
@@ -289,8 +303,9 @@ class _CellCalls:
         except HaUnavailable as e:
             raise RpcError("HaUnavailable", str(e)) from None
         if op == "plugins.list":
-            return [{k: t[k] for k in ("name", "description", "input_schema", "read_only", "destructive", "plugin")}
-                    for t in tools]
+            listed = [{k: t[k] for k in ("name", "description", "input_schema", "read_only", "destructive", "plugin")}
+                      for t in tools]
+            return _matching(listed, args)
         name = str(args.get("name", ""))
         tool_args = args.get("args") or {}
         if not isinstance(tool_args, dict):
@@ -337,7 +352,7 @@ class _CellCalls:
         api = str(args.get("api", ASSIST))
         tools = await self._allowed_tools(api)
         if op == "ha.list":
-            return tools
+            return _matching(tools, args)
         name = str(args.get("name", ""))
         tool_args = args.get("args") or {}
         if not isinstance(tool_args, dict):
