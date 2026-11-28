@@ -17,6 +17,7 @@ import mcpauth
 import stdin
 import web
 from audit import AUDIT_DIR, Audit
+from hamcp import HaUnavailable
 from service import DEFAULT_TIMEOUT_S, Service, load_options
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -146,6 +147,21 @@ async def run_code(
     return await with_heartbeat(ctx, svc.run_code(code, session_id, timeout_s, reset, user_id=caller(ctx)))
 
 
+async def reload_when_listening(api: uvicorn.Server) -> None:
+    """Have Home Assistant read this version's tools (see reload_own_entries),
+    once the MCP endpoint answers: the reload connects to it."""
+    for _ in range(120):
+        if api.started:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        return  # not listening: a reload would only make Home Assistant fail to connect
+    try:
+        log.info("[hamcp] reloaded MCP entries: %s", await svc.ha.reload_own_entries() or "none yet")
+    except HaUnavailable as e:
+        log.warning("[hamcp] could not reload this app's MCP entry: %s", e)
+
+
 async def prune_audit() -> None:
     while True:
         svc.audit.prune()
@@ -193,9 +209,11 @@ async def main() -> None:
         mcpauth.RequireToken(mcp.streamable_http_app(), token), host=mcp.settings.host, port=mcp.settings.port,
         log_level=mcp.settings.log_level.lower(),
     ))
+    reloader = asyncio.create_task(reload_when_listening(api))
     try:
         await api.serve()
     finally:
+        reloader.cancel()
         requests.close()
         ui.should_exit = True
         with contextlib.suppress(Exception):

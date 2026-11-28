@@ -57,6 +57,10 @@ requests without it are refused (`401`). Other apps on the same host, and
 an entry added by hand (it has no token), cannot call the app. If nothing is
 discovered, restart the app to announce it again.
 
+Home Assistant reads an MCP server's tools when its entry loads and then
+only every 30 minutes. So that an update reaches the agent at once, the app
+reloads its own entry (the one discovery created) each time it starts.
+
 No port mapping is needed, and an MCP client outside Home Assistant cannot
 use the app.
 
