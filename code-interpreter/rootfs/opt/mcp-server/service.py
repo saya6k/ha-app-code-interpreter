@@ -87,13 +87,14 @@ def load_options(path: Path = OPTIONS_PATH) -> Options:
         name = str((entry or {}).get("name") or "").strip()
         access = str((entry or {}).get("access") or "").strip()
         api = str((entry or {}).get("api") or "").strip() or None
+        admin_tools = tuple(t.strip() for t in str((entry or {}).get("admin_tools") or "").split(",") if t.strip())
         if not name or access not in ACCESS:  # dropping only narrows access: fail-closed
             log.error("[mcp-server] plugin %r: needs a name and access all or admin — ignored", entry)
             continue
         if api is not None and not valid_api(api):
             log.error("[mcp-server] plugin %r: api %r is not an LLM API id a plugin may use — ignored", name, api)
             continue
-        plugins.append(Plugin(name, access, api))
+        plugins.append(Plugin(name, access, api, admin_tools))
     export_dir = Path(raw.get("export_dir") or DEFAULT_EXPORT_DIR)
     if not export_dir.is_absolute() or ".." in export_dir.parts or not (
         export_dir == sharefs.SHARE or sharefs.SHARE in export_dir.parents
