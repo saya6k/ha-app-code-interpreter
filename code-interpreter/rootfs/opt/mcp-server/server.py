@@ -108,6 +108,10 @@ async def run_code(
       skills.request(text)                     ask for a new skill when the user wants one; it is
                                                written in the background and runs only once an
                                                administrator approves it
+      skills.save(name, {description, guide})  when the user says how you should do something from
+                                               now on: a guide (instructions, not code), in force
+                                               at once; skills.<name>() then returns {guide} to
+                                               follow. skills.delete(name) removes a guide
 
     Example, one call:
       const { entities } = await ha.homeassistant.GetLiveContext();

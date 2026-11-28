@@ -138,6 +138,15 @@ def test_skills_are_listed_and_need_the_ui_header_to_approve(env):
     assert client.post("/api/skills/..%2Fx/greet/delete", headers={"X-Requested-With": "code-interpreter-ui"}).status_code in (400, 404)
 
 
+def test_a_users_guide_is_listed_without_a_code_check(env):
+    client, svc, _ = env
+    svc.skills.save_guide("u1", "outfit_notes", "how I like outfits", "Always mention an umbrella when rain is likely.")
+    guide = next(k for k in client.get("/api/skills").json()["skills"] if k["name"] == "outfit_notes")
+    assert guide["kind"] == "guide" and guide["check"] == {} and guide["active"]["guide"].startswith("Always")
+    r = client.post("/api/skills/u1/outfit_notes/delete", headers={"X-Requested-With": "code-interpreter-ui"})
+    assert r.status_code == 200 and svc.skills.get("u1", "outfit_notes") is None
+
+
 def test_skill_code_is_only_inserted_as_text():
     html = web.UI_FILE.read_text()
     start = html.index("async function loadSkills")

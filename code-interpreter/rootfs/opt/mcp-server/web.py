@@ -77,7 +77,8 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
         for user in svc.skills.users():
             for s in svc.skills.list(user):
                 # What the code visibly calls vs. its manifest, for the reviewer.
-                check = {k: manifest_check(s[k]["code"], s[k].get("uses")) for k in ("active", "pending") if s.get(k)}
+                check = {k: manifest_check(s[k]["code"], s[k].get("uses")) for k in ("active", "pending")
+                         if s.get(k) and "code" in s[k]}  # a guide has no code
                 out.append({"user_id": user, "user": names.get(user), **s, "check": check})
         return JSONResponse({"skills": out, "workflow": svc.options.skill_workflow})
 

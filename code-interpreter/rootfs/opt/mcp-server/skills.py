@@ -25,7 +25,8 @@ log = logging.getLogger("mcp-server")
 
 ROOT = Path("/data/skills")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
-RESERVED = frozenset({"list", "find", "request"})  # skills.list/find/request(): a skill by those names could never run
+# skills.list/find/request/save/delete(): a skill by those names could never run
+RESERVED = frozenset({"list", "find", "request", "save", "delete"})
 USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CODE_CAP = 8192
 TEXT_CAP = 500
@@ -204,6 +205,8 @@ class SkillStore:
         if not code or len(code) > CODE_CAP:
             raise SkillError(f"code must be 1..{CODE_CAP} characters")
         existing = self._read(path)
+        if existing and existing.get("kind") == "guide":
+            raise SkillError(f"{name!r} is the user's guide; a code skill needs another name")
         if existing is None and len(self.list(user)) >= PER_USER_CAP:
             raise SkillError(f"{PER_USER_CAP} skills already; delete some first")
         skill = existing or {"name": name, "active": None, "pending": None}
@@ -213,6 +216,35 @@ class SkillStore:
         }
         self._write(path, skill)
         return skill
+
+    def save_guide(self, user: str, name: str, description: str, guide: str) -> dict:
+        """A guide is instructions for the user's own agent, not code: it is in
+        force at once, and the user replaces or deletes it. It can never
+        take a code skill's name, which only an administrator's approval
+        changes."""
+        path = self._path(user, name)
+        if not guide or len(guide) > CODE_CAP:
+            raise SkillError(f"a guide must be 1..{CODE_CAP} characters")
+        existing = self._read(path)
+        if existing and existing.get("kind") != "guide":
+            raise SkillError(f"{name!r} is a code skill; a guide needs another name")
+        if existing is None and len(self.list(user)) >= PER_USER_CAP:
+            raise SkillError(f"{PER_USER_CAP} skills already; delete some first")
+        skill = {**(existing or {}), "name": name, "kind": "guide", "pending": None, "active": {
+            "description": description[:TEXT_CAP], "params": "", "guide": guide, "uses": parse_uses({}),
+            "saved": time.time(),
+        }}
+        self._write(path, skill)
+        return skill
+
+    def delete_guide(self, user: str, name: str) -> None:
+        path = self._path(user, name)
+        skill = self._read(path)
+        if not skill:
+            raise SkillError("no such skill")
+        if skill.get("kind") != "guide":
+            raise SkillError(f"{name!r} is a code skill: an administrator deletes it in the panel")
+        path.unlink()
 
     def approve(self, user: str, name: str, by: str | None) -> dict:
         path = self._path(user, name)
