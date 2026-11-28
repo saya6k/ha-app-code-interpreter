@@ -23,13 +23,22 @@ class FakeHA:
         return {"u1": "Alice"}
 
 
+class FakeReviewer:
+    def __init__(self):
+        self.deleted_skills = []
+
+    def deleted(self, user, name):
+        self.deleted_skills.append((user, name))
+
+
 class FakeService:
     def __init__(self, audit, skills_dir):
         self.options = Options(policy=SandboxPolicy(allowlist=("pypi.org",)), skill_workflow=True)
         self.audit = audit
         self.ha = FakeHA()
         self.skills = SkillStore(skills_dir)
-        self.skills.save("u1", "greet", "code", "says hi", "async () => ha.intent.HassTurnOn({})", "{}")
+        self.reviewer = FakeReviewer()
+        self.skills.save("u1", "greet", "says hi", "Run `await ha.intent.HassTurnOn({})` and say hi.")
         self.open = {"abc": {"session_id": "abc", "created": 1.0, "last_used": 2.0, "expires_in_s": 90}}
 
     def list_sessions(self, everyone=False):
@@ -116,26 +125,20 @@ def test_skills_are_listed_with_their_calls_and_deleted_with_the_ui_header(env):
     body = client.get("/api/skills").json()
     assert body["workflow"] is True
     (k,) = body["skills"]
-    assert (k["user"], k["name"], k["kind"], k["code"]) == ("Alice", "greet", "code", "async () => ha.intent.HassTurnOn({})")
+    assert (k["user"], k["name"], k["description"]) == ("Alice", "greet", "says hi") and "HassTurnOn" in k["guide"]
     assert k["calls"] == {"calls": ["intent__HassTurnOn"], "dynamic": []}
     assert client.post("/api/skills/u1/greet/delete").status_code == 403
-    for action in ("approve", "reject", "explode"):  # nothing waits for approval any more
+    for action in ("approve", "reject", "explode"):  # nothing waits for approval
         assert client.post(f"/api/skills/u1/greet/{action}", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 404
     r = client.post("/api/skills/u1/greet/delete", headers={"X-Requested-With": "code-interpreter-ui",
                                                              "X-Remote-User-Name": "admin"})
     assert r.status_code == 200 and svc.skills.get("u1", "greet") is None
+    assert svc.reviewer.deleted_skills == [("u1", "greet")]  # its notification is cleared
     assert client.post("/api/skills/u1/greet/delete", headers={"X-Requested-With": "code-interpreter-ui"}).status_code == 400
     assert client.post("/api/skills/..%2Fx/greet/delete", headers={"X-Requested-With": "code-interpreter-ui"}).status_code in (400, 404)
     (ev,) = [json.loads(x) for f in tmp.glob("audit-*.jsonl") for x in f.read_text().splitlines()
              if json.loads(x)["event"] == "skill.deleted"]
     assert ev["detail"] == {"user_id": "u1", "name": "greet", "by": "admin"}
-
-
-def test_a_users_guide_is_listed_without_calls(env):
-    client, svc, _ = env
-    svc.skills.save("u1", "outfit_notes", "guide", "how I like outfits", "Always mention an umbrella when rain is likely.")
-    guide = next(k for k in client.get("/api/skills").json()["skills"] if k["name"] == "outfit_notes")
-    assert guide["kind"] == "guide" and guide["calls"] is None and guide["guide"].startswith("Always")
 
 
 def test_skill_code_is_only_inserted_as_text():

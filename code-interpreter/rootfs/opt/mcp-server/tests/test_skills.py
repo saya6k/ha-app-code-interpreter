@@ -2,79 +2,82 @@ import json
 
 import pytest
 
-from skills import CODE_CAP, SkillError, SkillStore, calls_in, tool_summary
+from skills import GUIDE_CAP, SkillError, SkillStore, calls_in, tool_summary
 
+GUIDE = "When asked for an outfit, call plugins.wardrowbe.suggest_outfit({}) and mention the chance of rain."
 CODE = "async ({ room }) => room"
 
 
 def test_a_saved_skill_is_in_force_and_a_save_replaces_it(tmp_path):
     st = SkillStore(tmp_path)
-    st.save("u1", "lights_off", "code", "turn lights off", CODE, "{room}", {"session_id": "s"})
-    assert st.get("u1", "lights_off")["code"] == CODE
-    st.touch("u1", "lights_off")
-    st.save("u1", "lights_off", "guide", "how to turn lights off", "Ask which room first.")
-    s = st.get("u1", "lights_off")
-    assert (s["kind"], s["guide"], "code" in s) == ("guide", "Ask which room first.", False)
-    assert s["used"]  # replacing keeps when it last ran
-    st.delete("u1", "lights_off")
-    assert st.get("u1", "lights_off") is None
+    st.save("u1", "outfit", "suggest an outfit", GUIDE, {"session_id": "s"})
+    assert st.get("u1", "outfit")["guide"] == GUIDE
+    st.touch("u1", "outfit")
+    st.save("u1", "outfit", "suggest an outfit", "Ask about the occasion first.")
+    s = st.get("u1", "outfit")
+    assert s["guide"] == "Ask about the occasion first." and s["used"]  # replacing keeps when it last ran
+    st.delete("u1", "outfit")
+    assert st.get("u1", "outfit") is None
     with pytest.raises(SkillError):
-        st.delete("u1", "lights_off")
+        st.delete("u1", "outfit")
 
 
 def test_skills_are_per_user(tmp_path):
     st = SkillStore(tmp_path)
-    st.save("u1", "a", "code", "d", CODE)
+    st.save("u1", "a", "d", GUIDE)
     assert st.list("u2") == [] and st.get("u2", "a") is None and st.users() == ["u1"]
 
 
 @pytest.mark.parametrize("name", ["", "Bad", "1x", "../x", "a" * 41, "a-b", "list", "request", "find", "save", "delete"])
 def test_invalid_names_are_refused(tmp_path, name):
     with pytest.raises(SkillError):
-        SkillStore(tmp_path).save("u1", name, "code", "d", CODE)
+        SkillStore(tmp_path).save("u1", name, "d", GUIDE)
 
 
 @pytest.mark.parametrize("user", ["", "../etc", "a/b"])
 def test_invalid_users_are_refused(tmp_path, user):
     with pytest.raises(SkillError):
-        SkillStore(tmp_path).save(user, "a", "code", "d", CODE)
+        SkillStore(tmp_path).save(user, "a", "d", GUIDE)
 
 
-@pytest.mark.parametrize("kind, body, description", [
-    ("code", "x" * (CODE_CAP + 1), "d"), ("code", "", "d"), ("guide", CODE, "  "), ("macro", CODE, "d")])
-def test_size_description_and_kind_are_checked(tmp_path, kind, body, description):
+@pytest.mark.parametrize("guide, description", [("x" * (GUIDE_CAP + 1), "d"), ("  ", "d"), (GUIDE, "  ")])
+def test_size_and_description_are_checked(tmp_path, guide, description):
     with pytest.raises(SkillError):
-        SkillStore(tmp_path).save("u1", "a", kind, description, body)
+        SkillStore(tmp_path).save("u1", "a", description, guide)
 
 
-def test_files_written_while_skills_waited_for_approval_still_load(tmp_path):
+def test_routines_from_before_become_guides_that_say_how_to_run_them(tmp_path):
     (tmp_path / "u1").mkdir()
     (tmp_path / "u1" / "old.json").write_text(json.dumps({"name": "old", "active": None, "used": 5, "pending": {
-        "description": "d", "params": "{}", "code": CODE, "uses": {}, "proposed": 1.0, "source": {"session_id": "s"}}}))
+        "description": "d", "params": "{ room }", "code": CODE, "uses": {}, "proposed": 1.0, "source": {"session_id": "s"}}}))
+    (tmp_path / "u1" / "flat.json").write_text(json.dumps({"name": "flat", "kind": "code", "description": "f",
+                                                           "params": "", "code": CODE, "saved": 2.0}))
     (tmp_path / "u1" / "note.json").write_text(json.dumps({"name": "note", "kind": "guide", "pending": None,
                                                            "active": {"description": "g", "guide": "be brief"}}))
     st = SkillStore(tmp_path)
-    assert st.get("u1", "old") == {"name": "old", "kind": "code", "description": "d", "params": "{}", "code": CODE,
-                                   "saved": 1.0, "source": {"session_id": "s"}, "used": 5}
-    assert st.get("u1", "note")["guide"] == "be brief"
+    old = st.get("u1", "old")
+    assert old == {"name": "old", "description": "d", "guide": old["guide"], "saved": 1.0, "source": {"session_id": "s"},
+                   "used": 5}
+    assert "{ room }" in old["guide"] and f"const routine = {CODE};" in old["guide"]
+    assert CODE in st.get("u1", "flat")["guide"] and st.get("u1", "note")["guide"] == "be brief"
 
 
 def test_an_approval_era_update_replaces_the_version_it_waited_beside(tmp_path):
     (tmp_path / "u1").mkdir()
-    (tmp_path / "u1" / "a.json").write_text(json.dumps({"name": "a", "active": {"description": "v1", "code": "async () => 1"},
-                                                        "pending": {"description": "v2", "code": "async () => 2"}}))
+    (tmp_path / "u1" / "a.json").write_text(json.dumps({"name": "a", "active": {"description": "v1", "guide": "one"},
+                                                        "pending": {"description": "v2", "guide": "two"}}))
     skill = SkillStore(tmp_path).get("u1", "a")
-    assert (skill["description"], skill["code"]) == ("v2", "async () => 2")
+    assert (skill["description"], skill["guide"]) == ("v2", "two")
 
 
 def test_the_listing_is_recent_first_capped_and_counts_the_rest(tmp_path):
     st = SkillStore(tmp_path)
     for name in ("alpha", "beta", "gamma"):
-        st.save("u1", name, "code", f"{name} " + "x" * 200, CODE)
+        st.save("u1", name, f"{name} " + "x" * 200, GUIDE)
     st.touch("u1", "gamma")
     listed, more = st.listing("u1", cap=2)
     assert [s["name"] for s in listed] == ["gamma", "alpha"] and more == 1
-    assert listed[0]["kind"] == "code" and len(listed[0]["description"]) == 120
+    assert set(listed[0]) == {"name", "description"} and len(listed[0]["description"]) == 120
 
 
 CHECKED = """async ({ room }) => {

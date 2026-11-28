@@ -76,9 +76,8 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
         out = []
         for user in svc.skills.users():
             for s in svc.skills.list(user):
-                # What the code visibly calls, for whoever reads it here.
-                calls = calls_in(s["code"]) if s.get("kind", "code") == "code" else None
-                out.append({"user_id": user, "user": names.get(user), **s, "calls": calls})
+                # What the guide's code visibly calls, for whoever reads it here.
+                out.append({"user_id": user, "user": names.get(user), **s, "calls": calls_in(s["guide"])})
         return JSONResponse({"skills": out, "workflow": svc.options.skill_workflow})
 
     async def skill_action(request: Request) -> Response:
@@ -93,6 +92,7 @@ def build_app(svc, audit_dir: Path, allowed_clients=ALLOWED_CLIENTS) -> Starlett
         except SkillError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         svc.audit.record("skill.deleted", None, user_id=user, name=name, by=by)
+        svc.reviewer.deleted(user, name)
         return JSONResponse({"ok": True})
 
     async def audit_days(request: Request) -> Response:
