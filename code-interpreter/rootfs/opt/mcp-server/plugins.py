@@ -5,11 +5,13 @@ The MCP client integration registers an API for each server it connects to
 ("mcp-" + config entry id), and Home Assistant's MCP Server serves it like
 "assist". So the app calls those servers through Home Assistant: their
 credentials stay there. An administrator lists the ones cells may use, each
-for everyone with a Home Assistant user ("all") or administrators only.
+for everyone with a Home Assistant user ("all") or administrators only, and
+optionally some of an "all" server's tools for administrators only.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import time
 from dataclasses import dataclass
@@ -29,6 +31,15 @@ class Plugin:
     name: str  # the MCP client config entry's title, or a label when api is set
     access: str = "admin"
     api: str | None = None  # an LLM API id Home Assistant's MCP Server serves, e.g. wardrowbe__<entry id>
+    # Tools only administrators get even when access is "all": glob patterns
+    # on the tool's name, with or without its server prefix ("delete_*").
+    admin_tools: tuple[str, ...] = ()
+
+    def admin_only(self, tool: str) -> bool:
+        if self.access == "admin":
+            return True
+        short = tool.split("__", 1)[-1]
+        return any(fnmatch.fnmatchcase(tool, p) or fnmatch.fnmatchcase(short, p) for p in self.admin_tools)
 
 
 def valid_api(api: str) -> bool:
@@ -93,7 +104,8 @@ class Plugins:
             if p.access == "admin" and not admin:
                 continue
             for t in await self.ha.tools(api):
-                out.append({**t, "plugin": p.name, "api": api})
+                if admin or not p.admin_only(t["name"]):
+                    out.append({**t, "plugin": p.name, "api": api})
         return out
 
     async def describe(self) -> str:
@@ -103,4 +115,5 @@ class Plugins:
             ready = await self.resolve()
         except HaUnavailable as e:
             return f"unavailable: {e}"
-        return ", ".join(f"{p.name} ({p.access})" for p, _ in ready) or "none available"
+        return ", ".join(f"{p.name} ({p.access}{'; admin: ' + ', '.join(p.admin_tools) if p.admin_tools else ''})"
+                         for p, _ in ready) or "none available"

@@ -915,6 +915,28 @@ def test_find_returns_the_matching_tools_the_caller_may_use(tmp_path):
     assert found("ha.list", {"api": "assist", "query": " "}).startswith("TypeError: ")
 
 
+def test_admin_tools_keep_some_of_an_all_servers_tools_for_administrators(tmp_path):
+    svc, _ = make(tmp_path, {"plugins": [{"name": "memory", "access": "all", "admin_tools": " save_*, memory__search ,"}]})
+    svc.ha = FakeHA()
+    svc.plugins.ha = svc.ha
+    assert svc.options.plugins[0].admin_tools == ("save_*", "memory__search")
+    bob = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
+    assert json.loads(asyncio.run(svc.run_code("call plugins.list {}", session_id=bob, user_id="bob"))["result"]) == []
+    r = asyncio.run(svc.run_code('call plugins.call {"name": "memory__search"}', session_id=bob, user_id="bob"))
+    assert r["error"].startswith("UnknownTool: ") and svc.ha.calls == []
+    alice = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
+    r = asyncio.run(svc.run_code('call plugins.call {"name": "memory__search"}', session_id=alice, user_id="alice"))
+    assert json.loads(r["result"]) == {"ok": True}
+
+
+def test_admin_tools_match_with_or_without_the_server_prefix():
+    from plugins import Plugin
+    p = Plugin("memory", "all", admin_tools=("save_*", "memory__wipe"))
+    assert p.admin_only("memory__save_note") and p.admin_only("memory__wipe")
+    assert not p.admin_only("memory__search") and not p.admin_only("other__wipe")
+    assert Plugin("x", "admin").admin_only("x__anything")
+
+
 def test_no_plugins_without_a_user(tmp_path):
     svc, created = plugin_service(tmp_path)
     sid = asyncio.run(svc.run_code("1 + 1"))["session_id"]

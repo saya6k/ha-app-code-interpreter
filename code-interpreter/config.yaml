@@ -67,3 +67,4 @@ schema:
     - name: str
       access: list(all|admin)
       api: str?
+      admin_tools: str?

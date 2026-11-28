@@ -295,7 +295,18 @@ lists the tools the speaker may use; with none, `plugins` is undefined.
   never get plugins. `access: admin` plugins are checked on every call.
 - A plugin's tools run with no Home Assistant user behind them: the server
   sees the same caller for everyone. Only list servers whose tools every
-  allowed person may use, including tools that write (`memory__save`).
+  allowed person may use, including tools that write (`memory__save`), or
+  keep those for administrators with `admin_tools`: comma-separated
+  patterns on the tool's name, with or without the server prefix. Everyone
+  else does not see those tools in `plugins.tools()` and cannot call them.
+
+  ```yaml
+  plugins:
+    - name: Memory
+      access: all
+      admin_tools: save_*, delete_*
+  ```
+
 - Plugin answers go back to the model; a server that returns text written
   by others can carry instructions. Every call is in the audit log
   (`plugin.call`) and counts toward the 50 calls per run.
