@@ -9,6 +9,7 @@ import hamcp
 import replclient
 import service
 from skills import SkillReviewer, SkillStore
+from skills import find as skills_find
 from audit import Audit
 from policy import SandboxPolicy
 from sandbox import FileOpError, SandboxError
@@ -706,6 +707,72 @@ def test_cells_use_only_their_users_approved_skills(tmp_path):
     other = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=other, user_id="bob"))
     assert r["error"].startswith("UnknownSkill: ")
+
+
+def test_a_new_sessions_first_result_names_the_approved_skills_recent_first(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+    for name in ("alpha", "beta", "gamma"):
+        svc.skills.propose("alice", name, "", "", "async () => 1", {})
+    svc.skills.approve("alice", "alpha", "admin")
+    svc.skills.approve("alice", "beta", "admin")  # gamma stays pending: it cannot run
+    first = asyncio.run(svc.run_code("1", user_id="alice"))
+    assert first["skills"] == ["alpha", "beta"] and "skills_more" not in first
+    asyncio.run(svc.run_code('call skills.get {"name": "beta"}', session_id=first["session_id"], user_id="alice"))
+    assert "skills" not in asyncio.run(svc.run_code("1", user_id="alice"))  # same conversation: said already
+    for s in svc.manager.list():
+        s.last_used -= 301  # Home Assistant's conversation has expired: the next call starts a new one
+    later = asyncio.run(svc.run_code("1", user_id="alice"))
+    assert later["resumed"] and later["skills"] == ["beta", "alpha"]  # beta ran last
+    assert "skills" not in asyncio.run(svc.run_code("1", user_id="bob"))
+    assert "skills" not in asyncio.run(svc.run_code("1"))
+
+
+def test_the_names_are_capped_and_the_rest_counted(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+    for i in range(33):
+        svc.skills.propose("alice", f"s{i:02}", "", "", "async () => 1", {})
+        svc.skills.approve("alice", f"s{i:02}", "admin")
+    r = asyncio.run(svc.run_code("1", user_id="alice"))
+    assert len(r["skills"]) == 30 and r["skills_more"] == 3
+
+
+def test_skills_find_ranks_by_the_requests_words(tmp_path):
+    svc, _ = skill_service(tmp_path, {})
+    svc.skills.propose("alice", "todays_outfit", "오늘 날씨에 맞는 코디를 추천", "", "async () => 1", {})
+    svc.skills.propose("alice", "lights_off_except", "Turn off every light except one room", "", "async () => 1", {})
+    svc.skills.propose("alice", "water_plants", "Start the garden irrigation", "", "async () => 1", {})
+    sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
+
+    def find(text):
+        r = asyncio.run(svc.run_code(f"call skills.find {json.dumps({'text': text})}", session_id=sid, user_id="alice"))
+        return r.get("error") or [s["name"] for s in json.loads(r["result"])]
+
+    assert find("오늘 코디 추천해 줘") == ["todays_outfit"]
+    assert find("turn the lights off but not the bedroom") == ["lights_off_except"]  # not "the garden"
+    assert find("start watering the garden") == ["water_plants"]
+    assert find("zzz") == []
+    assert find("  ").startswith("TypeError: ")
+    other = asyncio.run(svc.run_code("1", user_id="bob"))["session_id"]
+    r = asyncio.run(svc.run_code('call skills.find {"text": "코디"}', session_id=other, user_id="bob"))
+    assert json.loads(r["result"]) == []
+
+
+def test_skills_find_weighs_the_name_over_the_description():
+    skills = [
+        {"name": "garden_report", "active": {"description": "what the sensors say"}},
+        {"name": "sensor_summary", "active": {"description": "the garden's sensors"}},
+    ]
+    assert [s["name"] for s in skills_find(skills, "garden")] == ["garden_report", "sensor_summary"]
+
+
+def test_a_skill_still_runs_when_its_use_cannot_be_recorded(tmp_path, monkeypatch):
+    svc, _ = skill_service(tmp_path, {})
+    svc.skills.propose("alice", "greet", "", "", "async () => 1", {})
+    svc.skills.approve("alice", "greet", "admin")
+    sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
+    monkeypatch.setattr(svc.skills, "_write", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
+    r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
+    assert json.loads(r["result"]) == {"code": "async () => 1"}
 
 
 def test_a_failed_review_is_audited_not_lost(tmp_path):

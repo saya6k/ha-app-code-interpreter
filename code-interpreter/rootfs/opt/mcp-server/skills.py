@@ -10,6 +10,7 @@ someone approves it.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -23,11 +24,13 @@ log = logging.getLogger("mcp-server")
 
 ROOT = Path("/data/skills")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
-RESERVED = frozenset({"list", "request"})  # skills.list() and skills.request(): a skill by those names could never run
+RESERVED = frozenset({"list", "find", "request"})  # skills.list/find/request(): a skill by those names could never run
 USER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 CODE_CAP = 8192
 TEXT_CAP = 500
 PER_USER_CAP = 50
+NAMES_CAP = 30  # skill names a new session's first result carries
+FIND_CAP = 5
 
 
 USES_KEYS = ("ha", "hab", "plugins")
@@ -178,6 +181,22 @@ class SkillStore:
     def get(self, user: str, name: str) -> dict | None:
         return self._read(self._path(user, name))
 
+    def touch(self, user: str, name: str) -> None:
+        """Remember when a skill last ran: names() lists recent ones first."""
+        path = self._path(user, name)
+        if (skill := self._read(path)) is not None:
+            skill["used"] = time.time()
+            with contextlib.suppress(OSError):  # only the order of names(): never worth failing the run
+                self._write(path, skill)
+
+    def names(self, user: str, cap: int = NAMES_CAP) -> tuple[list[str], int]:
+        """Approved skills' names, most recently used first, and how many more
+        there are. A name costs a few tokens: the model learns what exists
+        without the descriptions, and reads them with skills.find()."""
+        active = [s for s in self.list(user) if s.get("active")]
+        active.sort(key=lambda s: (-(s.get("used") or 0), s["name"]))
+        return [s["name"] for s in active[:cap]], max(0, len(active) - cap)
+
     def propose(self, user: str, name: str, description: str, params: str, code: str, source: dict,
                 uses: dict | None = None) -> dict:
         path = self._path(user, name)
@@ -221,6 +240,41 @@ class SkillStore:
         if not path.exists():
             raise SkillError("no such skill")
         path.unlink()
+
+
+STOPWORDS = frozenset("a an and are as at be but by for from in is it of on or the to with".split())
+
+
+def _grams(text: str) -> set[str]:
+    """What a request and a skill can share, with no tokenizer or model:
+    Korean words as character bigrams ("코디를" meets "코디"), other words
+    whole and by their first five letters ("lights" meets "light"). English
+    bigrams would make every description match ("th", "in")."""
+    out = set()
+    for word in re.findall(r"\w+", text.replace("_", " ").casefold()):
+        if word in STOPWORDS:
+            continue
+        out.add(word)
+        if re.search("[가-힣]", word):
+            out.update(word[i:i + 2] for i in range(len(word) - 1))
+        else:
+            out.add(word[:5])
+    return out
+
+
+def find(skills: list[dict], text: str, cap: int = FIND_CAP) -> list[dict]:
+    """The skills that share the most of the request's words with their name
+    (counted twice) and description, best first. One that scores under half
+    the best shares only a stray word."""
+    query = _grams(text)
+    scored = []
+    for s in skills:
+        version = s.get("active") or s.get("pending") or {}
+        score = 2 * len(query & _grams(s["name"])) + len(query & _grams(version.get("description", "")))
+        if score:
+            scored.append((-score, s["name"], s))
+    best = -min(scored, key=lambda x: x[0])[0] if scored else 0
+    return [s for score, _, s in sorted(scored, key=lambda x: x[:2])[:cap] if -score * 2 >= best]
 
 
 def worth_reviewing(code: str) -> bool:

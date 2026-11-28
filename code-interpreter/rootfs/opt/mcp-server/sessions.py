@@ -58,6 +58,10 @@ class SessionManager:
     def list(self) -> list[Session]:
         return list(self._sessions.values())
 
+    def idle_for(self, session_id: str) -> float:
+        session = self._sessions.get(session_id)
+        return self._clock() - session.last_used if session else float("inf")
+
     def expires_in(self, session: Session) -> float:
         return max(0.0, session.last_used + self._idle - self._clock())
 

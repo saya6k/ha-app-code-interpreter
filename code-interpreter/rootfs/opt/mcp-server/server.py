@@ -98,8 +98,11 @@ async def run_code(
       share.list(dir?), share.import(sharePath, dest?), share.export(path)   Home Assistant's /share
       plugins?.<server>.<tool>(args)           MCP servers Home Assistant reaches that the app allows
                                                you (plugins.tools() lists them); undefined if none
-      skills.list(), skills.<name>(args)       this user's saved skills (approved ones run);
-                                               prefer a fitting skill over writing the code again
+      skills.find(text), skills.list()         this user's saved skills that match a request (or
+                                               all), with params; a new conversation's first
+                                               result names the approved ones as `skills`
+      skills.<name>(args)                      run an approved skill: prefer a fitting skill over
+                                               writing the code again
       skills.request(text)                     ask for a new skill when the user wants one; it is
                                                written in the background and runs only once an
                                                administrator approves it
