@@ -80,16 +80,18 @@ async def run_code(
     `result` (promises inside a returned object are awaited); console.log and
     log() output comes back as `logs`; a thrown error as `error` + `message`.
 
-    Skills are this user's saved routines (code) and guides (instructions for
-    you). A new conversation's first result lists them in `skills` with
-    one-line descriptions. When the task at hand is one a listed skill covers,
-    use it first, in place of your default approach: skills.<name>(args) runs
-    a routine; a guide returns {guide}, which you follow. If no `skills`
-    listing is in this conversation, skills.find(request) searches them. When
-    the user wants a routine kept, or says how you should do something from
-    now on, save it: skills.save(name, {description, code | guide}), in force
-    at once. Write description as what it does and when to use it, in the
-    user's words.
+    Skills are this user's guides: instructions for a task they repeat (the
+    steps, the tools, code to adapt), kept for you to follow. A new
+    conversation's first result lists them in `skills` with one-line
+    descriptions. When the task at hand is one a listed skill covers, read it
+    first and follow it in place of your default approach: skills.<name>()
+    returns {guide}. If no `skills` listing is in this conversation,
+    skills.find(request) searches them. When the user wants a way of doing
+    something kept, or says how you should do it from now on, save it:
+    skills.save(name, {description, guide}), in force at once. Write the guide
+    for your next self (steps, tools with their arguments, a run_code snippet)
+    and the description as what it does and when to use it, in the user's
+    words.
 
     Tools: ha.tools(), ha.admin.tools() and plugins.tools() list names and
     one-line descriptions only. ha.find(text), ha.admin.find(text) and
@@ -112,13 +114,11 @@ async def run_code(
       plugins?.<server>.<tool>(args)           MCP servers Home Assistant reaches that the app allows
                                                you; undefined if none
       skills.list(), skills.find(text)         all of this user's skills, or the few that match
-      skills.<name>(args)                      run a routine, or read a guide ({guide})
-      skills.save(name, {description, code | guide, params?})
-                                               save or replace one; code is an async function taking
-                                               one argument object (or its source)
+      skills.<name>()                          read one: {guide}
+      skills.save(name, {description, guide})  save or replace one
       skills.delete(name)                      remove one the user no longer wants
-      skills.request(text)                     have a background writer draft a routine instead
-                                               (about a minute)
+      skills.request(text)                     have a background writer draft one instead (about a
+                                               minute)
       $`cmd ${x}`                              sh -c in /sandbox, values quoted; .text() .lines()
                                                .json() .nothrow() .timeout(ms); non-zero exit throws
       file(p).text()/json()/lines()/exists(), write(p, s), sleep(ms), log(...), require(builtin)

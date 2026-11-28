@@ -440,9 +440,16 @@ class FakeHA:
         self.admins = set(admins)
         self.calls = []
         self.users = {"alice": "Alice", "bob": "Bob"}
+        self.notes = []
 
-    def known_users(self):
+    async def user_names(self):
         return dict(self.users)
+
+    async def notify(self, notification_id, title, message):
+        self.notes.append(("create", notification_id, message))
+
+    async def dismiss(self, notification_id):
+        self.notes.append(("dismiss", notification_id))
 
     async def find_user(self, who):
         found = [uid for uid, name in self.users.items() if who.casefold() in (uid, name.casefold())]
@@ -657,7 +664,7 @@ def finish(svc, sid):
 
 def test_a_finished_session_can_save_a_skill(tmp_path):
     answer = {"save": True, "name": "lights_off_except", "description": "d", "params": "{ except }",
-              "code": "async ({ except: room }) => room", "reason": "repeatable"}
+              "guide": "Turn off every light but the room given.", "reason": "repeatable"}
     svc, _ = skill_service(tmp_path, answer, skill_ai_task_entity="ai_task.claude_ai_task")
     sid = asyncio.run(svc.run_code("set " + "a=1", user_id="alice"))["session_id"]
     asyncio.run(svc.run_code(SKILL_CODE, session_id=sid, user_id="alice"))
@@ -666,9 +673,11 @@ def test_a_finished_session_can_save_a_skill(tmp_path):
     assert entity == "ai_task.claude_ai_task" and "GetLiveContext" in instructions and "set a=1" not in instructions
     assert "when to use it" in instructions
     skill = svc.skills.get("alice", "lights_off_except")
-    assert skill["code"] == "async ({ except: room }) => room" and skill["source"]["session_id"] == sid
+    assert skill["guide"] == "Turn off every light but the room given." and skill["source"]["session_id"] == sid
     (ev,) = [e for e in events(tmp_path) if e["event"] == "skill.saved"]
     assert ev["detail"]["via"] == "review" and ev["detail"]["ai_task_entity"] == "ai_task.claude_ai_task"
+    asyncio.run(svc.reviewer.wait())
+    assert "Alice: `lights_off_except`, saved from a finished conversation" in svc.ha.notes[0][2]
 
 
 def test_no_review_when_off_anonymous_trivial_or_declined(tmp_path):
@@ -691,12 +700,12 @@ def test_no_review_when_off_anonymous_trivial_or_declined(tmp_path):
 
 def test_cells_use_only_their_users_skills(tmp_path):
     svc, _ = skill_service(tmp_path, {})
-    svc.skills.save("alice", "greet", "code", "says hi", "async () => 1", "{}")
+    svc.skills.save("alice", "greet", "says hi", "Say one.")
     sid = asyncio.run(svc.run_code("1 + 1", user_id="alice"))["session_id"]
     listed = json.loads(asyncio.run(svc.run_code("call skills.list {}", session_id=sid, user_id="alice"))["result"])
-    assert listed == [{"name": "greet", "kind": "code", "description": "says hi", "params": "{}"}]
+    assert listed == [{"name": "greet", "description": "says hi"}]
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
-    assert json.loads(r["result"]) == {"code": "async () => 1"}
+    assert json.loads(r["result"]) == {"guide": "Say one."}
     other = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=other, user_id="bob"))
     assert r["error"].startswith("UnknownSkill: ")
@@ -704,11 +713,10 @@ def test_cells_use_only_their_users_skills(tmp_path):
 
 def test_a_new_conversations_first_result_lists_the_skills_recent_first(tmp_path):
     svc, _ = skill_service(tmp_path, {})
-    svc.skills.save("alice", "alpha", "code", "first one", "async () => 1")
-    svc.skills.save("alice", "beta", "guide", "how to answer", "be brief")
+    svc.skills.save("alice", "alpha", "first one", "Say one.")
+    svc.skills.save("alice", "beta", "how to answer", "be brief")
     first = asyncio.run(svc.run_code("1", user_id="alice"))
-    assert first["skills"] == [{"name": "alpha", "kind": "code", "description": "first one"},
-                               {"name": "beta", "kind": "guide", "description": "how to answer"}]
+    assert first["skills"] == [{"name": "alpha", "description": "first one"}, {"name": "beta", "description": "how to answer"}]
     assert "skills_more" not in first
     asyncio.run(svc.run_code('call skills.get {"name": "beta"}', session_id=first["session_id"], user_id="alice"))
     assert "skills" not in asyncio.run(svc.run_code("1", user_id="alice"))  # same conversation: said already
@@ -723,16 +731,16 @@ def test_a_new_conversations_first_result_lists_the_skills_recent_first(tmp_path
 def test_the_listing_is_capped_and_the_rest_counted(tmp_path):
     svc, _ = skill_service(tmp_path, {})
     for i in range(33):
-        svc.skills.save("alice", f"s{i:02}", "code", "d", "async () => 1")
+        svc.skills.save("alice", f"s{i:02}", "d", "Say one.")
     r = asyncio.run(svc.run_code("1", user_id="alice"))
     assert len(r["skills"]) == 30 and r["skills_more"] == 3
 
 
 def test_skills_find_ranks_by_the_requests_words(tmp_path):
     svc, _ = skill_service(tmp_path, {})
-    svc.skills.save("alice", "todays_outfit", "code", "오늘 날씨에 맞는 코디를 추천", "async () => 1")
-    svc.skills.save("alice", "lights_off_except", "code", "Turn off every light except one room", "async () => 1")
-    svc.skills.save("alice", "water_plants", "code", "Start the garden irrigation", "async () => 1")
+    svc.skills.save("alice", "todays_outfit", "오늘 날씨에 맞는 코디를 추천", "Say one.")
+    svc.skills.save("alice", "lights_off_except", "Turn off every light except one room", "Say one.")
+    svc.skills.save("alice", "water_plants", "Start the garden irrigation", "Say one.")
     sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
 
     def find(text):
@@ -759,11 +767,11 @@ def test_skills_find_weighs_the_name_over_the_description():
 
 def test_a_skill_still_runs_when_its_use_cannot_be_recorded(tmp_path, monkeypatch):
     svc, _ = skill_service(tmp_path, {})
-    svc.skills.save("alice", "greet", "code", "d", "async () => 1")
+    svc.skills.save("alice", "greet", "d", "Say one.")
     sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
     monkeypatch.setattr(svc.skills, "_write", lambda *a: (_ for _ in ()).throw(OSError("disk full")))
     r = asyncio.run(svc.run_code('call skills.get {"name": "greet"}', session_id=sid, user_id="alice"))
-    assert json.loads(r["result"]) == {"code": "async () => 1"}
+    assert json.loads(r["result"]) == {"guide": "Say one."}
 
 
 def test_a_guide_is_in_force_at_once_and_the_user_edits_and_deletes_it(tmp_path):
@@ -778,7 +786,7 @@ def test_a_guide_is_in_force_at_once_and_the_user_edits_and_deletes_it(tmp_path)
     assert saved["saved"] == "outfit_notes"
     assert cell("skills.get", {"name": "outfit_notes"}) == {"guide": "비 오면 우산을 챙기라고 말해."}  # no approval
     (entry,) = cell("skills.find", {"text": "코디 추천해 줘"})
-    assert (entry["name"], entry["kind"]) == ("outfit_notes", "guide")
+    assert entry == {"name": "outfit_notes", "description": "코디 추천 규칙"}
     cell("skills.save", {"name": "outfit_notes", "description": "코디 추천 규칙", "guide": "우산과 겉옷을 챙기라고 말해."})
     assert cell("skills.get", {"name": "outfit_notes"}) == {"guide": "우산과 겉옷을 챙기라고 말해."}
     assert cell("skills.delete", {"name": "outfit_notes"}) == {"deleted": "outfit_notes"}
@@ -787,7 +795,7 @@ def test_a_guide_is_in_force_at_once_and_the_user_edits_and_deletes_it(tmp_path)
         "outfit_notes"] * 3
 
 
-def test_the_agent_saves_replaces_and_deletes_any_of_the_users_skills(tmp_path):
+def test_the_agent_saves_replaces_and_deletes_the_users_skills_and_everyone_is_told(tmp_path):
     svc, _ = skill_service(tmp_path, {})
     sid = asyncio.run(svc.run_code("1", user_id="alice"))["session_id"]
 
@@ -795,22 +803,38 @@ def test_the_agent_saves_replaces_and_deletes_any_of_the_users_skills(tmp_path):
         r = asyncio.run(svc.run_code(f"call {op} {json.dumps(args)}", session_id=sid, user_id="alice"))
         return r.get("error") or json.loads(r["result"])
 
-    saved = cell("skills.save", {"name": "greet", "description": "says hi", "code": "async () => 1", "params": "{}"})
-    assert saved["saved"] == "greet" and cell("skills.get", {"name": "greet"}) == {"code": "async () => 1"}
-    cell("skills.save", {"name": "greet", "description": "how to greet", "guide": "wave"})  # replaced, any kind
-    assert cell("skills.get", {"name": "greet"}) == {"guide": "wave"}
+    saved = cell("skills.save", {"name": "greet", "description": "says hi", "guide": "Say hi."})
+    assert saved["saved"] == "greet" and cell("skills.get", {"name": "greet"}) == {"guide": "Say hi."}
+    cell("skills.save", {"name": "greet", "description": "how to greet", "guide": "Wave."})
+    assert cell("skills.get", {"name": "greet"}) == {"guide": "Wave."}
     assert cell("skills.delete", {"name": "greet"}) == {"deleted": "greet"}
-    assert cell("skills.save", {"name": "x", "description": "d", "code": "a", "guide": "b"}).startswith("TypeError: ")
-    assert cell("skills.save", {"name": "x", "description": "d"}).startswith("TypeError: ")
+    asyncio.run(svc.reviewer.wait())
+    nid = "code_interpreter_skill_alice_greet"
+    assert [n[:2] for n in svc.ha.notes] == [("create", nid), ("create", nid), ("dismiss", nid)]
+    assert "Alice: `greet`, saved by their assistant" in svc.ha.notes[0][2] and "Wave" not in svc.ha.notes[1][2]
+    assert cell("skills.save", {"name": "x", "description": "d", "code": "async () => 1"}).startswith("TypeError: ")
     assert cell("skills.save", {"name": "x", "description": "d", "guide": 3}).startswith("TypeError: ")
     assert cell("skills.save", {"name": "x", "guide": "b"}).startswith("SkillError: ")  # no description
     assert cell("skills.save", {"name": "list", "description": "d", "guide": "b"}).startswith("SkillError: ")
     assert cell("skills.delete", {"name": "nope"}).startswith("SkillError: ")
-    saved = [e["detail"] for e in events(tmp_path) if e["event"] == "skill.saved"]
-    assert [(d["kind"], d["via"]) for d in saved] == [("code", "agent"), ("guide", "agent")]
+    assert [d["via"] for d in (e["detail"] for e in events(tmp_path) if e["event"] == "skill.saved")] == ["agent", "agent"]
     other = asyncio.run(svc.run_code("1"))["session_id"]
     r = asyncio.run(svc.run_code('call skills.save {"name": "n3", "description": "d", "guide": "x"}', session_id=other))
     assert r["error"].startswith("NoUser: ")
+
+
+def test_a_failed_notification_keeps_the_skill(tmp_path):
+    answer = {"save": True, "name": "x_skill", "description": "d", "guide": "Do x.", "reason": "r"}
+    svc, _ = skill_service(tmp_path, answer)
+
+    async def down(*a):
+        raise hamcp.HaUnavailable("persistent_notification.create failed (500)")
+
+    svc.ha.notify = down
+    sid = asyncio.run(svc.run_code(SKILL_CODE, user_id="alice"))["session_id"]
+    finish(svc, sid)
+    asyncio.run(svc.reviewer.wait())
+    assert svc.skills.get("alice", "x_skill")["guide"] == "Do x."
 
 
 def test_a_failed_review_is_audited_not_lost(tmp_path):
@@ -842,17 +866,21 @@ def request(svc, line):
 
 def test_a_skill_request_from_stdin_is_saved_for_that_user(tmp_path):
     answer = {"save": True, "name": "lights_off_except", "description": "d", "params": "{ except }",
-              "code": "async ({ except: room }) => room", "reason": "asked"}
+              "guide": "Turn off every light but the room given.", "reason": "asked"}
     svc, _ = skill_service(tmp_path, answer)
     request(svc, json.dumps({"type": "skill.request", "user": "Bob", "request": "거실 빼고 불 끄기"}))
     ((instructions, _),) = svc.ha.asked
     assert "거실 빼고 불 끄기" in instructions and "intent__HassTurnOff" in instructions
     assert "trace__get_trace" not in instructions  # bob is not an administrator
     skill = svc.skills.get("bob", "lights_off_except")
-    assert skill["code"] == "async ({ except: room }) => room" and skill["source"]["request"] == "거실 빼고 불 끄기"
+    assert skill["guide"].startswith("Turn off") and skill["source"]["request"] == "거실 빼고 불 끄기"
     ev = [e for e in events(tmp_path) if e["event"] in ("skill.requested", "skill.saved")]
     assert [e["event"] for e in ev] == ["skill.requested", "skill.saved"] and ev[0]["detail"]["user_id"] == "bob"
     assert ev[1]["detail"]["via"] == "request"
+    asyncio.run(svc.reviewer.wait())
+    ((kind, nid, message),) = svc.ha.notes
+    assert nid == "code_interpreter_skill_bob_lights_off_except" and "Bob: `lights_off_except`, saved from a skill request" in message
+    assert "Turn off" not in message  # no model-written text
 
 
 def test_an_administrators_request_lists_the_read_only_admin_tools(tmp_path):
@@ -992,7 +1020,7 @@ def ask(svc, sid, user, text="today's outfit"):
 
 def test_a_skill_asked_for_in_a_conversation_is_saved_for_the_speaker(tmp_path):
     answer = {"save": True, "name": "todays_outfit", "description": "d", "params": "{}",
-              "code": "async () => plugins.wardrowbe.suggest_outfit({})", "reason": "asked"}
+              "guide": "Call plugins.wardrowbe.suggest_outfit({}).", "reason": "asked"}
     svc, _ = skill_service(tmp_path, answer)
     sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
     r = ask(svc, sid, "bob")
@@ -1002,19 +1030,19 @@ def test_a_skill_asked_for_in_a_conversation_is_saved_for_the_speaker(tmp_path):
     assert "today's outfit" in instructions
     skill = svc.skills.get("bob", "todays_outfit")
     assert skill["source"]["request"] == "today's outfit" and skill["source"]["session_id"] == sid
-    assert skill["code"] == "async () => plugins.wardrowbe.suggest_outfit({})"  # in force at once
+    assert skill["guide"] == "Call plugins.wardrowbe.suggest_outfit({})."  # in force at once
     (ev,) = [e for e in events(tmp_path) if e["event"] == "skill.requested"]
     assert ev["session_id"] == sid and ev["detail"]["via"] == "conversation" and ev["detail"]["user_id"] == "bob"
 
 
-def test_a_skill_request_sees_the_users_skills_with_their_kind(tmp_path):
+def test_a_skill_request_sees_the_users_skills_but_not_their_text(tmp_path):
     svc, _ = skill_service(tmp_path, {"save": False, "reason": "no"})
-    svc.skills.save("bob", "outfit_rules", "guide", "코디 규칙", "우산을 챙기라고 말해.")
+    svc.skills.save("bob", "outfit_rules", "코디 규칙", "우산을 챙기라고 말해.")
     sid = asyncio.run(svc.run_code("1 + 1", user_id="bob"))["session_id"]
     ask(svc, sid, "bob")
     asyncio.run(svc.reviewer.wait())
     ((instructions, _),) = svc.ha.asked
-    assert '{"name": "outfit_rules", "kind": "guide", "description": "코디 규칙"}' in instructions
+    assert '{"name": "outfit_rules", "description": "코디 규칙"}' in instructions
     assert "우산" not in instructions  # a guide's text stays with the agent it was written for
 
 

@@ -311,20 +311,18 @@ class SkillCalls(FakeCalls):
     async def call(self, op, args):
         self.seen.append((op, args))
         if op == "skills.list":
-            return [{"name": "double", "kind": "code"}]
-        if op == "skills.get" and args["name"] == "double":
-            return {"code": "async ({ n }) => n * 2"}
+            return [{"name": "note", "description": "how to answer"}]
         if op == "skills.get" and args["name"] == "note":
             return {"guide": "be brief"}
         raise replclient.RpcError("UnknownSkill", "no skill 'other'")
 
 
-def test_skills_proxy_runs_code_with_its_arguments_and_returns_a_guide(repl):
+def test_skills_proxy_returns_a_guide_by_name(repl):
     calls = SkillCalls()
-    r = repl.do(repl.client.run("[await skills.double({ n: 21 }), (await skills.list())[0].name, "
-                                "await skills.other().catch((e) => e.name), await skills.note()]", timeout_s=10, rpc=calls))
-    assert r["result"] == '[42,"double","UnknownSkill",{"guide":"be brief"}]', r
-    assert calls.seen[0] == ("skills.get", {"name": "double"})
+    r = repl.do(repl.client.run("[await skills.note(), (await skills.list())[0].name, "
+                                "await skills.other().catch((e) => e.name)]", timeout_s=10, rpc=calls))
+    assert r["result"] == '[{"guide":"be brief"},"note","UnknownSkill"]', r
+    assert calls.seen[0] == ("skills.get", {"name": "note"})
 
 
 def test_ha_namespaces_are_not_thenables(repl):

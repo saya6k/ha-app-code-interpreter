@@ -7,7 +7,6 @@ import { spawn } from "node:child_process";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import util from "node:util";
-import vm from "node:vm";
 
 const PIPE_GRACE_MS = 2000; // after exit: a detached grandchild may keep the pipes open
 const STREAM_LIMIT = 16 << 20; // per stream: enough to parse a big file in the cell, bounded by RLIMIT_AS anyway
@@ -246,37 +245,24 @@ export function installPlugins(target, rpc, enabled) {
     : undefined;
 }
 
-// skills.list(), skills.find(text); skills.<name>(args) runs the user's skill: the app hands
-// back its code each time (it can be replaced), compiled here; a guide comes back as {guide}.
+// skills.list(), skills.find(text); skills.<name>() returns the user's guide: instructions
+// for the assistant to follow, read from the app each time (it can be replaced).
 export function installSkills(target, rpc) {
   const base = {
     list: () => rpc("skills.list", {}),
-    // The user's skills that best match what was asked, with descriptions and params.
+    // The user's skills that best match what was asked.
     find: (text) => rpc("skills.find", { text: String(text) }),
-    // Have the AI Task write a routine in the background.
+    // Have the AI Task write a guide in the background.
     request: (text) => rpc("skills.request", { request: String(text) }),
-    // Save or replace a skill, in force at once: code (an async function, or its source) or a guide.
-    save: (name, { description = "", code, guide, params = "" } = {}) =>
-      rpc("skills.save", {
-        name: String(name), description: String(description), params: String(params),
-        ...(code !== undefined ? { code: String(code) } : {}), ...(guide !== undefined ? { guide: String(guide) } : {}),
-      }),
+    // Save or replace a guide, in force at once.
+    save: (name, { description = "", guide } = {}) =>
+      rpc("skills.save", { name: String(name), description: String(description), guide: String(guide ?? "") }),
     delete: (name) => rpc("skills.delete", { name: String(name) }),
   };
   target.skills = new Proxy(base, {
     get(b, key) {
       if (key in b || typeof key !== "string" || key === "then" || key === "toJSON") return b[key];
-      return async (args = {}) => {
-        const got = await rpc("skills.get", { name: key });
-        if (got.guide !== undefined) return { guide: got.guide };  // instructions to follow, not code
-        const { code } = got;
-        const fn = vm.runInThisContext(`(${code})`, {
-          filename: `skill:${key}`,
-          importModuleDynamically: vm.constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
-        });
-        if (typeof fn !== "function") throw new TypeError(`skill ${key} is not a function`);
-        return fn(args);
-      };
+      return () => rpc("skills.get", { name: key });
     },
   });
 }

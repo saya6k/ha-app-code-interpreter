@@ -219,6 +219,14 @@ class HomeAssistant:
         out = await self._action("ai_task/generate_data", body, timeout_s, response=True)
         return (out.get("service_response") or {}).get("data") or {}
 
+    async def notify(self, notification_id: str, title: str, message: str) -> None:
+        """A persistent notification (every Home Assistant user sees it)."""
+        await self._action("persistent_notification/create",
+                           {"notification_id": notification_id, "title": title, "message": message}, 15)
+
+    async def dismiss(self, notification_id: str) -> None:
+        await self._action("persistent_notification/dismiss", {"notification_id": notification_id}, 15)
+
     async def mcp_servers(self) -> list[dict]:
         """The MCP client integration's config entries: the MCP servers Home
         Assistant reaches, each with an API of its own."""
